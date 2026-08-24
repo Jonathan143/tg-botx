@@ -1,0 +1,28 @@
+name: 每日链式签到
+account: default
+target: "@example_bot"
+
+schedule:
+  type: random
+  timezone: Asia/Shanghai
+  start: "09:00:00"
+  end: "18:00:00"
+
+steps:
+  - type: send_message
+    text: "/start"
+  - type: wait_message
+    success:
+      mode: contains
+      value: "请选择操作"
+    timeout_seconds: 60
+  - type: click_button
+    text: "签到"
+  - type: wait_message
+    success:
+      mode: contains
+      value: "签到成功"
+    failure:
+      mode: contains
+      value: "签到失败"
+    timeout_seconds: 60

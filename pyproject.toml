@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tg-checkin-bot"
+version = "0.1.0"
+description = "Telegram user-account check-in scheduler"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "APScheduler>=3.10,<4",
+  "PyYAML>=6.0",
+  "SQLAlchemy>=2.0",
+  "Telethon>=1.36",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.2",
+  "qrcode>=7.4",
+  "typer>=0.12",
+]
+
+[project.scripts]
+tg-bot = "tg_bot.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tg_bot"]

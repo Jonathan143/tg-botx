@@ -1,0 +1,24 @@
+name: 每日直接签到
+account: default
+target: "@example_bot"
+
+schedule:
+  type: fixed
+  timezone: Asia/Shanghai
+  time: "09:00:00"
+
+retry:
+  max_attempts: 3
+  backoff_seconds: [30, 60, 120]
+
+steps:
+  - type: send_message
+    text: "/checkin"
+  - type: wait_message
+    success:
+      mode: contains
+      value: "签到成功"
+    failure:
+      mode: contains
+      value: "签到失败"
+    timeout_seconds: 60
