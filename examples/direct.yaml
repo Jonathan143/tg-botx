@@ -15,7 +15,8 @@ notifications:
   failure: true
   success: true
 
-output_bot_response: true
+log_bot_response: false
+notify_bot_response: false
 
 steps:
   - type: send_message

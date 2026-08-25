@@ -60,6 +60,8 @@ class TaskDefinition(BaseModel):
     steps: list[dict[str, Any]] = Field(min_length=1)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
     output_bot_response: bool = False
+    log_bot_response: bool | None = None
+    notify_bot_response: bool | None = None
 
     @model_validator(mode="after")
     def validate_steps(self) -> "TaskDefinition":
@@ -81,4 +83,6 @@ class TaskDefinition(BaseModel):
             return cls.model_validate(yaml.safe_load(file))
 
     def to_yaml(self) -> str:
-        return yaml.safe_dump(self.model_dump(mode="json"), allow_unicode=True, sort_keys=False)
+        return yaml.safe_dump(
+            self.model_dump(mode="json", exclude_none=True), allow_unicode=True, sort_keys=False
+        )

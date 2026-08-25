@@ -194,6 +194,15 @@ class Database:
             session.refresh(run)
             return run
 
+    def has_running_run(self, task_id: str) -> bool:
+        with self.session() as session:
+            query = (
+                select(TaskRun.id)
+                .where(TaskRun.task_id == task_id, TaskRun.status == "running")
+                .limit(1)
+            )
+            return session.scalar(query) is not None
+
     def task_history(self, task_id: str, limit: int = 20) -> list[TaskRun]:
         with self.session() as session:
             query = select(TaskRun).where(TaskRun.task_id == task_id).order_by(TaskRun.started_at.desc()).limit(limit)

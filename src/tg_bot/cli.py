@@ -39,12 +39,13 @@ def configure_logging(settings: Settings) -> None:
     logging.basicConfig(level=level, handlers=[console_handler, file_handler], force=True)
 
 
-def resources() -> tuple[Settings, Database]:
+def resources(*, create_schema: bool = True) -> tuple[Settings, Database]:
     settings = Settings()
     settings.ensure_directories()
     configure_logging(settings)
     database = Database(settings.database_url)
-    database.create_all()
+    if create_schema:
+        database.create_all()
     return settings, database
 
 
@@ -164,8 +165,7 @@ def run_task(task_id: str):
         try:
             return await service.run_task(task_id)
         finally:
-            service.scheduler.shutdown(wait=False)
-            await service.pool.close()
+            await service.close()
 
     success = asyncio.run(execute())
     logger.info("手动执行任务结束 task_id=%s success=%s", task_id, success)
@@ -181,7 +181,10 @@ def cancel_task(task_id: str):
     service = CheckinService(settings, database)
 
     async def cancel() -> bool:
-        return await service.cancel_task(task_id)
+        try:
+            return await service.cancel_task(task_id)
+        finally:
+            await service.close()
 
     if asyncio.run(cancel()):
         logger.info("取消任务 task_id=%s", task_id)
@@ -221,5 +224,5 @@ def import_task(config: Path = typer.Option(..., "--config", exists=True, readab
 @app.command()
 def serve():
     """启动常驻调度服务。"""
-    settings, database = resources()
+    settings, database = resources(create_schema=False)
     asyncio.run(CheckinService(settings, database).run_forever())

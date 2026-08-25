@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +19,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TG_BOT_DATABASE_URL", "DATABASE_URL"),
     )
     admin_chat_ids: str = Field(default="")
+    notification_bot_token: SecretStr | None = Field(default=None)
     log_level: str = Field(default="INFO")
     log_file: str = Field(default="tg-bot.log")
     log_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
@@ -37,6 +38,11 @@ class Settings(BaseSettings):
     @property
     def admin_chat_id_list(self) -> list[int]:
         return [int(item.strip()) for item in self.admin_chat_ids.split(",") if item.strip()]
+
+    @property
+    def notification_chat_id(self) -> int | None:
+        chat_ids = self.admin_chat_id_list
+        return chat_ids[0] if chat_ids else None
 
     @property
     def database_url(self) -> str:

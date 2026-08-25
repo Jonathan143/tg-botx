@@ -22,7 +22,7 @@
 - `/Users/Kang/Documents/ChatGPT/tg-bot/examples/direct.yaml`
 - `/Users/Kang/Documents/ChatGPT/tg-bot/examples/chain.yaml`
 
-核心约定：Python 3.12+、Telethon 用户账号 MTProto、APScheduler、SQLAlchemy + SQLite/PostgreSQL、Typer、Pydantic、Docker；支持手机号/验证码和二维码登录；任务支持直接指令、消息等待、按钮点击链；固定每日时间或指定时区内随机到秒；失败重试、执行历史、管理员 Telegram 失败通知；同账号同聊天串行执行。
+核心约定：Python 3.12+、Telethon 用户账号 MTProto、APScheduler、SQLAlchemy + SQLite/PostgreSQL、Typer、Pydantic、Docker；支持手机号/验证码和二维码登录；任务支持直接指令、消息等待、按钮点击链；固定每日时间或指定时区内随机到秒；失败重试、执行历史、独立 Telegram Bot API 管理员通知；同账号同聊天串行执行。
 
 ## 代码入口
 

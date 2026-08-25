@@ -39,6 +39,23 @@ TG_BOT_LOG_MAX_BYTES=10485760
 TG_BOT_LOG_BACKUP_COUNT=5
 ```
 
+## Telegram 机器人通知
+
+通知通过 BotFather 创建的独立机器人和 Telegram Bot API 发送，不复用签到用户账号的 session：
+
+```text
+TG_BOT_NOTIFICATION_BOT_TOKEN=replace-with-bot-token
+TG_BOT_ADMIN_CHAT_IDS=123456789
+```
+
+管理员必须先在 Telegram 中打开该机器人并发送 `/start`，否则机器人不能主动发起私聊。通知只发送到
+`TG_BOT_ADMIN_CHAT_IDS` 中的第一个 chat ID；未配置 Token 或管理员 chat ID 时，通知功能保持禁用并记录警告，
+不会影响签到任务执行。
+
+机器人通知包括任务最终成功或失败、取消请求与实际取消、忙碌跳过，以及 `serve` 常驻服务的启动、
+SIGINT/SIGTERM 优雅停止和可捕获的致命异常。投递发生网络错误、限流或服务端错误时最多重试 3 次；
+最终投递失败只写日志，不改变签到任务结果。任务事件按任务时区显示，服务事件使用 UTC。
+
 ## CLI
 
 ```text
@@ -67,12 +84,15 @@ notifications:
   success: false
 ```
 
-通知会发送到 `TG_BOT_ADMIN_CHAT_IDS` 配置的 Telegram chat ID；多个 ID 使用逗号分隔。将某个维度设为 `false` 可关闭对应通知。
+将某个维度设为 `false` 可关闭对应的最终结果通知。取消、忙碌跳过和服务生命周期通知由全局规则发送。
 
-如需同时在运行日志和通知中输出机器人最后一次回复的完整消息体，可开启：
+机器人最后一次回复可能包含账号、余额、积分或兑换码等敏感信息，因此日志和通知分别使用独立开关，
+并且默认都关闭：
 
 ```yaml
-output_bot_response: true
+log_bot_response: false
+notify_bot_response: false
 ```
 
-该配置默认关闭。回复超过单条 Telegram 消息长度时，通知会自动分段发送。
+旧配置 `output_bot_response` 仍兼容：未配置对应新开关时，它会同时控制日志和通知输出。新开关优先于旧配置。
+回复超过单条 Telegram 消息长度时，通知会自动分段发送。
