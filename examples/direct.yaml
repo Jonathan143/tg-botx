@@ -11,6 +11,12 @@ retry:
   max_attempts: 1
   backoff_seconds: [30, 60, 120]
 
+notifications:
+  failure: true
+  success: true
+
+output_bot_response: true
+
 steps:
   - type: send_message
     text: "/checkin"

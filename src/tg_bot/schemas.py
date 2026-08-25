@@ -15,6 +15,13 @@ class RetryConfig(BaseModel):
     backoff_seconds: list[int] = Field(default_factory=lambda: [30, 60, 120])
 
 
+class NotificationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    failure: bool = True
+    success: bool = False
+
+
 class ScheduleConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -51,7 +58,8 @@ class TaskDefinition(BaseModel):
     schedule: ScheduleConfig
     retry: RetryConfig = Field(default_factory=RetryConfig)
     steps: list[dict[str, Any]] = Field(min_length=1)
-    notifications: dict[str, Any] = Field(default_factory=dict)
+    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
+    output_bot_response: bool = False
 
     @model_validator(mode="after")
     def validate_steps(self) -> "TaskDefinition":

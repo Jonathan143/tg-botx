@@ -10,7 +10,9 @@ from tg_bot.matching import match_button, matches
 
 
 class CheckinError(RuntimeError):
-    pass
+    def __init__(self, message: str, bot_response: str | None = None):
+        super().__init__(message)
+        self.bot_response = bot_response
 
 
 class CheckinExecutor:
@@ -18,11 +20,12 @@ class CheckinExecutor:
         self.client = client
         self.is_cancelled = is_cancelled or (lambda: False)
 
-    async def execute(self, task: Any) -> None:
+    async def execute(self, task: Any) -> str | None:
         entity = await self.client.get_entity(task.target)
         bot = await self.client.get_entity(task.target)
         baseline = await self._latest_message_id(entity)
         current_message = None
+        bot_response: str | None = None
         editable_message_ids: set[int] = set()
         editable_message_texts: dict[int, str] = {}
 
@@ -46,6 +49,7 @@ class CheckinExecutor:
                         editable_message_ids=editable_message_ids,
                         editable_message_texts=editable_message_texts,
                     )
+                    bot_response = current_message.raw_text or ""
                     baseline = max(baseline, current_message.id)
                     editable_message_ids.clear()
                     editable_message_texts.clear()
@@ -59,11 +63,14 @@ class CheckinExecutor:
                 else:
                     raise CheckinError(f"不支持的步骤类型：{kind}")
             except asyncio.TimeoutError as exc:
-                raise CheckinError(f"步骤 {index + 1} 等待超时") from exc
-            except CheckinError:
+                raise CheckinError(f"步骤 {index + 1} 等待超时", bot_response) from exc
+            except CheckinError as exc:
+                if exc.bot_response is None:
+                    exc.bot_response = bot_response
                 raise
             except Exception as exc:
-                raise CheckinError(f"步骤 {index + 1} 执行失败：{exc}") from exc
+                raise CheckinError(f"步骤 {index + 1} 执行失败：{exc}", bot_response) from exc
+        return bot_response
 
     async def _latest_message_id(self, entity: Any) -> int:
         message = await self.client.get_messages(entity, limit=1)
@@ -107,7 +114,7 @@ class CheckinExecutor:
                     return
             text = message.raw_text or ""
             if matches(text, step.get("failure")):
-                future.set_exception(CheckinError(f"机器人返回失败消息：{text[:200]}"))
+                future.set_exception(CheckinError("机器人返回失败消息", text))
                 return
             success_rule = step.get("success")
             if success_rule is None or matches(text, success_rule):
@@ -146,19 +153,23 @@ class CheckinExecutor:
         await message.click(text=getattr(button, "text", ""))
 
 
-async def run_with_retries(executor: CheckinExecutor, task: Any) -> tuple[bool, str | None, int]:
+async def run_with_retries(
+    executor: CheckinExecutor, task: Any
+) -> tuple[bool, str | None, int, str | None]:
     retry = task.config.get("retry", {})
     max_attempts = retry.get("max_attempts", 3)
     backoff = retry.get("backoff_seconds", [30, 60, 120])
     error: str | None = None
+    bot_response: str | None = None
     for attempt in range(1, max_attempts + 1):
         if executor.is_cancelled():
             raise asyncio.CancelledError
         try:
-            await executor.execute(task)
-            return True, None, attempt
+            bot_response = await executor.execute(task)
+            return True, None, attempt, bot_response
         except Exception as exc:
             error = str(exc)
+            bot_response = getattr(exc, "bot_response", None)
             if attempt < max_attempts:
                 await asyncio.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
-    return False, error, max_attempts
+    return False, error, max_attempts, bot_response

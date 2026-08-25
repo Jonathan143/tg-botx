@@ -46,3 +46,21 @@ tg-bot serve
 ```
 
 任务配置采用 YAML，步骤仅允许内置类型，不执行任意 Python 或 Shell。
+
+可在任务中分别控制失败和成功通知。未配置 `notifications` 时默认仅发送失败通知：
+
+```yaml
+notifications:
+  failure: true
+  success: false
+```
+
+通知会发送到 `TG_BOT_ADMIN_CHAT_IDS` 配置的 Telegram chat ID；多个 ID 使用逗号分隔。将某个维度设为 `false` 可关闭对应通知。
+
+如需同时在运行日志和通知中输出机器人最后一次回复的完整消息体，可开启：
+
+```yaml
+output_bot_response: true
+```
+
+该配置默认关闭。回复超过单条 Telegram 消息长度时，通知会自动分段发送。

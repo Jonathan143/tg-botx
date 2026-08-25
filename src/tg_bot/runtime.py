@@ -43,20 +43,58 @@ class NotificationService:
         self.settings = settings
         self.pool = pool
 
-    async def failure(self, account: Account, task: Task, error: str, next_run: datetime | None) -> None:
-        if not self.settings.admin_chat_id_list:
+    @staticmethod
+    def _is_enabled(task: Task, status: str) -> bool:
+        notifications = task.config.get("notifications") or {}
+        return bool(notifications.get(status, status == "failure"))
+
+    @staticmethod
+    def _message_chunks(text: str, limit: int = 4000) -> list[str]:
+        return [text[index : index + limit] for index in range(0, len(text), limit)]
+
+    async def _send(
+        self,
+        account: Account,
+        task: Task,
+        status: str,
+        next_run: datetime | None,
+        error: str | None = None,
+        bot_response: str | None = None,
+    ) -> None:
+        if not self._is_enabled(task, status) or not self.settings.admin_chat_id_list:
             return
+        status_text = "成功" if status == "success" else "失败"
         try:
             client = await self.pool.get(account)
+            reason_line = f"原因：{error}\n" if error else ""
             text = (
-                f"签到失败\n任务：{task.name}\n目标：{task.target}\n"
-                f"时间：{utc_now().isoformat()}\n原因：{error}\n"
+                f"签到{status_text}\n任务：{task.name}\n目标：{task.target}\n"
+                f"时间：{utc_now().isoformat()}\n"
+                f"{reason_line}"
                 f"下次计划：{next_run.isoformat() if next_run else '未安排'}"
             )
+            if task.config.get("output_bot_response", False) and bot_response is not None:
+                text += f"\n机器人回复：\n{bot_response}"
             for chat_id in self.settings.admin_chat_id_list:
-                await client.send_message(chat_id, text)
+                for chunk in self._message_chunks(text):
+                    await client.send_message(chat_id, chunk)
         except Exception:
-            logger.exception("发送失败通知时出错")
+            logger.exception("发送%s通知时出错", status_text)
+
+    async def success(
+        self, account: Account, task: Task, next_run: datetime | None, bot_response: str | None
+    ) -> None:
+        await self._send(account, task, "success", next_run, bot_response=bot_response)
+
+    async def failure(
+        self,
+        account: Account,
+        task: Task,
+        error: str,
+        next_run: datetime | None,
+        bot_response: str | None = None,
+    ) -> None:
+        await self._send(account, task, "failure", next_run, error, bot_response)
 
 
 class CheckinService:
@@ -126,10 +164,11 @@ class CheckinService:
             self.database.update_task(task.id, cancel_requested=False)
             run = self.database.add_run(TaskRun(task_id=task.id, planned_at=task.next_run_at))
             self.running[task.id] = asyncio.current_task()
+            bot_response: str | None = None
             try:
                 client = await self.pool.get(account)
                 is_cancelled = lambda: bool(self.database.get_task(task.id).cancel_requested)
-                success, error, attempts = await run_with_retries(
+                success, error, attempts, bot_response = await run_with_retries(
                     CheckinExecutor(client, is_cancelled=is_cancelled), task
                 )
                 finished = utc_now()
@@ -148,8 +187,20 @@ class CheckinService:
                     next_run_at=next_run,
                 )
                 task.next_run_at = next_run
-                if not success:
-                    await self.notifications.failure(account, task, error or "未知错误", next_run)
+                if task.config.get("output_bot_response", False) and bot_response is not None:
+                    logger.info(
+                        "机器人回复 task_id=%s name=%s status=%s\n%s",
+                        task.id,
+                        task.name,
+                        "success" if success else "failed",
+                        bot_response,
+                    )
+                if success:
+                    await self.notifications.success(account, task, next_run, bot_response)
+                else:
+                    await self.notifications.failure(
+                        account, task, error or "未知错误", next_run, bot_response
+                    )
                 self._schedule_task(task)
                 return success
             except asyncio.CancelledError:
@@ -160,7 +211,9 @@ class CheckinService:
                 self.database.update_task(task.id, last_run_at=utc_now(), last_status="failed")
                 next_run = next_run_for(schedule_from_task(task), now=utc_now())
                 self.database.update_task(task.id, next_run_at=next_run)
-                await self.notifications.failure(account, task, str(exc), next_run)
+                await self.notifications.failure(
+                    account, task, str(exc), next_run, bot_response
+                )
                 task.next_run_at = next_run
                 self._schedule_task(task)
                 return False
