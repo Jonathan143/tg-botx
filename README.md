@@ -16,7 +16,19 @@ tg-bot task create --config examples/direct.yaml
 tg-bot serve
 ```
 
-`data/` 中包含 SQLite 数据库、Telegram session 和日志，必须持久化并避免提交到 Git。
+`data/` 中包含 SQLite 数据库（以及 Telegram session 和日志），必须持久化并避免提交到 Git。
+
+数据库默认使用 SQLite。可通过环境变量切换到 PostgreSQL：
+
+```text
+TG_BOT_DATABASE=sqlite
+# TG_BOT_DATABASE=postgresql
+# TG_BOT_DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/tg_bot
+```
+
+选择 PostgreSQL 时必须配置 `TG_BOT_DATABASE_URL`。连接串也支持常见的
+`postgresql://` 或 `postgres://` 写法，程序会自动使用 psycopg 驱动；SQLite
+仍使用 `TG_BOT_DATA_DIR/database.sqlite3`。
 
 日志默认同时输出到终端和 `data/logs/tg-bot.log`，并按 10 MB 自动轮转，保留 5 个历史文件。可通过以下环境变量调整：
 

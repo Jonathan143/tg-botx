@@ -15,6 +15,7 @@ dependencies = [
   "Telethon>=1.36",
   "pydantic>=2.7",
   "pydantic-settings>=2.2",
+  "psycopg[binary]>=3.1",
   "qrcode[pil]>=7.4",
   "typer>=0.12",
 ]

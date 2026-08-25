@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import Boolean, DateTime, Integer, String, Text, TypeDecorator, create_engine, select
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -33,7 +34,13 @@ class UTCDateTime(TypeDecorator[datetime]):
             return None
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).replace(tzinfo=None)
+        value = value.astimezone(timezone.utc)
+        # SQLite has no timezone-aware datetime type, so preserve the existing
+        # naive-UTC storage format.  PostgreSQL's TIMESTAMP WITH TIME ZONE
+        # should receive an aware value so the server timezone cannot alter it.
+        if dialect.name == "sqlite":
+            return value.replace(tzinfo=None)
+        return value
 
     def process_result_value(self, value: datetime | None, dialect) -> datetime | None:
         if value is None:
@@ -100,7 +107,19 @@ class TaskRun(Base):
 
 class Database:
     def __init__(self, url: str):
-        self.engine = create_engine(url, connect_args={"check_same_thread": False})
+        # SQLAlchemy's ``postgresql://`` shorthand defaults to psycopg2.  The
+        # project ships psycopg 3, so make the driver explicit for either
+        # PostgreSQL URL spelling.
+        if url.startswith("postgres://"):
+            url = "postgresql+psycopg://" + url[len("postgres://") :]
+        elif url.startswith("postgresql://"):
+            url = "postgresql+psycopg://" + url[len("postgresql://") :]
+
+        database_url = make_url(url)
+        engine_kwargs = {}
+        if database_url.get_backend_name() == "sqlite":
+            engine_kwargs["connect_args"] = {"check_same_thread": False}
+        self.engine = create_engine(url, **engine_kwargs)
         self.Session = sessionmaker(self.engine, expire_on_commit=False)
 
     def create_all(self) -> None:

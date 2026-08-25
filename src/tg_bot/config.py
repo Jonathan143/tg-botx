@@ -1,6 +1,7 @@
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,11 +11,28 @@ class Settings(BaseSettings):
     api_id: int | None = Field(default=None)
     api_hash: str | None = Field(default=None)
     data_dir: Path = Field(default=Path("./data"))
+    database: Literal["sqlite", "postgresql"] = Field(default="sqlite")
+    # A complete SQLAlchemy URL is required when PostgreSQL is selected.  The
+    # aliases also accept the conventional unprefixed DATABASE_URL variable.
+    database_url_override: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("TG_BOT_DATABASE_URL", "DATABASE_URL"),
+    )
     admin_chat_ids: str = Field(default="")
     log_level: str = Field(default="INFO")
     log_file: str = Field(default="tg-bot.log")
     log_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     log_backup_count: int = Field(default=5, ge=0)
+
+    @field_validator("database", mode="before")
+    @classmethod
+    def normalize_database(cls, value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized in {"postgres", "postgresql"}:
+            return "postgresql"
+        if normalized in {"sqlite", "sqlite3"}:
+            return "sqlite"
+        raise ValueError("TG_BOT_DATABASE 仅支持 sqlite 或 postgresql")
 
     @property
     def admin_chat_id_list(self) -> list[int]:
@@ -22,7 +40,19 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        return f"sqlite:///{self.data_dir / 'database.sqlite3'}"
+        if self.database_url_override:
+            url = self.database_url_override.strip()
+            if url.startswith("postgres://"):
+                return "postgresql+psycopg://" + url[len("postgres://") :]
+            if url.startswith("postgresql://"):
+                return "postgresql+psycopg://" + url[len("postgresql://") :]
+            return url
+        if self.database == "sqlite":
+            return f"sqlite:///{self.data_dir / 'database.sqlite3'}"
+        raise RuntimeError(
+            "使用 PostgreSQL 时必须在环境变量中配置 TG_BOT_DATABASE_URL，"
+            "例如 postgresql+psycopg://user:password@localhost:5432/tg_bot"
+        )
 
     @property
     def sessions_dir(self) -> Path:

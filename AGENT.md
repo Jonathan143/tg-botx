@@ -31,7 +31,7 @@ tg-bot serve
 
 - `src/tg_bot/config.py`：环境变量、数据目录及日志配置。
 - `src/tg_bot/schemas.py`：任务 YAML 的 Pydantic 模型和输入校验。
-- `src/tg_bot/db.py`：SQLAlchemy 模型、SQLite 初始化与数据访问。
+- `src/tg_bot/db.py`：SQLAlchemy 模型、SQLite/PostgreSQL 初始化与数据访问。
 - `src/tg_bot/auth.py`：手机号和二维码登录、退出登录及 session 管理。
 - `src/tg_bot/executor.py`：消息发送、回复等待、按钮点击和失败重试。
 - `src/tg_bot/matching.py`：消息与按钮匹配规则。
@@ -39,7 +39,7 @@ tg-bot serve
 - `src/tg_bot/runtime.py`：客户端池、任务调度、并发锁、通知和取消。
 - `src/tg_bot/cli.py`：Typer CLI 入口和日志初始化。
 - `examples/`：可直接参考的任务 YAML。
-- `data/`：SQLite 数据库、Telegram session 和运行日志；属于本地持久化数据，不得提交。
+- `data/`：SQLite 数据库（使用 PostgreSQL 时仅保存 Telegram session 和运行日志）；属于本地持久化数据，不得提交。
 
 ## 实现约定
 
@@ -50,7 +50,8 @@ tg-bot serve
 - 任务步骤只能使用显式允许的内置类型。不得引入执行任意 Python、Shell 或不受控表达式的能力。
 - Telethon 调用保持异步；客户端应通过现有 `ClientPool` 复用，并在退出时可靠断开。
 - 保持同一账号与目标聊天的串行语义，修改调度或执行流程时不得绕过 `(account.id, target)` 锁。
-- 数据库写入通过 `Database` 封装完成；SQLite 仍需保留 `check_same_thread=False` 和现有 UTC 转换行为。
+- 数据库写入通过 `Database` 封装完成；SQLite 仍需保留 `check_same_thread=False` 和现有 UTC 转换行为，PostgreSQL 使用 psycopg 驱动并保持 UTC 时区语义。
+- 数据库由 `TG_BOT_DATABASE` 选择（`sqlite` 或 `postgresql`）；选择 PostgreSQL 时必须配置 `TG_BOT_DATABASE_URL`，SQLite 默认使用 `TG_BOT_DATA_DIR/database.sqlite3`。
 - 面向 CLI 用户的提示、异常信息和项目文档使用简体中文；日志应包含必要的任务标识，但不得包含敏感信息。
 - 保持改动聚焦，不顺带重构无关代码，也不要覆盖用户已有的工作区改动。
 
