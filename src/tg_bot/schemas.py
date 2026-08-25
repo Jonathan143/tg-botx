@@ -62,7 +62,7 @@ class TaskDefinition(BaseModel):
             if step["type"] == "send_message" and not isinstance(step.get("text"), str):
                 raise ValueError(f"steps[{index}] send_message 必须配置 text")
             if step["type"] == "click_button" and not any(
-                key in step for key in ("text", "callback_data", "row", "column")
+                key in step for key in ("text", "text_contains", "callback_data", "row", "column")
             ):
                 raise ValueError(f"steps[{index}] click_button 至少需要一种按钮定位方式")
         return self

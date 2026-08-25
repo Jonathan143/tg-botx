@@ -13,15 +13,15 @@ steps:
     text: "/start"
   - type: wait_message
     success:
-      mode: contains
-      value: "请选择操作"
+      mode: regex
+      value: "请选择"
     timeout_seconds: 60
   - type: click_button
-    text: "签到"
+    text: "每日签到"
   - type: wait_message
     success:
-      mode: contains
-      value: "签到成功"
+      mode: regex
+      value: "签到成功|已经签到"
     failure:
       mode: contains
       value: "签到失败"

@@ -18,6 +18,15 @@ tg-bot serve
 
 `data/` 中包含 SQLite 数据库、Telegram session 和日志，必须持久化并避免提交到 Git。
 
+日志默认同时输出到终端和 `data/logs/tg-bot.log`，并按 10 MB 自动轮转，保留 5 个历史文件。可通过以下环境变量调整：
+
+```text
+TG_BOT_LOG_LEVEL=INFO
+TG_BOT_LOG_FILE=tg-bot.log
+TG_BOT_LOG_MAX_BYTES=10485760
+TG_BOT_LOG_BACKUP_COUNT=5
+```
+
 ## CLI
 
 ```text

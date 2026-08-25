@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     api_hash: str | None = Field(default=None)
     data_dir: Path = Field(default=Path("./data"))
     admin_chat_ids: str = Field(default="")
+    log_level: str = Field(default="INFO")
+    log_file: str = Field(default="tg-bot.log")
+    log_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    log_backup_count: int = Field(default=5, ge=0)
 
     @property
     def admin_chat_id_list(self) -> list[int]:
@@ -27,6 +31,10 @@ class Settings(BaseSettings):
     @property
     def logs_dir(self) -> Path:
         return self.data_dir / "logs"
+
+    @property
+    def log_path(self) -> Path:
+        return self.logs_dir / self.log_file
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

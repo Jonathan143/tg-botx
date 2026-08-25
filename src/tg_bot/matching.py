@@ -26,6 +26,7 @@ def match_button(message: Any, selector: dict[str, Any]) -> Any:
     buttons = getattr(message, "buttons", None) or []
     candidates = []
     wanted_text = selector.get("text")
+    wanted_text_contains = selector.get("text_contains")
     wanted_callback = selector.get("callback_data")
     wanted_row = selector.get("row")
     wanted_column = selector.get("column")
@@ -41,9 +42,20 @@ def match_button(message: Any, selector: dict[str, Any]) -> Any:
             callback_text = callback.decode() if isinstance(callback, bytes) else str(callback or "")
             if wanted_callback is not None and callback_text != str(wanted_callback):
                 continue
-            if wanted_callback is None and wanted_text is not None and button_text.casefold() != str(wanted_text).casefold():
-                continue
             candidates.append(button)
+
+    if wanted_callback is None:
+        if wanted_text_contains is not None:
+            needle = str(wanted_text_contains).casefold()
+            candidates = [button for button in candidates if needle in str(getattr(button, "text", "")).casefold()]
+        elif wanted_text is not None:
+            # Preserve exact matching when possible, then allow a unique
+            # substring match such as "每日签到" -> "✅每日签到".
+            needle = str(wanted_text).casefold()
+            exact = [button for button in candidates if str(getattr(button, "text", "")).casefold() == needle]
+            candidates = exact or [
+                button for button in candidates if needle in str(getattr(button, "text", "")).casefold()
+            ]
 
     if len(candidates) != 1:
         raise ValueError(f"按钮匹配结果数量为 {len(candidates)}，要求唯一匹配")

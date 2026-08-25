@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,11 +19,30 @@ from tg_bot.schemas import TaskDefinition
 app = typer.Typer(help="Telegram 用户账号签到调度器")
 task_app = typer.Typer(help="管理签到任务")
 app.add_typer(task_app, name="task")
+logger = logging.getLogger(__name__)
+
+
+def configure_logging(settings: Settings) -> None:
+    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    if not isinstance(level, int):
+        level = logging.INFO
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    file_handler = RotatingFileHandler(
+        settings.log_path,
+        maxBytes=settings.log_max_bytes,
+        backupCount=settings.log_backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logging.basicConfig(level=level, handlers=[console_handler, file_handler], force=True)
 
 
 def resources() -> tuple[Settings, Database]:
     settings = Settings()
     settings.ensure_directories()
+    configure_logging(settings)
     database = Database(settings.database_url)
     database.create_all()
     return settings, database
@@ -77,6 +97,7 @@ def create_task(config: Path = typer.Option(..., "--config", exists=True, readab
         next_run_at=next_run_for(schedule, now=datetime.now(timezone.utc)),
     )
     database.save_task(task)
+    logger.info("创建任务 task_id=%s name=%s enabled=%s", task.id, task.name, task.enabled)
     typer.echo(f"任务已创建：{task.name} ({task.id})，当前为停用状态")
 
 
@@ -115,6 +136,7 @@ def enable_task(task_id: str):
         raise typer.BadParameter("任务不存在")
     next_run = next_run_for(schedule_from_task(task))
     database.update_task(task.id, enabled=True, next_run_at=next_run)
+    logger.info("启用任务 task_id=%s name=%s next_run_at=%s", task.id, task.name, next_run)
     typer.echo(f"任务已启用，下次执行：{next_run}")
 
 
@@ -126,6 +148,7 @@ def disable_task(task_id: str):
     if not task:
         raise typer.BadParameter("任务不存在")
     database.update_task(task.id, enabled=False)
+    logger.info("停用任务 task_id=%s name=%s", task.id, task.name)
     typer.echo(f"任务已停用：{task.name}")
 
 
@@ -133,6 +156,7 @@ def disable_task(task_id: str):
 def run_task(task_id: str):
     """立即执行一次任务。"""
     settings, database = resources()
+    logger.info("手动执行任务 task_id=%s", task_id)
     service = CheckinService(settings, database)
 
     async def execute() -> bool:
@@ -144,6 +168,7 @@ def run_task(task_id: str):
             await service.pool.close()
 
     success = asyncio.run(execute())
+    logger.info("手动执行任务结束 task_id=%s success=%s", task_id, success)
     if not success:
         raise typer.Exit(code=1)
     typer.echo("签到执行成功")
@@ -159,6 +184,7 @@ def cancel_task(task_id: str):
         return await service.cancel_task(task_id)
 
     if asyncio.run(cancel()):
+        logger.info("取消任务 task_id=%s", task_id)
         typer.echo("已发送取消请求")
     else:
         typer.echo("任务当前没有运行实例")
@@ -195,6 +221,5 @@ def import_task(config: Path = typer.Option(..., "--config", exists=True, readab
 @app.command()
 def serve():
     """启动常驻调度服务。"""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings, database = resources()
     asyncio.run(CheckinService(settings, database).run_forever())
