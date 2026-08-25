@@ -23,6 +23,8 @@ class CheckinExecutor:
         bot = await self.client.get_entity(task.target)
         baseline = await self._latest_message_id(entity)
         current_message = None
+        editable_message_ids: set[int] = set()
+        editable_message_texts: dict[int, str] = {}
 
         for index, step in enumerate(task.config["steps"]):
             if self.is_cancelled():
@@ -32,6 +34,8 @@ class CheckinExecutor:
                 if kind == "send_message":
                     current_message = await self.client.send_message(entity, step["text"])
                     baseline = max(baseline, current_message.id)
+                    editable_message_ids.clear()
+                    editable_message_texts.clear()
                 elif kind == "wait_message":
                     current_message = await self._wait_for_message(
                         entity=entity,
@@ -39,12 +43,18 @@ class CheckinExecutor:
                         baseline=baseline,
                         step=step,
                         timeout=step.get("timeout_seconds", 60),
+                        editable_message_ids=editable_message_ids,
+                        editable_message_texts=editable_message_texts,
                     )
                     baseline = max(baseline, current_message.id)
+                    editable_message_ids.clear()
+                    editable_message_texts.clear()
                 elif kind == "click_button":
                     if current_message is None:
                         raise CheckinError("点击按钮步骤前没有可用的机器人消息")
                     button = match_button(current_message, step)
+                    editable_message_ids = {current_message.id}
+                    editable_message_texts = {current_message.id: current_message.raw_text or ""}
                     await self._click(current_message, button, step)
                 else:
                     raise CheckinError(f"不支持的步骤类型：{kind}")
@@ -66,19 +76,33 @@ class CheckinExecutor:
         baseline: int,
         step: dict[str, Any],
         timeout: int,
+        editable_message_ids: set[int] | None = None,
+        editable_message_texts: dict[int, str] | None = None,
     ) -> Any:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
+        editable_message_ids = editable_message_ids or set()
+        editable_message_texts = editable_message_texts or {}
 
-        async def handler(event: Any) -> None:
-            message = event.message
-            if message.id <= baseline or future.done():
+        async def inspect_message(message: Any) -> None:
+            """Resolve the waiter when a new matching bot message is found.
+
+            A response can arrive between the previous step and event-handler
+            registration.  Keeping the same matching logic in one function
+            lets us catch up from message history after registering handlers.
+            """
+            if future.done():
+                return
+            is_editable_message = message.id in editable_message_ids
+            if message.id <= baseline and not is_editable_message:
+                return
+            if is_editable_message and message.raw_text == editable_message_texts.get(message.id):
                 return
             if bot_id is not None:
-                if event.sender_id != bot_id:
+                if getattr(message, "sender_id", None) != bot_id:
                     return
             else:
-                sender = await event.get_sender()
+                sender = await message.get_sender()
                 if not getattr(sender, "bot", False):
                     return
             text = message.raw_text or ""
@@ -89,9 +113,23 @@ class CheckinExecutor:
             if success_rule is None or matches(text, success_rule):
                 future.set_result(message)
 
+        async def handler(event: Any) -> None:
+            await inspect_message(event.message)
+
         self.client.add_event_handler(handler, events.NewMessage(chats=entity))
         self.client.add_event_handler(handler, events.MessageEdited(chats=entity))
         try:
+            # Catch responses that were sent before the event handlers were
+            # attached.  Telegram returns newest messages first, so inspect in
+            # chronological order to preserve the event-handler semantics.
+            min_id = max(0, baseline - 1) if editable_message_ids else baseline
+            messages = await self.client.get_messages(entity, limit=50, min_id=min_id)
+            for message in reversed(messages or []):
+                await inspect_message(message)
+                if future.done():
+                    break
+            if future.done():
+                return await future
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
             self.client.remove_event_handler(handler, events.NewMessage(chats=entity))

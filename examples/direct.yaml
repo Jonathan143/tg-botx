@@ -5,10 +5,10 @@ target: "@example_bot"
 schedule:
   type: fixed
   timezone: Asia/Shanghai
-  time: "09:00:00"
+  time: "10:40:00"
 
 retry:
-  max_attempts: 3
+  max_attempts: 1
   backoff_seconds: [30, 60, 120]
 
 steps:
@@ -16,8 +16,10 @@ steps:
     text: "/checkin"
   - type: wait_message
     success:
-      mode: contains
-      value: "签到成功"
+      - mode: contains
+        value: "签到成功"
+      - mode: contains
+        value: "已完成签到"
     failure:
       mode: contains
       value: "签到失败"
