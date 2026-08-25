@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from getpass import getpass
+
 import qrcode
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
@@ -50,7 +52,7 @@ class AuthService:
         try:
             await client.sign_in(phone=phone, code=code, phone_code_hash=sent.phone_code_hash)
         except SessionPasswordNeededError:
-            password = input("请输入二次验证密码（不会保存）：")
+            password = getpass("请输入二次验证密码（输入内容不会显示，也不会保存）：")
             await client.sign_in(password=password)
         return await client.get_me()
 
@@ -74,13 +76,13 @@ class AuthService:
                 print("二维码已过期，正在刷新……")
                 login = await client.qr_login()
             except SessionPasswordNeededError:
-                password = input("请输入二次验证密码（不会保存）：")
+                password = getpass("请输入二次验证密码（输入内容不会显示，也不会保存）：")
                 await client.sign_in(password=password)
                 break
         try:
             return await client.get_me()
         except SessionPasswordNeededError:
-            password = input("请输入二次验证密码（不会保存）：")
+            password = getpass("请输入二次验证密码（输入内容不会显示，也不会保存）：")
             await client.sign_in(password=password)
             return await client.get_me()
 
