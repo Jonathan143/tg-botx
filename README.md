@@ -6,7 +6,8 @@
 
 ```bash
 cp .env.example .env
-# 填入 https://my.telegram.org 获取的 api_id 和 api_hash
+# 填入 https://my.telegram.org 获取的 api_id/api_hash，并配置后台密钥与 Origin
+# TG_BOT_ADMIN_KEY 建议使用 `openssl rand -base64 48` 生成
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -15,6 +16,10 @@ tg-bot login --method qr
 tg-bot task create --config examples/direct.yaml
 tg-bot serve
 ```
+
+`serve` 会在同一 asyncio 生命周期中启动 APScheduler、Telethon 客户端池和 FastAPI
+后台 API。未配置 `TG_BOT_ADMIN_KEY`/`TG_BOT_ADMIN_ORIGIN` 或密钥少于 32 个 UTF-8 字节时，
+管理 API 会拒绝启动。
 
 `data/` 中包含 SQLite 数据库（以及 Telegram session 和日志），必须持久化并避免提交到 Git。
 
@@ -38,6 +43,31 @@ TG_BOT_LOG_FILE=tg-bot.log
 TG_BOT_LOG_MAX_BYTES=10485760
 TG_BOT_LOG_BACKUP_COUNT=5
 ```
+
+## 后台管理 API
+
+后台假定始终由 HTTPS 反向代理提供同源 `/api`：
+
+```text
+TG_BOT_ADMIN_KEY=<openssl rand -base64 48 的输出>
+TG_BOT_ADMIN_ORIGIN=https://admin.example.com
+TG_BOT_ADMIN_SESSION_DAYS=30
+TG_BOT_API_HOST=0.0.0.0
+TG_BOT_API_PORT=8000
+TG_BOT_TRANSPORT_KEY_ROTATION_HOURS=24
+# 仅当前置反向代理可信时显式填写 CIDR
+TG_BOT_TRUSTED_PROXIES=
+```
+
+`GET /api/auth/key` 返回内存 RSA 公钥和一次性 nonce。前端将所有敏感值编码为 UTF-8 JSON
+`{value:string,nonce:string,timestamp:string}`，再用 RSA-OAEP/SHA-256 加密。登录成功后使用
+`HttpOnly+Secure+SameSite=Strict` Cookie 和内存 CSRF Token。除公钥获取和验证外，
+OpenAPI 与全部管理路由均需认证。
+`POST /api/settings/transport-key/rotate` 可立即轮换传输密钥，旧私钥仅保留 5 分钟宽限期。
+
+Compose 配置只通过 `expose` 向同一 Compose 网络公布 8000 端口，没有宿主机
+`ports` 映射。请将 Web 反向代理加入同一网络，由它将同源 `/api` 转发到
+`http://tg-bot:8000`；不应直接将 Uvicorn 端口暴露到公网。
 
 ## Telegram 机器人通知
 

@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,6 +25,13 @@ class Settings(BaseSettings):
     log_file: str = Field(default="tg-bot.log")
     log_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     log_backup_count: int = Field(default=5, ge=0)
+    admin_key: SecretStr | None = Field(default=None)
+    admin_origin: str | None = Field(default=None)
+    admin_session_days: int = Field(default=30, ge=1, le=365)
+    api_host: str = Field(default="0.0.0.0")
+    api_port: int = Field(default=8000, ge=1, le=65535)
+    transport_key_rotation_hours: int = Field(default=24, ge=1, le=168)
+    trusted_proxies: str = Field(default="")
 
     @field_validator("database", mode="before")
     @classmethod
@@ -34,6 +42,24 @@ class Settings(BaseSettings):
         if normalized in {"sqlite", "sqlite3"}:
             return "sqlite"
         raise ValueError("TG_BOT_DATABASE 仅支持 sqlite 或 postgresql")
+
+    @field_validator("admin_origin")
+    @classmethod
+    def validate_admin_origin(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        origin = value.strip()
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or "," in origin
+        ):
+            raise ValueError("TG_BOT_ADMIN_ORIGIN 必须是唯一的 HTTPS Origin，且不能包含路径")
+        return origin.rstrip("/")
 
     @property
     def admin_chat_id_list(self) -> list[int]:
@@ -81,3 +107,13 @@ class Settings(BaseSettings):
         if not self.api_id or not self.api_hash:
             raise RuntimeError("请在 .env 中配置 TG_BOT_API_ID 和 TG_BOT_API_HASH")
         return self.api_id, self.api_hash
+
+    def require_admin_config(self) -> tuple[str, str]:
+        secret = self.admin_key.get_secret_value() if self.admin_key else ""
+        if len(secret.encode("utf-8")) < 32:
+            raise RuntimeError(
+                "TG_BOT_ADMIN_KEY 未配置或强度不足；请使用 openssl rand -base64 48 生成"
+            )
+        if not self.admin_origin:
+            raise RuntimeError("TG_BOT_ADMIN_ORIGIN 未配置，管理 API 拒绝启动")
+        return secret, self.admin_origin

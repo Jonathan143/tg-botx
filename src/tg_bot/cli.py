@@ -12,6 +12,7 @@ import typer
 from tg_bot.auth import AuthService
 from tg_bot.config import Settings
 from tg_bot.db import Database, Task
+from tg_bot.logging_utils import SensitiveDataFilter
 from tg_bot.runtime import CheckinService
 from tg_bot.schedule import next_run_for, schedule_from_task
 from tg_bot.schemas import TaskDefinition
@@ -34,8 +35,16 @@ def configure_logging(settings: Settings) -> None:
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
+    sensitive_values = [settings.api_hash or "", settings.database_url_override or ""]
+    if settings.admin_key:
+        sensitive_values.append(settings.admin_key.get_secret_value())
+    if settings.notification_bot_token:
+        sensitive_values.append(settings.notification_bot_token.get_secret_value())
+    sensitive_filter = SensitiveDataFilter(sensitive_values)
+    file_handler.addFilter(sensitive_filter)
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(sensitive_filter)
     logging.basicConfig(level=level, handlers=[console_handler, file_handler], force=True)
 
 
@@ -223,6 +232,22 @@ def import_task(config: Path = typer.Option(..., "--config", exists=True, readab
 
 @app.command()
 def serve():
-    """启动常驻调度服务。"""
+    """启动常驻调度服务和后台管理 API。"""
     settings, database = resources(create_schema=False)
-    asyncio.run(CheckinService(settings, database).run_forever())
+    settings.require_admin_config()
+    from tg_bot.admin_api import create_admin_app
+
+    import uvicorn
+
+    service = CheckinService(settings, database)
+    api = create_admin_app(settings, database, service)
+    uvicorn.run(
+        api,
+        host=settings.api_host,
+        port=settings.api_port,
+        log_config=None,
+        # Query strings may contain administrator-selected log filters.  Keep
+        # Uvicorn access logging disabled so request URLs cannot bypass the
+        # application-wide sensitive-data redaction filter.
+        access_log=False,
+    )

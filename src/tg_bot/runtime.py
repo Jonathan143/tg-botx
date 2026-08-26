@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 from contextlib import suppress
@@ -16,8 +17,29 @@ from tg_bot.config import Settings
 from tg_bot.db import Account, Database, Task, TaskRun, utc_now
 from tg_bot.executor import CheckinExecutor, run_with_retries
 from tg_bot.schedule import next_run_for, schedule_from_task
+from tg_bot.schemas import TaskDefinition
 
 logger = logging.getLogger(__name__)
+
+
+class TaskNotFound(LookupError):
+    pass
+
+
+class TaskStateError(RuntimeError):
+    pass
+
+
+class TaskNameConflictError(TaskStateError):
+    pass
+
+
+class AccountNotFoundError(TaskStateError):
+    pass
+
+
+class ManualRunConflict(RuntimeError):
+    pass
 
 
 class ClientPool:
@@ -88,6 +110,7 @@ class NotificationService:
     def _task_time(task: Task, value: datetime | None) -> str:
         if value is None:
             return "未安排"
+        zone: ZoneInfo | timezone
         try:
             zone = ZoneInfo(task.timezone)
         except ZoneInfoNotFoundError:
@@ -245,6 +268,10 @@ class CheckinService:
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self.locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.running: dict[str, asyncio.Task] = {}
+        self._manual_reservations: set[tuple[str, str]] = set()
+        # In-memory generation counters distinguish administrator scheduling
+        # mutations from execution-status writes without a schema migration.
+        self._task_revisions: dict[str, int] = {}
 
     async def start(self) -> None:
         self.settings.ensure_directories()
@@ -258,6 +285,11 @@ class CheckinService:
     async def close(self) -> None:
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
+        active = list(set(self.running.values()))
+        for running in active:
+            running.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
         await self.pool.close()
         await self.notifications.close()
 
@@ -320,6 +352,122 @@ class CheckinService:
             misfire_grace_time=None,
         )
 
+    def _remove_scheduled_task(self, task_id: str) -> None:
+        job = self.scheduler.get_job(f"task:{task_id}")
+        if job is not None:
+            self.scheduler.remove_job(job.id)
+
+    def _sync_schedule(self, task: Task) -> None:
+        if task.enabled and not task.archived and task.next_run_at is not None:
+            self._schedule_task(task)
+        else:
+            self._remove_scheduled_task(task.id)
+
+    def _bump_task_revision(self, task_id: str) -> None:
+        self._task_revisions[task_id] = self._task_revisions.get(task_id, 0) + 1
+
+    @staticmethod
+    def _task_from_definition(account: Account, definition: TaskDefinition) -> Task:
+        schedule = definition.schedule
+        return Task(
+            account_id=account.id,
+            name=definition.name,
+            target=definition.target,
+            timezone=schedule.timezone,
+            schedule_type=schedule.type,
+            fixed_time=schedule.time,
+            random_start=schedule.start,
+            random_end=schedule.end,
+            config_json=json.dumps(definition.model_dump(mode="json"), ensure_ascii=False),
+            enabled=False,
+            next_run_at=None,
+        )
+
+    def create_task(self, definition: TaskDefinition) -> Task:
+        if self.database.get_task_any(definition.name) is not None:
+            raise TaskNameConflictError("任务名称已存在")
+        account = self.database.get_account(definition.account)
+        if account is None:
+            raise AccountNotFoundError("任务绑定的账号不存在")
+        return self.database.save_task(self._task_from_definition(account, definition))
+
+    def edit_task(self, task_id: str, definition: TaskDefinition) -> Task:
+        task = self.database.get_task_any(task_id)
+        if task is None:
+            raise TaskNotFound("任务不存在")
+        if task.archived:
+            raise TaskStateError("归档任务需先恢复后才能编辑")
+        duplicate = self.database.get_task_any(definition.name)
+        if duplicate is not None and duplicate.id != task.id:
+            raise TaskNameConflictError("任务名称已存在")
+        account = self.database.get_account(definition.account)
+        if account is None:
+            raise AccountNotFoundError("任务绑定的账号不存在")
+
+        schedule = definition.schedule
+        next_run = next_run_for(schedule, now=utc_now()) if task.enabled else None
+        updated = self.database.update_task(
+            task.id,
+            account_id=account.id,
+            name=definition.name,
+            target=definition.target,
+            timezone=schedule.timezone,
+            schedule_type=schedule.type,
+            fixed_time=schedule.time,
+            random_start=schedule.start,
+            random_end=schedule.end,
+            config_json=json.dumps(definition.model_dump(mode="json"), ensure_ascii=False),
+            next_run_at=next_run,
+        )
+        self._bump_task_revision(task.id)
+        self._sync_schedule(updated)
+        return updated
+
+    def enable_task(self, task_id: str) -> Task:
+        task = self.database.get_task_any(task_id)
+        if task is None:
+            raise TaskNotFound("任务不存在")
+        if task.archived:
+            raise TaskStateError("归档任务需先恢复后才能启用")
+        next_run = next_run_for(schedule_from_task(task), now=utc_now())
+        updated = self.database.update_task(task.id, enabled=True, next_run_at=next_run)
+        self._bump_task_revision(task.id)
+        self._sync_schedule(updated)
+        return updated
+
+    def disable_task(self, task_id: str) -> Task:
+        task = self.database.get_task_any(task_id)
+        if task is None:
+            raise TaskNotFound("任务不存在")
+        updated = self.database.update_task(task.id, enabled=False, next_run_at=None)
+        self._bump_task_revision(task.id)
+        self._sync_schedule(updated)
+        return updated
+
+    def archive_task(self, task_id: str) -> Task:
+        task = self.database.get_task_any(task_id)
+        if task is None:
+            raise TaskNotFound("任务不存在")
+        # Archiving always disables future scheduling, but deliberately leaves
+        # an already running execution untouched.
+        updated = self.database.update_task(
+            task.id, enabled=False, archived=True, next_run_at=None
+        )
+        self._bump_task_revision(task.id)
+        self._sync_schedule(updated)
+        return updated
+
+    def restore_task(self, task_id: str) -> Task:
+        task = self.database.get_task_any(task_id)
+        if task is None:
+            raise TaskNotFound("任务不存在")
+        updated = self.database.update_task(
+            task.id, archived=False, enabled=False, next_run_at=None
+        )
+        self._bump_task_revision(task.id)
+        self._sync_schedule(updated)
+        return updated
+
     async def _scheduled_run(self, task_id: str) -> None:
         await self.run_task(task_id)
 
@@ -342,7 +490,6 @@ class CheckinService:
 
     async def _record_skipped(self, task: Task) -> None:
         finished = utc_now()
-        next_run = next_run_for(schedule_from_task(task), now=finished)
         run = self.database.add_run(TaskRun(task_id=task.id, planned_at=task.next_run_at))
         self.database.update_run(
             run.id,
@@ -351,33 +498,68 @@ class CheckinService:
             attempts=0,
             error="目标聊天忙碌",
         )
-        self.database.update_task(
-            task.id,
-            last_run_at=finished,
-            last_status="skipped",
-            next_run_at=next_run,
+        next_run = self._update_after_run(
+            task,
+            "skipped",
+            finished,
+            manual=False,
+            revision=self._task_revisions.get(task.id, 0),
         )
-        task.next_run_at = next_run
         await self.notifications.skipped(task, next_run)
-        self._schedule_task(task)
 
-    async def run_task(self, task_id: str) -> bool:
-        task = self.database.get_task(task_id)
-        if not task or task.archived or not task.enabled:
-            raise RuntimeError("任务不存在、已归档或未启用")
-        account = self.database.get_account_by_id(task.account_id)
-        if not account:
-            raise RuntimeError("任务绑定的账号不存在")
+    @staticmethod
+    def _definition_unchanged(snapshot: Task, current: Task) -> bool:
+        return (
+            snapshot.account_id == current.account_id
+            and snapshot.config_json == current.config_json
+        )
+
+    def _update_after_run(
+        self,
+        snapshot: Task,
+        status: str,
+        finished: datetime,
+        *,
+        manual: bool,
+        revision: int,
+    ) -> datetime | None:
+        """Update history fields without letting an old run undo newer edits.
+
+        Execution uses ``snapshot`` throughout.  If an administrator edited,
+        disabled or archived the task while it was running, the edit method
+        has already synchronized the future scheduler state and that state is
+        preserved here.
+        """
+
+        current = self.database.get_task_any(snapshot.id)
+        if current is None:
+            return None
+        values: dict[str, object] = {"last_run_at": finished, "last_status": status}
+        if (
+            not manual
+            and current.enabled
+            and not current.archived
+            and self._task_revisions.get(snapshot.id, 0) == revision
+            and self._definition_unchanged(snapshot, current)
+        ):
+            values["next_run_at"] = next_run_for(schedule_from_task(current), now=finished)
+        updated = self.database.update_task(current.id, **values)
+        self._sync_schedule(updated)
+        return updated.next_run_at
+
+    async def _execute_run(
+        self,
+        task: Task,
+        account: Account,
+        run: TaskRun,
+        *,
+        manual: bool,
+    ) -> bool:
         lock_key = (account.id, task.target)
         lock = self.locks.setdefault(lock_key, asyncio.Lock())
-        if lock.locked():
-            logger.warning("任务 %s 因目标聊天忙碌而跳过本次执行", task.name)
-            await self._record_skipped(task)
-            return False
-
         async with lock:
+            revision = self._task_revisions.get(task.id, 0)
             self.database.update_task(task.id, cancel_requested=False)
-            run = self.database.add_run(TaskRun(task_id=task.id, planned_at=task.next_run_at))
             running = asyncio.current_task()
             if running is None:
                 raise RuntimeError("无法获取当前任务实例")
@@ -388,34 +570,30 @@ class CheckinService:
                 client = await self.pool.get(account)
 
                 def is_cancelled() -> bool:
-                    current = self.database.get_task(task.id)
+                    current = self.database.get_task_any(task.id)
                     return bool(current and current.cancel_requested)
 
                 success, error, attempts, bot_response = await run_with_retries(
                     CheckinExecutor(client, is_cancelled=is_cancelled), task
                 )
                 finished = utc_now()
-                next_run = next_run_for(schedule_from_task(task), now=finished)
+                status = "success" if success else "failed"
                 self.database.update_run(
                     run.id,
                     finished_at=finished,
-                    status="success" if success else "failed",
+                    status=status,
                     attempts=attempts,
                     error=error,
                 )
-                self.database.update_task(
-                    task.id,
-                    last_run_at=finished,
-                    last_status="success" if success else "failed",
-                    next_run_at=next_run,
+                next_run = self._update_after_run(
+                    task, status, finished, manual=manual, revision=revision
                 )
-                task.next_run_at = next_run
                 if self._log_bot_response_enabled(task) and bot_response is not None:
                     logger.info(
                         "机器人回复 task_id=%s name=%s status=%s\n%s",
                         task.id,
                         task.name,
-                        "success" if success else "failed",
+                        status,
                         bot_response,
                     )
                 if success:
@@ -424,26 +602,19 @@ class CheckinService:
                     await self.notifications.failure(
                         task, error or "未知错误", next_run, bot_response
                     )
-                self._schedule_task(task)
                 return success
             except asyncio.CancelledError:
                 finished = utc_now()
-                current = self.database.get_task(task.id)
+                current = self.database.get_task_any(task.id)
                 requested = bool(current and current.cancel_requested)
                 reason = "收到取消请求" if requested else "执行被中断"
-                next_run = next_run_for(schedule_from_task(task), now=finished)
                 self.database.update_run(
                     run.id, finished_at=finished, status="canceled", error=reason
                 )
-                self.database.update_task(
-                    task.id,
-                    last_run_at=finished,
-                    last_status="canceled",
-                    next_run_at=next_run,
+                next_run = self._update_after_run(
+                    task, "canceled", finished, manual=manual, revision=revision
                 )
-                task.next_run_at = next_run
                 await self.notifications.canceled(task, next_run, reason)
-                self._schedule_task(task)
                 if not requested:
                     raise
                 return False
@@ -452,26 +623,94 @@ class CheckinService:
                 self.database.update_run(
                     run.id, finished_at=finished, status="failed", error=str(exc)
                 )
-                next_run = next_run_for(schedule_from_task(task), now=finished)
-                self.database.update_task(
-                    task.id,
-                    last_run_at=finished,
-                    last_status="failed",
-                    next_run_at=next_run,
+                next_run = self._update_after_run(
+                    task, "failed", finished, manual=manual, revision=revision
                 )
                 await self.notifications.failure(task, str(exc), next_run, bot_response)
-                task.next_run_at = next_run
-                self._schedule_task(task)
                 return False
             finally:
                 cancel_watcher.cancel()
                 with suppress(asyncio.CancelledError):
                     await cancel_watcher
                 self.database.update_task(task.id, cancel_requested=False)
+                if self.running.get(task.id) is running:
+                    self.running.pop(task.id, None)
+
+    async def run_task(self, task_id: str) -> bool:
+        task = self.database.get_task(task_id)
+        if not task or task.archived or not task.enabled:
+            raise RuntimeError("任务不存在、已归档或未启用")
+        account = self.database.get_account_by_id(task.account_id)
+        if not account:
+            raise RuntimeError("任务绑定的账号不存在")
+        lock_key = (account.id, task.target)
+        lock = self.locks.setdefault(lock_key, asyncio.Lock())
+        if lock.locked() or lock_key in self._manual_reservations:
+            logger.warning("任务 %s 因目标聊天忙碌而跳过本次执行", task.name)
+            await self._record_skipped(task)
+            return False
+        run = self.database.add_run(TaskRun(task_id=task.id, planned_at=task.next_run_at))
+        return await self._execute_run(task, account, run, manual=False)
+
+    def start_manual_run(self, task_id: str) -> str:
+        """Start a manual execution in the background and return its run row.
+
+        Manual executions are allowed for disabled tasks, do not move the
+        configured future schedule, and fail before inserting history when the
+        account/target serialization key is already occupied.
+        """
+
+        task = self.database.get_task_any(task_id)
+        if task is None:
+            raise TaskNotFound("任务不存在")
+        if task.archived:
+            raise TaskStateError("归档任务不能手动运行")
+        account = self.database.get_account_by_id(task.account_id)
+        if account is None:
+            raise AccountNotFoundError("任务绑定的账号不存在")
+        lock_key = (account.id, task.target)
+        lock = self.locks.setdefault(lock_key, asyncio.Lock())
+        if (
+            lock.locked()
+            or lock_key in self._manual_reservations
+            or task.id in self.running
+        ):
+            raise ManualRunConflict("同一账号和目标当前已有运行实例")
+
+        self.database.update_task(task.id, cancel_requested=False)
+        run = self.database.add_run(TaskRun(task_id=task.id, planned_at=None))
+        self._manual_reservations.add(lock_key)
+
+        async def execute() -> bool:
+            try:
+                return await self._execute_run(task, account, run, manual=True)
+            finally:
+                self._manual_reservations.discard(lock_key)
+
+        running = asyncio.create_task(execute(), name=f"manual:{task.id}:{run.id}")
+        self.running[task.id] = running
+
+        def cleanup(completed: asyncio.Task) -> None:
+            self._manual_reservations.discard(lock_key)
+            if self.running.get(task.id) is completed:
                 self.running.pop(task.id, None)
+            if not completed.cancelled():
+                completed.exception()
+            stored = self.database.get_run(run.id)
+            if stored is not None and stored.status == "running":
+                status = "canceled" if completed.cancelled() else "failed"
+                self.database.update_run(
+                    run.id,
+                    finished_at=utc_now(),
+                    status=status,
+                    error="执行在启动前被取消" if completed.cancelled() else "执行异常中止",
+                )
+
+        running.add_done_callback(cleanup)
+        return run.id
 
     async def cancel_task(self, task_id: str) -> bool:
-        task = self.database.get_task(task_id)
+        task = self.database.get_task_any(task_id)
         if task is None:
             return False
         running = self.running.get(task.id)
