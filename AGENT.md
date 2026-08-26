@@ -71,7 +71,7 @@ tg-bot serve
 
 ```bash
 python3 -m compileall -q src
-rtk git diff --check
+git diff --check
 ```
 
 若依赖尚未安装，不要擅自安装或填写 Telegram 凭证；说明未能执行依赖相关验证即可。真实 Telegram 链路只能在用户授权并提供可用配置后验证。
