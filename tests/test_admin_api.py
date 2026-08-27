@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from tg_bot.admin_api import create_admin_app
 from tg_bot.admin_accounts import LogoutImpact
@@ -297,6 +298,54 @@ def test_task_json_accepts_and_returns_camel_case_for_create_detail_and_edit(tmp
         assert edited.status_code == 200
         assert edited.json()["definition"]["retry"]["maxAttempts"] == 4
         assert edited.json()["definition"]["outputBotResponse"] is False
+
+
+def test_task_events_require_session_and_send_full_initial_snapshot(
+    tmp_path, monkeypatch
+):
+    app = app_for(tmp_path)
+    with TestClient(app, base_url=ORIGIN) as client:
+        unauthorized = client.get("/api/tasks/missing/events")
+        assert unauthorized.status_code == 401
+        assert unauthorized.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        verified = authenticate(client).json()
+        headers = {
+            "Origin": ORIGIN,
+            "Content-Type": "application/json",
+            "X-CSRF-Token": verified["csrfToken"],
+        }
+        definition = {
+            "name": "sse-task",
+            "account": "default",
+            "target": "checkin_bot",
+            "schedule": {"type": "fixed", "timezone": "UTC", "time": "12:00:00"},
+            "steps": [{"type": "send_message", "text": "/checkin"}],
+        }
+        created = client.post("/api/tasks", headers=headers, json={"definition": definition})
+        task_id = created.json()["id"]
+        detail = client.get(f"/api/tasks/{task_id}").json()
+
+        disconnect_checks = iter((False, True))
+
+        async def disconnected(_: Request) -> bool:
+            return next(disconnect_checks)
+
+        monkeypatch.setattr(Request, "is_disconnected", disconnected)
+        monkeypatch.setattr("tg_bot.admin_api.TASK_EVENT_KEEPALIVE_SECONDS", 0.001)
+        response = client.get(f"/api/tasks/{task_id}/events")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["cache-control"] == "no-cache, no-transform"
+        assert response.headers["x-accel-buffering"] == "no"
+        lines = response.text.strip().splitlines()
+        assert lines[0].startswith("id: ")
+        assert int(lines[0].removeprefix("id: ")) > 0
+        assert lines[1] == "event: task.updated"
+        assert json.loads(lines[2].removeprefix("data: ")) == detail
+        assert lines[-1] == ": keepalive"
+        assert app.state.checkin_service._task_subscribers == {}
 
 
 def test_dashboard_returns_trends_health_upcoming_tasks_and_account_status(tmp_path):

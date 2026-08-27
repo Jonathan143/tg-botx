@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 SESSION_COOKIE = "tg_bot_admin_session"
 CSRF_HEADER = "X-CSRF-Token"
+TASK_EVENT_KEEPALIVE_SECONDS = 15
 _LOG_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[ T][^ ]+)\s+"
     r"(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+"
@@ -666,6 +667,56 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         if not task:
             raise APIError("NOT_FOUND", "任务不存在", 404)
         return _task_json(task, database, service)
+
+    @app.get("/api/tasks/{task_id}/events")
+    async def stream_task_events(task_id: str, request: Request) -> StreamingResponse:
+        task = database.get_task_any(task_id)
+        if not task:
+            raise APIError("NOT_FOUND", "任务不存在", 404)
+
+        async def events() -> AsyncIterator[str]:
+            queue = service.subscribe_task(task.id)
+            try:
+                event_id = service.next_task_event_id()
+                current = database.get_task_any(task.id)
+                if current is None:
+                    return
+                payload = json.dumps(
+                    _task_json(current, database, service),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                yield f"id: {event_id}\nevent: task.updated\ndata: {payload}\n\n"
+
+                while not await request.is_disconnected():
+                    try:
+                        event_id = await asyncio.wait_for(
+                            queue.get(), timeout=TASK_EVENT_KEEPALIVE_SECONDS
+                        )
+                    except TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    current = database.get_task_any(task.id)
+                    if current is None:
+                        return
+                    payload = json.dumps(
+                        _task_json(current, database, service),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    yield f"id: {event_id}\nevent: task.updated\ndata: {payload}\n\n"
+            finally:
+                service.unsubscribe_task(task.id, queue)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.patch("/api/tasks/{task_id}")
     async def edit_task(task_id: str, body: TaskBody) -> dict[str, Any]:

@@ -272,6 +272,37 @@ class CheckinService:
         # In-memory generation counters distinguish administrator scheduling
         # mutations from execution-status writes without a schema migration.
         self._task_revisions: dict[str, int] = {}
+        self._task_event_sequence = 0
+        self._task_subscribers: dict[str, set[asyncio.Queue[int]]] = {}
+
+    def next_task_event_id(self) -> int:
+        """Reserve a process-local, monotonically increasing task event ID."""
+
+        self._task_event_sequence += 1
+        return self._task_event_sequence
+
+    def subscribe_task(self, task_id: str) -> asyncio.Queue[int]:
+        """Subscribe to coalesced change notifications for one task."""
+
+        queue: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
+        self._task_subscribers.setdefault(task_id, set()).add(queue)
+        return queue
+
+    def unsubscribe_task(self, task_id: str, queue: asyncio.Queue[int]) -> None:
+        subscribers = self._task_subscribers.get(task_id)
+        if subscribers is None:
+            return
+        subscribers.discard(queue)
+        if not subscribers:
+            self._task_subscribers.pop(task_id, None)
+
+    def _publish_task_updated(self, task_id: str) -> None:
+        event_id = self.next_task_event_id()
+        for queue in tuple(self._task_subscribers.get(task_id, ())):
+            if queue.full():
+                with suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+            queue.put_nowait(event_id)
 
     async def start(self) -> None:
         self.settings.ensure_directories()
@@ -339,6 +370,7 @@ class CheckinService:
             next_run = next_run_for(schedule_from_task(task), now=now)
             self.database.update_task(task.id, next_run_at=next_run)
             task.next_run_at = next_run
+            self._publish_task_updated(task.id)
 
     def _schedule_task(self, task: Task) -> None:
         if task.next_run_at is None:
@@ -389,7 +421,9 @@ class CheckinService:
         account = self.database.get_account(definition.account)
         if account is None:
             raise AccountNotFoundError("任务绑定的账号不存在")
-        return self.database.save_task(self._task_from_definition(account, definition))
+        task = self.database.save_task(self._task_from_definition(account, definition))
+        self._publish_task_updated(task.id)
+        return task
 
     def edit_task(self, task_id: str, definition: TaskDefinition) -> Task:
         task = self.database.get_task_any(task_id)
@@ -421,6 +455,7 @@ class CheckinService:
         )
         self._bump_task_revision(task.id)
         self._sync_schedule(updated)
+        self._publish_task_updated(task.id)
         return updated
 
     def enable_task(self, task_id: str) -> Task:
@@ -433,6 +468,7 @@ class CheckinService:
         updated = self.database.update_task(task.id, enabled=True, next_run_at=next_run)
         self._bump_task_revision(task.id)
         self._sync_schedule(updated)
+        self._publish_task_updated(task.id)
         return updated
 
     def disable_task(self, task_id: str) -> Task:
@@ -442,6 +478,7 @@ class CheckinService:
         updated = self.database.update_task(task.id, enabled=False, next_run_at=None)
         self._bump_task_revision(task.id)
         self._sync_schedule(updated)
+        self._publish_task_updated(task.id)
         return updated
 
     def archive_task(self, task_id: str) -> Task:
@@ -455,6 +492,7 @@ class CheckinService:
         )
         self._bump_task_revision(task.id)
         self._sync_schedule(updated)
+        self._publish_task_updated(task.id)
         return updated
 
     def restore_task(self, task_id: str) -> Task:
@@ -466,6 +504,7 @@ class CheckinService:
         )
         self._bump_task_revision(task.id)
         self._sync_schedule(updated)
+        self._publish_task_updated(task.id)
         return updated
 
     async def _scheduled_run(self, task_id: str) -> None:
@@ -545,6 +584,7 @@ class CheckinService:
             values["next_run_at"] = next_run_for(schedule_from_task(current), now=finished)
         updated = self.database.update_task(current.id, **values)
         self._sync_schedule(updated)
+        self._publish_task_updated(current.id)
         return updated.next_run_at
 
     async def _execute_run(
@@ -564,6 +604,7 @@ class CheckinService:
             if running is None:
                 raise RuntimeError("无法获取当前任务实例")
             self.running[task.id] = running
+            self._publish_task_updated(task.id)
             cancel_watcher = asyncio.create_task(self._watch_cancellation(task.id, running))
             bot_response: str | None = None
             try:
@@ -635,6 +676,7 @@ class CheckinService:
                 self.database.update_task(task.id, cancel_requested=False)
                 if self.running.get(task.id) is running:
                     self.running.pop(task.id, None)
+                self._publish_task_updated(task.id)
 
     async def run_task(self, task_id: str) -> bool:
         task = self.database.get_task(task_id)
@@ -689,6 +731,7 @@ class CheckinService:
 
         running = asyncio.create_task(execute(), name=f"manual:{task.id}:{run.id}")
         self.running[task.id] = running
+        self._publish_task_updated(task.id)
 
         def cleanup(completed: asyncio.Task) -> None:
             self._manual_reservations.discard(lock_key)
@@ -705,6 +748,7 @@ class CheckinService:
                     status=status,
                     error="执行在启动前被取消" if completed.cancelled() else "执行异常中止",
                 )
+            self._publish_task_updated(task.id)
 
         running.add_done_callback(cleanup)
         return run.id
@@ -717,6 +761,7 @@ class CheckinService:
         if running is None and not self.database.has_running_run(task.id):
             return False
         self.database.update_task(task.id, cancel_requested=True)
+        self._publish_task_updated(task.id)
         await self.notifications.cancel_requested(task)
         if running is not None:
             running.cancel()

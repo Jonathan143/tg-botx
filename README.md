@@ -65,6 +65,13 @@ TG_BOT_TRUSTED_PROXIES=
 OpenAPI 与全部管理路由均需认证。
 `POST /api/settings/transport-key/rotate` 可立即轮换传输密钥，旧私钥仅保留 5 分钟宽限期。
 
+任务详情支持 `GET /api/tasks/:id/events` SSE 流。该接口复用管理后台的登录 Cookie，
+不要求 CSRF Token；连接建立后立即发送一次当前任务快照，随后在任务配置、调度或运行状态
+变化时发送 `task.updated` 事件。每条事件的 `data` 都是与 `GET /api/tasks/:id`
+一致的完整 Task JSON，并带有进程内单调递增的 `id`。服务每 15 秒发送一次
+`: keepalive` 注释，响应包含 `X-Accel-Buffering: no`，反向代理也应关闭该路由的响应缓冲。
+客户端断开时服务会释放对应任务的订阅。
+
 Compose 配置只通过 `expose` 向同一 Compose 网络公布 8000 端口，没有宿主机
 `ports` 映射。请将 Web 反向代理加入同一网络，由它将同源 `/api` 转发到
 `http://tg-bot:8000`；不应直接将 Uvicorn 端口暴露到公网。

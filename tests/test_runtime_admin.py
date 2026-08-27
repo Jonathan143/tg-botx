@@ -164,6 +164,52 @@ def test_manual_busy_conflict_does_not_record_skipped(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_task_update_subscription_tracks_manual_run_state(tmp_path, monkeypatch):
+    async def scenario():
+        settings, database = resources(tmp_path)
+        service = CheckinService(settings, database)
+        task = service.create_task(definition("events"))
+        queue = service.subscribe_task(task.id)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_run_with_retries(executor, snapshot):
+            started.set()
+            await release.wait()
+            return True, None, 1, "ok"
+
+        async def fake_get(account):
+            return object()
+
+        monkeypatch.setattr("tg_bot.runtime.run_with_retries", fake_run_with_retries)
+        monkeypatch.setattr(service.pool, "get", fake_get)
+        await service.start()
+        try:
+            service.start_manual_run(task.id)
+            await started.wait()
+            started_event_id = queue.get_nowait()
+            assert task.id in service.running
+            assert database.has_running_run(task.id) is True
+
+            running = service.running[task.id]
+            release.set()
+            assert await running is True
+            finished_event_id = queue.get_nowait()
+            current = database.get_task(task.id)
+            assert finished_event_id > started_event_id
+            assert task.id not in service.running
+            assert database.has_running_run(task.id) is False
+            assert current.last_status == "success"
+            assert current.last_run_at is not None
+            assert current.updated_at >= current.last_run_at
+        finally:
+            service.unsubscribe_task(task.id, queue)
+            assert service._task_subscribers == {}
+            await service.close()
+
+    asyncio.run(scenario())
+
+
 def test_running_snapshot_cannot_overwrite_edit_or_disable(tmp_path, monkeypatch):
     async def scenario():
         settings, database = resources(tmp_path)
