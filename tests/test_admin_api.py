@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from datetime import UTC, datetime, timedelta
@@ -346,6 +347,66 @@ def test_task_events_require_session_and_send_full_initial_snapshot(
         assert json.loads(lines[2].removeprefix("data: ")) == detail
         assert lines[-1] == ": keepalive"
         assert app.state.checkin_service._task_subscribers == {}
+
+
+def test_manual_run_returns_running_task_with_initialized_step_statuses(
+    tmp_path, monkeypatch
+):
+    app = app_for(tmp_path)
+
+    async def blocked_run(executor, task):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr("tg_bot.runtime.run_with_retries", blocked_run)
+    with TestClient(app, base_url=ORIGIN) as client:
+        verified = authenticate(client).json()
+        headers = {
+            "Origin": ORIGIN,
+            "Content-Type": "application/json",
+            "X-CSRF-Token": verified["csrfToken"],
+        }
+        definition = {
+            "name": "manual-sse-task",
+            "account": "default",
+            "target": "checkin_bot",
+            "schedule": {"type": "fixed", "timezone": "UTC", "time": "12:00:00"},
+            "steps": [
+                {"type": "send_message", "text": "/start"},
+                {"type": "wait_message", "timeoutSeconds": 10},
+            ],
+        }
+        task_id = client.post(
+            "/api/tasks", headers=headers, json={"definition": definition}
+        ).json()["id"]
+
+        response = client.post(f"/api/tasks/{task_id}/run", headers=headers, json={})
+
+        assert response.status_code == 202
+        task = response.json()
+        assert task["id"] == task_id
+        assert task["running"] is True
+        assert task["run"]["status"] == "running"
+        assert task["run"]["id"]
+        assert task["run"]["stepStatuses"] == [
+            {"index": 0, "status": "pending"},
+            {"index": 1, "status": "pending"},
+        ]
+        assert "accepted" not in task
+
+        async def disconnected(_: Request) -> bool:
+            return True
+
+        monkeypatch.setattr(Request, "is_disconnected", disconnected)
+        event_response = client.get(f"/api/tasks/{task_id}/events")
+        event_lines = event_response.text.strip().splitlines()
+        event_task = json.loads(event_lines[2].removeprefix("data: "))
+        assert event_lines[1] == "event: task.updated"
+        assert event_task["running"] is True
+        assert event_task["run"]["id"] == task["run"]["id"]
+        assert event_task["run"]["stepStatuses"] == task["run"]["stepStatuses"]
+
+        canceled = client.post(f"/api/tasks/{task_id}/cancel", headers=headers, json={})
+        assert canceled.status_code == 202
 
 
 def test_dashboard_returns_trends_health_upcoming_tasks_and_account_status(tmp_path):

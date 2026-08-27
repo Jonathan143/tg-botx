@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, Literal
 
 from telethon import TelegramClient, events
 
@@ -16,9 +16,33 @@ class CheckinError(RuntimeError):
 
 
 class CheckinExecutor:
-    def __init__(self, client: TelegramClient, is_cancelled: Callable[[], bool] | None = None):
+    def __init__(
+        self,
+        client: TelegramClient,
+        is_cancelled: Callable[[], bool] | None = None,
+        on_attempt: Callable[[int], Awaitable[None]] | None = None,
+        on_step_status: Callable[
+            [int, Literal["running", "success", "failed"], str | None], Awaitable[None]
+        ]
+        | None = None,
+    ):
         self.client = client
         self.is_cancelled = is_cancelled or (lambda: False)
+        self.on_attempt = on_attempt
+        self.on_step_status = on_step_status
+
+    async def begin_attempt(self, attempt: int) -> None:
+        if self.on_attempt is not None:
+            await self.on_attempt(attempt)
+
+    async def report_step_status(
+        self,
+        index: int,
+        status: Literal["running", "success", "failed"],
+        error: str | None = None,
+    ) -> None:
+        if self.on_step_status is not None:
+            await self.on_step_status(index, status, error)
 
     async def execute(self, task: Any) -> str | None:
         entity = await self.client.get_entity(task.target)
@@ -33,6 +57,7 @@ class CheckinExecutor:
             if self.is_cancelled():
                 raise asyncio.CancelledError
             kind = step["type"]
+            await self.report_step_status(index, "running")
             try:
                 if kind == "send_message":
                     current_message = await self.client.send_message(entity, step["text"])
@@ -62,14 +87,23 @@ class CheckinExecutor:
                     await self._click(current_message, button, step)
                 else:
                     raise CheckinError(f"不支持的步骤类型：{kind}")
+            except asyncio.CancelledError:
+                await self.report_step_status(index, "failed", "任务已取消")
+                raise
             except asyncio.TimeoutError as exc:
-                raise CheckinError(f"步骤 {index + 1} 等待超时", bot_response) from exc
+                error = CheckinError(f"步骤 {index + 1} 等待超时", bot_response)
+                await self.report_step_status(index, "failed", str(error))
+                raise error from exc
             except CheckinError as exc:
                 if exc.bot_response is None:
                     exc.bot_response = bot_response
+                await self.report_step_status(index, "failed", str(exc))
                 raise
             except Exception as exc:
-                raise CheckinError(f"步骤 {index + 1} 执行失败：{exc}", bot_response) from exc
+                error = CheckinError(f"步骤 {index + 1} 执行失败：{exc}", bot_response)
+                await self.report_step_status(index, "failed", str(error))
+                raise error from exc
+            await self.report_step_status(index, "success")
         return bot_response
 
     async def _latest_message_id(self, entity: Any) -> int:
@@ -164,6 +198,7 @@ async def run_with_retries(
     for attempt in range(1, max_attempts + 1):
         if executor.is_cancelled():
             raise asyncio.CancelledError
+        await executor.begin_attempt(attempt)
         try:
             bot_response = await executor.execute(task)
             return True, None, attempt, bot_response
@@ -171,5 +206,6 @@ async def run_with_retries(
             error = str(exc)
             bot_response = getattr(exc, "bot_response", None)
             if attempt < max_attempts:
-                await asyncio.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
+                delay = backoff[min(attempt - 1, len(backoff) - 1)] if backoff else 0
+                await asyncio.sleep(delay)
     return False, error, max_attempts, bot_response

@@ -111,6 +111,13 @@ def _iso(value: datetime | str | None) -> str | None:
 
 def _task_json(task: Task, database: Database, service: CheckinService) -> dict[str, Any]:
     account = database.get_account_by_id(task.account_id)
+    run = service.get_task_run_progress(task.id)
+    if run is not None:
+        if isinstance(run.get("error"), str):
+            run["error"] = redact_sensitive(run["error"])
+        for step in run["stepStatuses"]:
+            if isinstance(step.get("error"), str):
+                step["error"] = redact_sensitive(step["error"])
     schedule: dict[str, Any] = {"type": task.schedule_type, "timezone": task.timezone}
     if task.schedule_type == "fixed":
         schedule["time"] = task.fixed_time
@@ -131,6 +138,7 @@ def _task_json(task: Task, database: Database, service: CheckinService) -> dict[
         "nextRunAt": _iso(task.next_run_at),
         "lastRunAt": _iso(task.last_run_at),
         "lastStatus": task.last_status,
+        "run": run,
         "createdAt": _iso(task.created_at),
         "updatedAt": _iso(task.updated_at),
     }
@@ -758,14 +766,17 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     @app.post("/api/tasks/{task_id}/run", status_code=202)
     async def run_task(task_id: str, _: EmptyBody) -> dict[str, Any]:
         try:
-            run_id = service.start_manual_run(task_id)
+            service.start_manual_run(task_id)
         except TaskNotFound as exc:
             raise APIError("NOT_FOUND", "任务不存在", 404) from exc
         except ManualRunConflict as exc:
             raise APIError("TASK_BUSY", "同一账号和目标已有任务在执行", 409) from exc
         except TaskStateError as exc:
             raise APIError("CONFLICT", str(exc), 409) from exc
-        return {"accepted": True, "taskId": task_id, "runId": run_id}
+        task = database.get_task_any(task_id)
+        if task is None:
+            raise APIError("NOT_FOUND", "任务不存在", 404)
+        return _task_json(task, database, service)
 
     @app.post("/api/tasks/{task_id}/cancel", status_code=202)
     async def cancel_task(task_id: str, _: EmptyBody) -> dict[str, Any]:

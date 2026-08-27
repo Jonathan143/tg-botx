@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -202,9 +203,244 @@ def test_task_update_subscription_tracks_manual_run_state(tmp_path, monkeypatch)
             assert current.last_status == "success"
             assert current.last_run_at is not None
             assert current.updated_at >= current.last_run_at
+            progress = service.get_task_run_progress(task.id)
+            assert progress["status"] == "success"
+            assert progress["stepStatuses"] == [{"index": 0, "status": "success"}]
         finally:
             service.unsubscribe_task(task.id, queue)
             assert service._task_subscribers == {}
+            await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_step_progress_is_published_by_index_and_retries_reset_attempt(tmp_path):
+    async def scenario():
+        settings, database = resources(tmp_path)
+        service = CheckinService(settings, database)
+        task = service.create_task(
+            TaskDefinition.model_validate(
+                {
+                    "name": "step-events",
+                    "account": "default",
+                    "target": "checkin_bot",
+                    "schedule": {
+                        "type": "fixed",
+                        "timezone": "UTC",
+                        "time": "23:59:00",
+                    },
+                    "retry": {"maxAttempts": 2, "backoffSeconds": [0]},
+                    "steps": [
+                        {"type": "send_message", "text": "/start"},
+                        {"type": "send_message", "text": "/finish"},
+                    ],
+                }
+            )
+        )
+        first_attempt_failed = asyncio.Event()
+        second_step_started = asyncio.Event()
+        release_second_step = asyncio.Event()
+
+        class FakeClient:
+            send_count = 0
+
+            async def get_entity(self, target):
+                return SimpleNamespace(id=1, bot=True)
+
+            async def get_messages(self, entity, **kwargs):
+                return []
+
+            async def send_message(self, entity, text):
+                self.send_count += 1
+                if self.send_count == 1:
+                    first_attempt_failed.set()
+                    raise RuntimeError("首次发送失败")
+                if text == "/finish":
+                    second_step_started.set()
+                    await release_second_step.wait()
+                return SimpleNamespace(id=self.send_count)
+
+        fake_client = FakeClient()
+
+        async def fake_get(account):
+            return fake_client
+
+        service.pool.get = fake_get
+        await service.start()
+        try:
+            service.start_manual_run(task.id)
+            await first_attempt_failed.wait()
+            await second_step_started.wait()
+            progress = service.get_task_run_progress(task.id)
+            assert progress["attempt"] == 2
+            assert progress["status"] == "running"
+            assert progress["stepStatuses"] == [
+                {"index": 0, "status": "success"},
+                {"index": 1, "status": "running"},
+            ]
+
+            running = service.running[task.id]
+            release_second_step.set()
+            assert await running is True
+            progress = service.get_task_run_progress(task.id)
+            assert progress["status"] == "success"
+            assert progress["attempt"] == 2
+            assert progress["stepStatuses"] == [
+                {"index": 0, "status": "success"},
+                {"index": 1, "status": "success"},
+            ]
+        finally:
+            await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_marks_running_step_failed_and_remaining_steps_skipped(tmp_path):
+    async def scenario():
+        settings, database = resources(tmp_path)
+        service = CheckinService(settings, database)
+        task = service.create_task(
+            TaskDefinition.model_validate(
+                {
+                    "name": "cancel-steps",
+                    "account": "default",
+                    "target": "checkin_bot",
+                    "schedule": {
+                        "type": "fixed",
+                        "timezone": "UTC",
+                        "time": "23:59:00",
+                    },
+                    "steps": [
+                        {"type": "send_message", "text": "/start"},
+                        {"type": "send_message", "text": "/never"},
+                    ],
+                }
+            )
+        )
+        step_started = asyncio.Event()
+
+        class FakeClient:
+            async def get_entity(self, target):
+                return SimpleNamespace(id=1, bot=True)
+
+            async def get_messages(self, entity, **kwargs):
+                return []
+
+            async def send_message(self, entity, text):
+                step_started.set()
+                await asyncio.Event().wait()
+
+        async def fake_get(account):
+            return FakeClient()
+
+        service.pool.get = fake_get
+        await service.start()
+        try:
+            service.start_manual_run(task.id)
+            await step_started.wait()
+            running = service.running[task.id]
+            assert await service.cancel_task(task.id) is True
+            assert await running is False
+
+            progress = service.get_task_run_progress(task.id)
+            assert progress["status"] == "canceled"
+            assert progress["error"] == "收到取消请求"
+            assert progress["stepStatuses"] == [
+                {"index": 0, "status": "failed", "error": "任务已取消"},
+                {"index": 1, "status": "skipped"},
+            ]
+            assert database.get_task(task.id).last_status == "canceled"
+        finally:
+            await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_run_keeps_failed_step_error_and_skips_later_steps(tmp_path):
+    async def scenario():
+        settings, database = resources(tmp_path)
+        service = CheckinService(settings, database)
+        task = service.create_task(
+            TaskDefinition.model_validate(
+                {
+                    "name": "failed-steps",
+                    "account": "default",
+                    "target": "checkin_bot",
+                    "schedule": {
+                        "type": "fixed",
+                        "timezone": "UTC",
+                        "time": "23:59:00",
+                    },
+                    "retry": {"maxAttempts": 1, "backoffSeconds": []},
+                    "steps": [
+                        {"type": "send_message", "text": "/fail"},
+                        {"type": "send_message", "text": "/never"},
+                    ],
+                }
+            )
+        )
+
+        class FakeClient:
+            async def get_entity(self, target):
+                return SimpleNamespace(id=1, bot=True)
+
+            async def get_messages(self, entity, **kwargs):
+                return []
+
+            async def send_message(self, entity, text):
+                raise RuntimeError("发送失败")
+
+        async def fake_get(account):
+            return FakeClient()
+
+        service.pool.get = fake_get
+        await service.start()
+        try:
+            service.start_manual_run(task.id)
+            running = service.running[task.id]
+            assert await running is False
+
+            progress = service.get_task_run_progress(task.id)
+            assert progress["status"] == "failed"
+            assert progress["attempt"] == 1
+            assert progress["stepStatuses"] == [
+                {
+                    "index": 0,
+                    "status": "failed",
+                    "error": "步骤 1 执行失败：发送失败",
+                },
+                {"index": 1, "status": "skipped"},
+            ]
+            assert database.get_task(task.id).last_status == "failed"
+        finally:
+            await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_before_execution_starts_still_finalizes_task_and_steps(tmp_path):
+    async def scenario():
+        settings, database = resources(tmp_path)
+        service = CheckinService(settings, database)
+        task = service.create_task(definition("cancel-before-start"))
+        await service.start()
+        try:
+            service.start_manual_run(task.id)
+            running = service.running[task.id]
+            assert await service.cancel_task(task.id) is True
+            with pytest.raises(asyncio.CancelledError):
+                await running
+            await asyncio.sleep(0)
+
+            current = database.get_task(task.id)
+            progress = service.get_task_run_progress(task.id)
+            assert current.last_status == "canceled"
+            assert current.last_run_at is not None
+            assert progress["status"] == "canceled"
+            assert progress["stepStatuses"] == [
+                {"index": 0, "status": "skipped"}
+            ]
+        finally:
             await service.close()
 
     asyncio.run(scenario())

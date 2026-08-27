@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import signal
@@ -274,6 +275,7 @@ class CheckinService:
         self._task_revisions: dict[str, int] = {}
         self._task_event_sequence = 0
         self._task_subscribers: dict[str, set[asyncio.Queue[int]]] = {}
+        self._task_run_progress: dict[str, dict[str, object]] = {}
 
     def next_task_event_id(self) -> int:
         """Reserve a process-local, monotonically increasing task event ID."""
@@ -303,6 +305,81 @@ class CheckinService:
                 with suppress(asyncio.QueueEmpty):
                     queue.get_nowait()
             queue.put_nowait(event_id)
+
+    def get_task_run_progress(self, task_id: str) -> dict[str, object] | None:
+        progress = self._task_run_progress.get(task_id)
+        return copy.deepcopy(progress) if progress is not None else None
+
+    def _initialize_run_progress(self, task: Task, run: TaskRun) -> None:
+        self._task_run_progress[task.id] = {
+            "id": run.id,
+            "status": "running",
+            "attempt": 0,
+            "stepStatuses": [
+                {"index": index, "status": "pending"}
+                for index, _ in enumerate(task.config["steps"])
+            ],
+        }
+
+    def _begin_run_attempt(self, task_id: str, run_id: str, attempt: int) -> None:
+        progress = self._task_run_progress.get(task_id)
+        if progress is None or progress["id"] != run_id:
+            return
+        progress["status"] = "running"
+        progress["attempt"] = attempt
+        progress.pop("error", None)
+        for step in progress["stepStatuses"]:
+            step["status"] = "pending"
+            step.pop("error", None)
+        self._publish_task_updated(task_id)
+
+    def _update_run_step(
+        self,
+        task_id: str,
+        run_id: str,
+        index: int,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        progress = self._task_run_progress.get(task_id)
+        if progress is None or progress["id"] != run_id:
+            return
+        steps = progress["stepStatuses"]
+        if not 0 <= index < len(steps):
+            return
+        step = steps[index]
+        step["status"] = status
+        if error is None:
+            step.pop("error", None)
+        else:
+            step["error"] = error
+        self._publish_task_updated(task_id)
+
+    def _finalize_run_progress(
+        self,
+        task_id: str,
+        run_id: str,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        progress = self._task_run_progress.get(task_id)
+        if progress is None or progress["id"] != run_id:
+            return
+        progress["status"] = status
+        if error is None:
+            progress.pop("error", None)
+        else:
+            progress["error"] = error
+        for step in progress["stepStatuses"]:
+            if status == "success":
+                step["status"] = "success"
+                step.pop("error", None)
+            elif step["status"] == "running":
+                step["status"] = "failed"
+                step["error"] = error or "任务执行失败"
+            elif step["status"] == "pending":
+                step["status"] = "skipped"
+                step.pop("error", None)
 
     async def start(self) -> None:
         self.settings.ensure_directories()
@@ -530,6 +607,7 @@ class CheckinService:
     async def _record_skipped(self, task: Task) -> None:
         finished = utc_now()
         run = self.database.add_run(TaskRun(task_id=task.id, planned_at=task.next_run_at))
+        self._initialize_run_progress(task, run)
         self.database.update_run(
             run.id,
             finished_at=finished,
@@ -537,6 +615,7 @@ class CheckinService:
             attempts=0,
             error="目标聊天忙碌",
         )
+        self._finalize_run_progress(task.id, run.id, "skipped", "目标聊天忙碌")
         next_run = self._update_after_run(
             task,
             "skipped",
@@ -614,8 +693,22 @@ class CheckinService:
                     current = self.database.get_task_any(task.id)
                     return bool(current and current.cancel_requested)
 
+                async def on_attempt(attempt: int) -> None:
+                    self._begin_run_attempt(task.id, run.id, attempt)
+
+                async def on_step_status(
+                    index: int, status: str, error: str | None
+                ) -> None:
+                    self._update_run_step(task.id, run.id, index, status, error)
+
                 success, error, attempts, bot_response = await run_with_retries(
-                    CheckinExecutor(client, is_cancelled=is_cancelled), task
+                    CheckinExecutor(
+                        client,
+                        is_cancelled=is_cancelled,
+                        on_attempt=on_attempt,
+                        on_step_status=on_step_status,
+                    ),
+                    task,
                 )
                 finished = utc_now()
                 status = "success" if success else "failed"
@@ -626,6 +719,7 @@ class CheckinService:
                     attempts=attempts,
                     error=error,
                 )
+                self._finalize_run_progress(task.id, run.id, status, error)
                 next_run = self._update_after_run(
                     task, status, finished, manual=manual, revision=revision
                 )
@@ -652,6 +746,7 @@ class CheckinService:
                 self.database.update_run(
                     run.id, finished_at=finished, status="canceled", error=reason
                 )
+                self._finalize_run_progress(task.id, run.id, "canceled", reason)
                 next_run = self._update_after_run(
                     task, "canceled", finished, manual=manual, revision=revision
                 )
@@ -664,6 +759,7 @@ class CheckinService:
                 self.database.update_run(
                     run.id, finished_at=finished, status="failed", error=str(exc)
                 )
+                self._finalize_run_progress(task.id, run.id, "failed", str(exc))
                 next_run = self._update_after_run(
                     task, "failed", finished, manual=manual, revision=revision
                 )
@@ -692,6 +788,7 @@ class CheckinService:
             await self._record_skipped(task)
             return False
         run = self.database.add_run(TaskRun(task_id=task.id, planned_at=task.next_run_at))
+        self._initialize_run_progress(task, run)
         return await self._execute_run(task, account, run, manual=False)
 
     def start_manual_run(self, task_id: str) -> str:
@@ -721,7 +818,9 @@ class CheckinService:
 
         self.database.update_task(task.id, cancel_requested=False)
         run = self.database.add_run(TaskRun(task_id=task.id, planned_at=None))
+        self._initialize_run_progress(task, run)
         self._manual_reservations.add(lock_key)
+        revision = self._task_revisions.get(task.id, 0)
 
         async def execute() -> bool:
             try:
@@ -742,11 +841,23 @@ class CheckinService:
             stored = self.database.get_run(run.id)
             if stored is not None and stored.status == "running":
                 status = "canceled" if completed.cancelled() else "failed"
+                finished = utc_now()
+                error = (
+                    "执行在启动前被取消" if completed.cancelled() else "执行异常中止"
+                )
                 self.database.update_run(
                     run.id,
-                    finished_at=utc_now(),
+                    finished_at=finished,
                     status=status,
-                    error="执行在启动前被取消" if completed.cancelled() else "执行异常中止",
+                    error=error,
+                )
+                self._finalize_run_progress(task.id, run.id, status, error)
+                self._update_after_run(
+                    task,
+                    status,
+                    finished,
+                    manual=True,
+                    revision=revision,
                 )
             self._publish_task_updated(task.id)
 
