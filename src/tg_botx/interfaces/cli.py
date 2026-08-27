@@ -252,4 +252,7 @@ def serve():
         # Uvicorn access logging disabled so request URLs cannot bypass the
         # application-wide sensitive-data redaction filter.
         access_log=False,
+        # SSE endpoints intentionally keep connections open.  Do not let one
+        # abandoned browser connection block process shutdown forever.
+        timeout_graceful_shutdown=5,
     )

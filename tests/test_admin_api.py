@@ -333,7 +333,7 @@ def test_task_events_require_session_and_send_full_initial_snapshot(
             return next(disconnect_checks)
 
         monkeypatch.setattr(Request, "is_disconnected", disconnected)
-    monkeypatch.setattr("tg_botx.interfaces.admin.admin_api.TASK_EVENT_KEEPALIVE_SECONDS", 0.001)
+        monkeypatch.setattr("tg_botx.interfaces.admin.admin_api.TASK_EVENT_KEEPALIVE_SECONDS", 0.001)
         response = client.get(f"/api/tasks/{task_id}/events")
 
         assert response.status_code == 200
