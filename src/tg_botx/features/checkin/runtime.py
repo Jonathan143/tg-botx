@@ -14,11 +14,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from telethon import TelegramClient
 
-from tg_bot.config import Settings
-from tg_bot.db import Account, Database, Task, TaskRun, utc_now
-from tg_bot.executor import CheckinExecutor, run_with_retries
-from tg_bot.schedule import next_run_for, schedule_from_task
-from tg_bot.schemas import TaskDefinition
+from tg_botx.config import Settings
+from tg_botx.features.checkin.executor import CheckinExecutor, run_with_retries
+from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
+from tg_botx.infrastructure.persistence.db import Account, Database, Task, TaskRun, utc_now
+from tg_botx.schemas import TaskDefinition
 
 logger = logging.getLogger(__name__)
 

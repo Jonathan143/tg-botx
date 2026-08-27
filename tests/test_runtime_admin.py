@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from tg_bot.config import Settings
-from tg_bot.db import Account, Database, TaskRun, utc_now
-from tg_bot.runtime import CheckinService, ManualRunConflict
-from tg_bot.schemas import TaskDefinition
+from tg_botx.config import Settings
+from tg_botx.infrastructure.persistence.db import Account, Database, TaskRun, utc_now
+from tg_botx.features.checkin.runtime import CheckinService, ManualRunConflict
+from tg_botx.schemas import TaskDefinition
 
 
 def definition(
@@ -141,7 +141,7 @@ def test_manual_busy_conflict_does_not_record_skipped(tmp_path, monkeypatch):
         async def fake_get(account):
             return object()
 
-        monkeypatch.setattr("tg_bot.runtime.run_with_retries", fake_run_with_retries)
+        monkeypatch.setattr("tg_botx.features.checkin.runtime.run_with_retries", fake_run_with_retries)
         monkeypatch.setattr(service.pool, "get", fake_get)
         await service.start()
         try:
@@ -182,7 +182,7 @@ def test_task_update_subscription_tracks_manual_run_state(tmp_path, monkeypatch)
         async def fake_get(account):
             return object()
 
-        monkeypatch.setattr("tg_bot.runtime.run_with_retries", fake_run_with_retries)
+        monkeypatch.setattr("tg_botx.features.checkin.runtime.run_with_retries", fake_run_with_retries)
         monkeypatch.setattr(service.pool, "get", fake_get)
         await service.start()
         try:
@@ -465,7 +465,7 @@ def test_running_snapshot_cannot_overwrite_edit_or_disable(tmp_path, monkeypatch
         async def fake_get(account):
             return object()
 
-        monkeypatch.setattr("tg_bot.runtime.run_with_retries", fake_run_with_retries)
+        monkeypatch.setattr("tg_botx.features.checkin.runtime.run_with_retries", fake_run_with_retries)
         monkeypatch.setattr(service.pool, "get", fake_get)
         await service.start()
         try:

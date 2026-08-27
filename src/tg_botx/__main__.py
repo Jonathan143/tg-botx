@@ -1,4 +1,4 @@
-from tg_bot.cli import app
+from tg_botx.interfaces.cli import app
 
 
 if __name__ == "__main__":

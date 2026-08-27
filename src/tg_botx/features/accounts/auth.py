@@ -7,8 +7,8 @@ import qrcode
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
-from tg_bot.config import Settings
-from tg_bot.db import Account, Database
+from tg_botx.config import Settings
+from tg_botx.infrastructure.persistence.db import Account, Database
 
 
 class AuthService:

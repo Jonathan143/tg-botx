@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
 
-from tg_bot.auth import AuthService
-from tg_bot.config import Settings
-from tg_bot.db import Database, Task
-from tg_bot.logging_utils import SensitiveDataFilter
-from tg_bot.runtime import CheckinService
-from tg_bot.schedule import next_run_for, schedule_from_task
-from tg_bot.schemas import TaskDefinition
+from tg_botx.config import Settings
+from tg_botx.features.accounts.auth import AuthService
+from tg_botx.features.checkin.runtime import CheckinService
+from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
+from tg_botx.infrastructure.observability.logging import SensitiveDataFilter
+from tg_botx.infrastructure.persistence.db import Database, Task
+from tg_botx.schemas import TaskDefinition
 
 app = typer.Typer(help="Telegram 用户账号签到调度器")
 task_app = typer.Typer(help="管理签到任务")
@@ -237,7 +237,7 @@ def serve():
     # sessions) are present when an existing installation is restarted.
     settings, database = resources()
     settings.require_admin_config()
-    from tg_bot.admin_api import create_admin_app
+    from tg_botx.interfaces.admin.admin_api import create_admin_app
 
     import uvicorn
 

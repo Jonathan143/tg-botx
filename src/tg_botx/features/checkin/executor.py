@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from telethon import TelegramClient, events
 
-from tg_bot.matching import match_button, matches
+from tg_botx.features.checkin.matching import match_button, matches
 
 
 class CheckinError(RuntimeError):

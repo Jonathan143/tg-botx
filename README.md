@@ -2,6 +2,11 @@
 
 基于 Telegram 用户账号的签到调度服务，支持手机号/验证码、二维码登录，直接指令签到，以及等待消息后点击按钮的链式签到。
 
+项目使用 Python 3.12+、`src/` 布局和显式分层设计。当前默认启用签到调度；机器人管理、频道通知和群监控以独立 feature/adapter 形式预留，便于逐步上线而不影响现有任务。
+
+架构说明见 [`docs/architecture.md`](docs/architecture.md)。
+业务代码统一从 `tg_botx.infrastructure`、`tg_botx.features` 和 `tg_botx.interfaces` 子包导入。
+
 ## 快速开始
 
 ```bash
@@ -136,6 +141,30 @@ tg-bot task export <task-id> --output task.yaml
 tg-bot task import --config task.yaml
 tg-bot serve
 ```
+
+## 开发与代码规范
+
+安装开发依赖并执行完整检查：
+
+```bash
+make dev
+make check
+```
+
+项目统一使用 Ruff 格式化与静态检查、mypy 类型检查和 pytest 测试。业务代码放在 `src/tg_botx`，测试放在 `tests`；新增环境变量时同步更新 `Settings`、`.env.example` 和文档。
+
+### 后续能力开关
+
+以下开关默认关闭，开启前请先完成对应 Telegram 账号、权限和限流策略配置：
+
+```text
+TG_BOT_BOT_ENABLED=false
+TG_BOT_CHANNEL_NOTIFICATIONS_ENABLED=false
+TG_BOT_GROUP_MONITOR_ENABLED=false
+TG_BOT_GROUP_MONITOR_HISTORY_LIMIT=500
+```
+
+`tg_botx.features` 提供可复用的 `CommandRegistry`、`ChannelNotifier` 和 `GroupMonitor`；它们只依赖抽象 transport/handler，可在管理 API、常驻服务或独立 worker 中组装。
 
 任务配置采用 YAML，步骤仅允许内置类型，不执行任意 Python 或 Shell。
 

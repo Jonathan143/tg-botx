@@ -8,9 +8,9 @@ from types import SimpleNamespace
 import pytest
 from telethon.errors import SessionPasswordNeededError
 
-from tg_bot.admin_accounts import AdminAccountError, LoginFlowManager
-from tg_bot.config import Settings
-from tg_bot.db import Account, Database, Task, utc_now
+from tg_botx.interfaces.admin.admin_accounts import AdminAccountError, LoginFlowManager
+from tg_botx.config import Settings
+from tg_botx.infrastructure.persistence.db import Account, Database, Task, utc_now
 
 
 class FakeQrLogin:

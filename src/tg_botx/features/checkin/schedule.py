@@ -4,8 +4,8 @@ import random
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from tg_bot.db import Task
-from tg_bot.schemas import ScheduleConfig
+from tg_botx.infrastructure.persistence.db import Task
+from tg_botx.schemas import ScheduleConfig
 
 
 def parse_clock(value: str) -> time:

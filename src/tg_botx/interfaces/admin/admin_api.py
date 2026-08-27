@@ -22,24 +22,24 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from tg_bot.admin_accounts import AdminAccountError, LoginFlowManager
-from tg_bot.admin_security import (
+from tg_botx.config import Settings
+from tg_botx.features.checkin.runtime import (
+    CheckinService,
+    ManualRunConflict,
+    TaskNotFound,
+    TaskStateError,
+)
+from tg_botx.infrastructure.observability.logging import allowed_log_files, redact_sensitive
+from tg_botx.infrastructure.persistence.db import Database, Task, TaskRun, utc_now
+from tg_botx.interfaces.admin.admin_accounts import AdminAccountError, LoginFlowManager
+from tg_botx.interfaces.admin.admin_security import (
     FailureRateLimiter,
     SecurityError,
     SessionManager,
     TransportKeyManager,
     resolve_client_ip,
 )
-from tg_bot.config import Settings
-from tg_bot.db import Database, Task, TaskRun, utc_now
-from tg_bot.logging_utils import allowed_log_files, redact_sensitive
-from tg_bot.runtime import (
-    CheckinService,
-    ManualRunConflict,
-    TaskNotFound,
-    TaskStateError,
-)
-from tg_bot.schemas import TaskDefinition
+from tg_botx.schemas import TaskDefinition
 
 logger = logging.getLogger(__name__)
 

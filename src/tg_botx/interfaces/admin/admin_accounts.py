@@ -21,8 +21,8 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 
-from tg_bot.config import Settings
-from tg_bot.db import Account, Database, utc_now
+from tg_botx.config import Settings
+from tg_botx.infrastructure.persistence.db import Account, Database, utc_now
 
 
 LoginMethod = Literal["qr", "phone"]

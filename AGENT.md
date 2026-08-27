@@ -29,15 +29,18 @@ tg-bot serve
 
 ## 目录与模块职责
 
-- `src/tg_bot/config.py`：环境变量、数据目录及日志配置。
-- `src/tg_bot/schemas.py`：任务 YAML 的 Pydantic 模型和输入校验。
-- `src/tg_bot/db.py`：SQLAlchemy 模型、SQLite/PostgreSQL 初始化与数据访问。
-- `src/tg_bot/auth.py`：手机号和二维码登录、退出登录及 session 管理。
-- `src/tg_bot/executor.py`：消息发送、回复等待、按钮点击和失败重试。
-- `src/tg_bot/matching.py`：消息与按钮匹配规则。
-- `src/tg_bot/schedule.py`：固定/随机调度时间计算和时区转换。
-- `src/tg_bot/runtime.py`：客户端池、任务调度、并发锁、通知和取消。
-- `src/tg_bot/cli.py`：Typer CLI 入口和日志初始化。
+- `src/tg_botx/config.py`：环境变量、数据目录及日志配置。
+- `src/tg_botx/schemas.py`：任务 YAML 的 Pydantic 模型和输入校验。
+- `src/tg_botx/infrastructure/persistence/`：SQLAlchemy 模型、SQLite/PostgreSQL 初始化与数据访问。
+- `src/tg_botx/features/accounts/`：手机号和二维码登录、退出登录及 session 管理。
+- `src/tg_botx/features/checkin/`：消息执行、匹配规则和固定/随机调度。
+- `src/tg_botx/features/checkin/runtime.py`：客户端池、任务调度、并发锁、通知和取消。
+- `src/tg_botx/interfaces/`：Typer CLI、FastAPI 管理 API、账号和安全接口。
+- `src/tg_botx/application/`：CLI、API、worker 共用的依赖组装。
+- `src/tg_botx/core/`：不依赖基础设施的领域事件和稳定契约。
+- `src/tg_botx/features/`：自定义命令、频道通知、群监控等可组合业务能力。
+- `src/tg_botx/integrations/`：Telethon、Bot API 等外部系统适配器。
+- 根目录旧模块：仅作兼容导出，新代码应使用上述子包路径。
 - `examples/`：可直接参考的任务 YAML。
 - `data/`：SQLite 数据库（使用 PostgreSQL 时仅保存 Telegram session 和运行日志）；属于本地持久化数据，不得提交。
 
@@ -50,6 +53,7 @@ tg-bot serve
 - 任务步骤只能使用显式允许的内置类型。不得引入执行任意 Python、Shell 或不受控表达式的能力。
 - Telethon 调用保持异步；客户端应通过现有 `ClientPool` 复用，并在退出时可靠断开。
 - 保持同一账号与目标聊天的串行语义，修改调度或执行流程时不得绕过 `(account.id, target)` 锁。
+- 新增 Telegram 能力时优先依赖 `core`/`features` 中的协议，通过 `integrations` 注入具体实现；不要在业务模块中直接创建网络客户端。
 - 数据库写入通过 `Database` 封装完成；SQLite 仍需保留 `check_same_thread=False` 和现有 UTC 转换行为，PostgreSQL 使用 psycopg 驱动并保持 UTC 时区语义。
 - 数据库由 `TG_BOT_DATABASE` 选择（`sqlite` 或 `postgresql`）；选择 PostgreSQL 时必须配置 `TG_BOT_DATABASE_URL`，SQLite 默认使用 `TG_BOT_DATA_DIR/database.sqlite3`。
 - 面向 CLI 用户的提示、异常信息和项目文档使用简体中文；日志应包含必要的任务标识，但不得包含敏感信息。

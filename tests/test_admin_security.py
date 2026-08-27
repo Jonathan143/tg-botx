@@ -8,7 +8,7 @@ import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from tg_bot.admin_security import (
+from tg_botx.interfaces.admin.admin_security import (
     FailureRateLimiter,
     SecurityError,
     SessionManager,

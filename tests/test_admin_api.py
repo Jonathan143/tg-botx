@@ -11,11 +11,11 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from tg_bot.admin_api import create_admin_app
-from tg_bot.admin_accounts import LogoutImpact
-from tg_bot.config import Settings
-from tg_bot.db import Account, Database, Task, TaskRun, utc_now
-from tg_bot.runtime import CheckinService
+from tg_botx.interfaces.admin.admin_api import create_admin_app
+from tg_botx.interfaces.admin.admin_accounts import LogoutImpact
+from tg_botx.config import Settings
+from tg_botx.infrastructure.persistence.db import Account, Database, Task, TaskRun, utc_now
+from tg_botx.features.checkin.runtime import CheckinService
 
 
 ADMIN_KEY = "db3BvR9P8y6F0HcXe5i7qL2sNu4mKa1ZpT8wJfGx"
@@ -333,7 +333,7 @@ def test_task_events_require_session_and_send_full_initial_snapshot(
             return next(disconnect_checks)
 
         monkeypatch.setattr(Request, "is_disconnected", disconnected)
-        monkeypatch.setattr("tg_bot.admin_api.TASK_EVENT_KEEPALIVE_SECONDS", 0.001)
+    monkeypatch.setattr("tg_botx.interfaces.admin.admin_api.TASK_EVENT_KEEPALIVE_SECONDS", 0.001)
         response = client.get(f"/api/tasks/{task_id}/events")
 
         assert response.status_code == 200
@@ -357,7 +357,7 @@ def test_manual_run_returns_running_task_with_initialized_step_statuses(
     async def blocked_run(executor, task):
         await asyncio.sleep(60)
 
-    monkeypatch.setattr("tg_bot.runtime.run_with_retries", blocked_run)
+    monkeypatch.setattr("tg_botx.features.checkin.runtime.run_with_retries", blocked_run)
     with TestClient(app, base_url=ORIGIN) as client:
         verified = authenticate(client).json()
         headers = {

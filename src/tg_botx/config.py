@@ -32,6 +32,23 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000, ge=1, le=65535)
     transport_key_rotation_hours: int = Field(default=24, ge=1, le=168)
     trusted_proxies: str = Field(default="")
+    # Feature switches keep future Telegram bot capabilities opt-in while the
+    # existing check-in service remains the default deployment.
+    bot_enabled: bool = Field(default=False)
+    channel_notifications_enabled: bool = Field(default=False)
+    group_monitor_enabled: bool = Field(default=False)
+    group_monitor_history_limit: int = Field(default=500, ge=1, le=100_000)
+
+    @property
+    def enabled_features(self) -> frozenset[str]:
+        """Return explicitly enabled optional capabilities."""
+
+        values = {
+            "bot": self.bot_enabled,
+            "channel_notifications": self.channel_notifications_enabled,
+            "group_monitor": self.group_monitor_enabled,
+        }
+        return frozenset(name for name, enabled in values.items() if enabled)
 
     @field_validator("database", mode="before")
     @classmethod
