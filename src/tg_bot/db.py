@@ -116,6 +116,21 @@ class TaskRun(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class AdminSession(Base):
+    """Persisted administrator session metadata.
+
+    Only the HMAC digest of the opaque cookie token is stored.  The token
+    itself remains in the browser cookie and the CSRF token is derived from it
+    by :class:`SessionManager`.
+    """
+
+    __tablename__ = "admin_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
 class Database:
     def __init__(self, url: str):
         # SQLAlchemy's ``postgresql://`` shorthand defaults to psycopg2.  The
@@ -218,6 +233,41 @@ class Database:
             session.commit()
             session.refresh(task)
             return task
+
+    def save_admin_session(
+        self, token_hash: str, expires_at: datetime, last_seen_at: datetime
+    ) -> None:
+        with self.session() as session:
+            item = session.get(AdminSession, token_hash)
+            if item is None:
+                item = AdminSession(token_hash=token_hash)
+                session.add(item)
+            item.expires_at = expires_at
+            item.last_seen_at = last_seen_at
+            session.commit()
+
+    def get_admin_session(self, token_hash: str) -> AdminSession | None:
+        with self.session() as session:
+            return session.get(AdminSession, token_hash)
+
+    def delete_admin_session(self, token_hash: str) -> None:
+        with self.session() as session:
+            item = session.get(AdminSession, token_hash)
+            if item is not None:
+                session.delete(item)
+                session.commit()
+
+    def delete_expired_admin_sessions(self, now: datetime) -> None:
+        with self.session() as session:
+            session.query(AdminSession).filter(AdminSession.expires_at <= now).delete(
+                synchronize_session=False
+            )
+            session.commit()
+
+    def delete_all_admin_sessions(self) -> None:
+        with self.session() as session:
+            session.query(AdminSession).delete(synchronize_session=False)
+            session.commit()
 
     def update_task(self, task_id: str, **values) -> Task:
         with self.session() as session:

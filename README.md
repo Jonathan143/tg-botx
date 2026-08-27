@@ -61,8 +61,9 @@ TG_BOT_TRUSTED_PROXIES=
 
 `GET /api/auth/key` 返回内存 RSA 公钥和一次性 nonce。前端将所有敏感值编码为 UTF-8 JSON
 `{value:string,nonce:string,timestamp:string}`，再用 RSA-OAEP/SHA-256 加密。登录成功后使用
-`HttpOnly+Secure+SameSite=Strict` Cookie 和内存 CSRF Token。除公钥获取和验证外，
-OpenAPI 与全部管理路由均需认证。
+`HttpOnly+Secure+SameSite=Strict` Cookie；会话摘要持久化在数据库中，因此服务重启后浏览器无需
+重新输入管理密钥（直到会话过期或主动退出）。CSRF Token 从会话 Cookie 派生且不会明文落库。
+除公钥获取和验证外，OpenAPI 与全部管理路由均需认证。
 `POST /api/settings/transport-key/rotate` 可立即轮换传输密钥，旧私钥仅保留 5 分钟宽限期。
 
 `POST /api/tasks/:id/run` 成功时返回更新后的完整 Task JSON（HTTP 202），其中

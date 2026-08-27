@@ -352,7 +352,13 @@ def _filter_logs(
 def create_admin_app(settings: Settings, database: Database, service: CheckinService) -> FastAPI:
     admin_key, admin_origin = settings.require_admin_config()
     keys = TransportKeyManager(rotation_hours=settings.transport_key_rotation_hours)
-    sessions = SessionManager(admin_key, session_days=settings.admin_session_days)
+    # Persist only hashed session tokens and timestamps so browser sessions
+    # remain valid across service restarts without storing administrator keys.
+    sessions = SessionManager(
+        admin_key,
+        session_days=settings.admin_session_days,
+        session_store=database,
+    )
     limiter = FailureRateLimiter(max_failures=5, window_seconds=600)
     accounts = LoginFlowManager(settings, database, client_pool=service.pool)
     trusted_proxies = [item.strip() for item in settings.trusted_proxies.split(",") if item.strip()]

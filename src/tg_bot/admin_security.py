@@ -1,8 +1,9 @@
 """Security primitives used by the HTTP administration API.
 
-The module deliberately has no FastAPI dependency.  It keeps transport keys,
-nonces and administrator sessions in memory so callers can share one security
-context for the lifetime of the ``tg-bot serve`` process.
+The module deliberately has no FastAPI dependency. Transport keys and nonces
+remain process-local, while administrator session metadata may be persisted by
+the caller so a service restart does not force an otherwise valid browser
+session to re-enter the administrator key.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -105,6 +106,14 @@ def _shannon_entropy(value: bytes) -> float:
 
 def _iso_timestamp(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=UTC).isoformat().replace("+00:00", "Z")
+
+
+def _timestamp_from_datetime(value: Any) -> float | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.timestamp()
 
 
 def _random_token(byte_count: int = 32) -> str:
@@ -459,8 +468,28 @@ class _Session:
     last_seen_at: float
 
 
+class SessionStore(Protocol):
+    """Minimal persistence contract used by :class:`SessionManager`."""
+
+    def save_admin_session(self, token_hash: str, expires_at: datetime, last_seen_at: datetime) -> None: ...
+
+    def get_admin_session(self, token_hash: str) -> Any | None: ...
+
+    def delete_admin_session(self, token_hash: str) -> None: ...
+
+    def delete_expired_admin_sessions(self, now: datetime) -> None: ...
+
+    def delete_all_admin_sessions(self) -> None: ...
+
+
 class SessionManager:
-    """Opaque, random, process-local administrator sessions with rolling TTL."""
+    """Opaque, random administrator sessions with a rolling TTL.
+
+    When ``session_store`` is supplied, only token digests and timestamps are
+    persisted. The digest key is derived from the administrator key, allowing
+    validation after a process restart while making sessions invalid whenever
+    the configured administrator key changes.
+    """
 
     def __init__(
         self,
@@ -468,6 +497,7 @@ class SessionManager:
         *,
         session_days: float = 30,
         clock: Callable[[], float] = time.time,
+        session_store: SessionStore | None = None,
     ) -> None:
         if session_days <= 0:
             raise ValueError("session_days must be positive")
@@ -475,23 +505,36 @@ class SessionManager:
         self.session_seconds = float(session_days) * 86_400
         self._clock = clock
         self._lock = threading.RLock()
-        boot_salt = secrets.token_bytes(32)
-        self._token_hash_key = hmac.new(boot_salt, key, hashlib.sha256).digest()
+        self._token_hash_key = hmac.new(
+            key, b"tg-bot-admin-session-token-v1", hashlib.sha256
+        ).digest()
+        self._csrf_key = hmac.new(
+            key, b"tg-bot-admin-session-csrf-v1", hashlib.sha256
+        ).digest()
+        self._session_store = session_store
         self._sessions: dict[bytes, _Session] = {}
 
     def create(self) -> SessionCredentials:
         now = self._clock()
         token = _random_token()
-        csrf_token = _random_token()
+        csrf_token = self._csrf_token(token)
         expires_at = now + self.session_seconds
         with self._lock:
             self._prune_locked(now)
-            self._sessions[self._token_digest(token)] = _Session(
+            token_hash = self._token_digest(token)
+            session = _Session(
                 csrf_token=csrf_token,
                 csrf_digest=hashlib.sha256(csrf_token.encode("ascii")).digest(),
                 expires_at=expires_at,
                 last_seen_at=now,
             )
+            self._sessions[token_hash] = session
+            if self._session_store is not None:
+                self._session_store.save_admin_session(
+                    token_hash.hex(),
+                    datetime.fromtimestamp(expires_at, tz=UTC),
+                    datetime.fromtimestamp(now, tz=UTC),
+                )
         return SessionCredentials(
             token,
             csrf_token,
@@ -510,7 +553,24 @@ class SessionManager:
         now = self._clock()
         with self._lock:
             self._prune_locked(now)
-            session = self._sessions.get(self._token_digest(token))
+            token_hash = self._token_digest(token)
+            session = self._sessions.get(token_hash)
+            if session is None and self._session_store is not None:
+                persisted = self._session_store.get_admin_session(token_hash.hex())
+                if persisted is not None:
+                    expires_at = _timestamp_from_datetime(persisted.expires_at)
+                    last_seen_at = _timestamp_from_datetime(persisted.last_seen_at)
+                    if expires_at is not None and expires_at > now:
+                        derived_csrf_token = self._csrf_token(token)
+                        session = _Session(
+                            csrf_token=derived_csrf_token,
+                            csrf_digest=hashlib.sha256(
+                                derived_csrf_token.encode("ascii")
+                            ).digest(),
+                            expires_at=expires_at,
+                            last_seen_at=last_seen_at or now,
+                        )
+                        self._sessions[token_hash] = session
             if session is None or session.expires_at <= now:
                 _session_failed()
             if require_csrf:
@@ -526,6 +586,12 @@ class SessionManager:
             old_expiry = session.expires_at
             session.last_seen_at = now
             session.expires_at = now + self.session_seconds
+            if self._session_store is not None:
+                self._session_store.save_admin_session(
+                    token_hash.hex(),
+                    datetime.fromtimestamp(session.expires_at, tz=UTC),
+                    datetime.fromtimestamp(now, tz=UTC),
+                )
             return SessionCredentials(
                 token=token,
                 csrf_token=session.csrf_token,
@@ -537,11 +603,16 @@ class SessionManager:
         if not isinstance(token, str) or not token:
             return
         with self._lock:
-            self._sessions.pop(self._token_digest(token), None)
+            token_hash = self._token_digest(token)
+            self._sessions.pop(token_hash, None)
+            if self._session_store is not None:
+                self._session_store.delete_admin_session(token_hash.hex())
 
     def revoke_all(self) -> None:
         with self._lock:
             self._sessions.clear()
+            if self._session_store is not None:
+                self._session_store.delete_all_admin_sessions()
 
     def prune(self) -> None:
         with self._lock:
@@ -552,12 +623,21 @@ class SessionManager:
             self._token_hash_key, token.encode("utf-8"), hashlib.sha256
         ).digest()
 
+    def _csrf_token(self, token: str) -> str:
+        return base64.urlsafe_b64encode(
+            hmac.new(self._csrf_key, token.encode("utf-8"), hashlib.sha256).digest()
+        ).decode("ascii").rstrip("=")
+
     def _prune_locked(self, now: float) -> None:
         self._sessions = {
             token_hash: session
             for token_hash, session in self._sessions.items()
             if session.expires_at > now
         }
+        if self._session_store is not None:
+            self._session_store.delete_expired_admin_sessions(
+                datetime.fromtimestamp(now, tz=UTC)
+            )
 
 
 class FailureRateLimiter:
@@ -674,6 +754,7 @@ __all__ = [
     "SecurityError",
     "SessionCredentials",
     "SessionManager",
+    "SessionStore",
     "TransportKeyManager",
     "resolve_client_ip",
     "validate_admin_key",

@@ -233,7 +233,9 @@ def import_task(config: Path = typer.Option(..., "--config", exists=True, readab
 @app.command()
 def serve():
     """启动常驻调度服务和后台管理 API。"""
-    settings, database = resources(create_schema=False)
+    # Ensure newly introduced persistence tables (including administrator
+    # sessions) are present when an existing installation is restarted.
+    settings, database = resources()
     settings.require_admin_config()
     from tg_bot.admin_api import create_admin_app
 
