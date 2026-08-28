@@ -32,7 +32,7 @@ from tg_botx.features.checkin.runtime import (
     TaskStateError,
 )
 from tg_botx.infrastructure.observability.logging import allowed_log_files, redact_sensitive
-from tg_botx.infrastructure.persistence.db import Database, Task, TaskRun, utc_now
+from tg_botx.infrastructure.persistence.db import Database, Task, TaskRun, WorkflowVersion, utc_now
 from tg_botx.interfaces.admin.admin_accounts import AdminAccountError, LoginFlowManager
 from tg_botx.interfaces.admin.admin_security import (
     FailureRateLimiter,
@@ -133,6 +133,11 @@ class EmptyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class PublishBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    release_note: str | None = Field(default=None, alias="releaseNote", max_length=500)
+
+
 def _iso(value: datetime | str | None) -> str | None:
     if isinstance(value, str):
         return value
@@ -148,11 +153,18 @@ def _task_json(task: Task, database: Database, service: CheckinService) -> dict[
         for step in run["stepStatuses"]:
             if isinstance(step.get("error"), str):
                 step["error"] = redact_sensitive(step["error"])
+            if isinstance(step.get("botResponse"), str):
+                step["botResponse"] = redact_sensitive(step["botResponse"])
+        for log in run.get("logs", []):
+            if isinstance(log.get("message"), str):
+                log["message"] = redact_sensitive(log["message"])
     schedule: dict[str, Any] = {"type": task.schedule_type, "timezone": task.timezone}
     if task.schedule_type == "fixed":
         schedule["time"] = task.fixed_time
     else:
         schedule.update({"start": task.random_start, "end": task.random_end})
+    versions = database.list_workflow_versions(task.id)
+    latest_version = versions[0] if versions else None
     return {
         "id": task.id,
         "name": task.name,
@@ -171,11 +183,62 @@ def _task_json(task: Task, database: Database, service: CheckinService) -> dict[
         "run": run,
         "createdAt": _iso(task.created_at),
         "updatedAt": _iso(task.updated_at),
+        "latestWorkflowVersion": latest_version.version_number if latest_version else None,
+        "workflowVersions": [
+            {
+                "id": item.id,
+                "version": item.version_number,
+                "publishedAt": _iso(item.published_at),
+                "releaseNote": item.release_note,
+            }
+            for item in versions
+        ],
     }
 
 
-def _run_json(run: TaskRun, database: Database) -> dict[str, Any]:
+def _run_json(
+    run: TaskRun,
+    database: Database,
+    service: CheckinService | None = None,
+) -> dict[str, Any]:
     task = database.get_task_any(run.task_id)
+    progress = service.get_task_run_progress(run.task_id) if service and task else None
+    if progress is not None and progress.get("id") != run.id:
+        progress = None
+    if progress is None and run.progress_json:
+        try:
+            stored_progress = json.loads(run.progress_json)
+            if isinstance(stored_progress, dict) and stored_progress.get("id") == run.id:
+                progress = stored_progress
+        except (TypeError, json.JSONDecodeError):
+            progress = None
+    if progress is not None:
+        if isinstance(progress.get("error"), str):
+            progress["error"] = redact_sensitive(progress["error"])
+        for step in progress.get("stepStatuses", []):
+            if isinstance(step.get("error"), str):
+                step["error"] = redact_sensitive(step["error"])
+            if isinstance(step.get("botResponse"), str):
+                step["botResponse"] = redact_sensitive(step["botResponse"])
+        for log in progress.get("logs", []):
+            if isinstance(log.get("message"), str):
+                log["message"] = redact_sensitive(log["message"])
+    workflow: dict[str, Any] | None = None
+    if run.run_kind == "test" and run.workflow_json:
+        try:
+            stored_workflow = json.loads(run.workflow_json)
+            if isinstance(stored_workflow, dict):
+                workflow = stored_workflow
+        except (TypeError, json.JSONDecodeError):
+            workflow = None
+    version: WorkflowVersion | None = None
+    if run.workflow_version_id:
+        version = database.get_workflow_version(run.workflow_version_id)
+    if workflow is None and version is not None:
+        workflow = version.execution_definition
+    workflow_error = None
+    if run.run_kind == "published" and workflow is None:
+        workflow_error = "发布版本数据不存在"
     return {
         "id": run.id,
         "taskId": run.task_id,
@@ -187,6 +250,16 @@ def _run_json(run: TaskRun, database: Database) -> dict[str, Any]:
         "status": run.status,
         "attempts": run.attempts,
         "error": redact_sensitive(run.error) if run.error else None,
+        "runKind": run.run_kind,
+        "workflowVersion": (
+            int(run.workflow_version)
+            if run.workflow_version and run.workflow_version.isdigit()
+            else run.workflow_version
+        ),
+        "workflowVersionId": run.workflow_version_id,
+        "workflow": workflow,
+        "workflowError": workflow_error,
+        "progress": progress,
     }
 
 
@@ -663,7 +736,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 "active": active_accounts,
                 "inactive": inactive_accounts,
             },
-            "recentRuns": [_run_json(item, database) for item in recent],
+            "recentRuns": [_run_json(item, database, service) for item in recent],
         }
 
     @app.get("/api/tasks")
@@ -718,6 +791,26 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         if not task:
             raise APIError("NOT_FOUND", "任务不存在", 404)
         return _task_json(task, database, service)
+
+    @app.get("/api/tasks/{task_id}/versions")
+    async def list_workflow_versions(task_id: str) -> dict[str, Any]:
+        task = database.get_task_any(task_id)
+        if not task:
+            raise APIError("NOT_FOUND", "任务不存在", 404)
+        versions = database.list_workflow_versions(task.id)
+        return {
+            "items": [
+                {
+                    "id": item.id,
+                    "version": item.version_number,
+                    "publishedAt": _iso(item.published_at),
+                    "releaseNote": item.release_note,
+                    "workflow": item.execution_definition,
+                }
+                for item in versions
+            ],
+            "latestVersion": versions[0].version_number if versions else None,
+        }
 
     @app.get("/api/tasks/{task_id}/events")
     async def stream_task_events(task_id: str, request: Request) -> StreamingResponse:
@@ -793,6 +886,19 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             raise APIError("CONFLICT", str(exc), 409) from exc
         return _task_json(task, database, service)
 
+    @app.post("/api/tasks/{task_id}/publish")
+    async def publish_task(task_id: str, body: PublishBody) -> dict[str, Any]:
+        try:
+            service.publish_task(task_id, body.release_note)
+        except TaskNotFound as exc:
+            raise APIError("NOT_FOUND", "任务不存在", 404) from exc
+        except TaskStateError as exc:
+            raise APIError("CONFLICT", str(exc), 409) from exc
+        task = database.get_task_any(task_id)
+        if task is None:
+            raise APIError("NOT_FOUND", "任务不存在", 404)
+        return _task_json(task, database, service)
+
     async def task_action(task_id: str, action: str) -> dict[str, Any]:
         try:
             task = getattr(service, f"{action}_task")(task_id)
@@ -821,7 +927,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     @app.post("/api/tasks/{task_id}/run", status_code=202)
     async def run_task(task_id: str, _: EmptyBody) -> dict[str, Any]:
         try:
-            service.start_manual_run(task_id)
+            run_id = service.start_manual_run(task_id)
         except TaskNotFound as exc:
             raise APIError("NOT_FOUND", "任务不存在", 404) from exc
         except ManualRunConflict as exc:
@@ -831,7 +937,28 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         task = database.get_task_any(task_id)
         if task is None:
             raise APIError("NOT_FOUND", "任务不存在", 404)
-        return _task_json(task, database, service)
+        payload = _task_json(task, database, service)
+        payload["runId"] = run_id
+        return payload
+
+    @app.post("/api/tasks/{task_id}/test", status_code=202)
+    async def test_task(task_id: str, body: TaskBody) -> dict[str, Any]:
+        if database.get_account(body.definition.account) is None:
+            raise APIError("VALIDATION_FAILED", "Telegram 账号不存在", 422)
+        try:
+            run_id = service.start_test_run(task_id, body.definition)
+        except TaskNotFound as exc:
+            raise APIError("NOT_FOUND", "任务不存在", 404) from exc
+        except ManualRunConflict as exc:
+            raise APIError("TASK_BUSY", "同一账号和目标已有任务在执行", 409) from exc
+        except TaskStateError as exc:
+            raise APIError("CONFLICT", str(exc), 409) from exc
+        task = database.get_task_any(task_id)
+        if task is None:
+            raise APIError("NOT_FOUND", "任务不存在", 404)
+        payload = _task_json(task, database, service)
+        payload["runId"] = run_id
+        return payload
 
     @app.post("/api/tasks/{task_id}/cancel", status_code=202)
     async def cancel_task(task_id: str, _: EmptyBody) -> dict[str, Any]:
@@ -913,7 +1040,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             started_from=started_from, started_to=started_to,
         )
         return {
-            "items": [_run_json(item, database) for item in items],
+            "items": [_run_json(item, database, service) for item in items],
             "page": page,
             "pageSize": page_size,
             "total": total,
@@ -924,7 +1051,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         run = database.get_run(run_id)
         if not run:
             raise APIError("NOT_FOUND", "执行记录不存在", 404)
-        return _run_json(run, database)
+        return _run_json(run, database, service)
 
     @app.get("/api/accounts")
     async def list_accounts() -> dict[str, Any]:

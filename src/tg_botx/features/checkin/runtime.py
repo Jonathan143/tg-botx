@@ -17,7 +17,14 @@ from telethon import TelegramClient
 from tg_botx.config import Settings
 from tg_botx.features.checkin.executor import CheckinExecutor, run_with_retries
 from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
-from tg_botx.infrastructure.persistence.db import Account, Database, Task, TaskRun, utc_now
+from tg_botx.infrastructure.persistence.db import (
+    Account,
+    Database,
+    Task,
+    TaskRun,
+    WorkflowVersion,
+    utc_now,
+)
 from tg_botx.schemas import TaskDefinition
 
 logger = logging.getLogger(__name__)
@@ -40,6 +47,10 @@ class AccountNotFoundError(TaskStateError):
 
 
 class ManualRunConflict(RuntimeError):
+    pass
+
+
+class WorkflowVersionNotFound(TaskStateError):
     pass
 
 
@@ -310,8 +321,14 @@ class CheckinService:
         progress = self._task_run_progress.get(task_id)
         return copy.deepcopy(progress) if progress is not None else None
 
-    def _initialize_run_progress(self, task: Task, run: TaskRun) -> None:
-        self._task_run_progress[task.id] = {
+    def _initialize_run_progress(
+        self,
+        task: Task,
+        run: TaskRun,
+        *,
+        workflow_snapshot: dict[str, object] | None = None,
+    ) -> None:
+        progress = {
             "id": run.id,
             "status": "running",
             "attempt": 0,
@@ -319,7 +336,47 @@ class CheckinService:
                 {"index": index, "status": "pending"}
                 for index, _ in enumerate(task.config["steps"])
             ],
+            "logs": [],
         }
+        self._task_run_progress[task.id] = progress
+        values: dict[str, object] = {"progress_json": json.dumps(progress, ensure_ascii=False)}
+        if run.run_kind == "test" and workflow_snapshot is not None:
+            values["workflow_json"] = json.dumps(workflow_snapshot, ensure_ascii=False)
+        self.database.update_run(run.id, **values)
+
+    def _persist_run_progress(self, task_id: str, run_id: str) -> None:
+        progress = self._task_run_progress.get(task_id)
+        if progress is None or progress["id"] != run_id:
+            return
+        self.database.update_run(
+            run_id,
+            progress_json=json.dumps(progress, ensure_ascii=False),
+        )
+
+    def _append_run_log(
+        self,
+        task_id: str,
+        run_id: str,
+        message: str,
+        *,
+        level: str = "INFO",
+        step_index: int | None = None,
+    ) -> None:
+        progress = self._task_run_progress.get(task_id)
+        if progress is None or progress["id"] != run_id:
+            return
+        logs = progress.setdefault("logs", [])
+        if not isinstance(logs, list):
+            return
+        logs.append(
+            {
+                "timestamp": utc_now().isoformat(),
+                "level": level,
+                "message": message,
+                "stepIndex": step_index,
+            }
+        )
+        del logs[:-200]
 
     def _begin_run_attempt(self, task_id: str, run_id: str, attempt: int) -> None:
         progress = self._task_run_progress.get(task_id)
@@ -331,6 +388,9 @@ class CheckinService:
         for step in progress["stepStatuses"]:
             step["status"] = "pending"
             step.pop("error", None)
+            step.pop("botResponse", None)
+        self._append_run_log(task_id, run_id, f"开始第 {attempt} 次尝试")
+        self._persist_run_progress(task_id, run_id)
         self._publish_task_updated(task_id)
 
     def _update_run_step(
@@ -340,6 +400,7 @@ class CheckinService:
         index: int,
         status: str,
         error: str | None = None,
+        bot_response: str | None = None,
     ) -> None:
         progress = self._task_run_progress.get(task_id)
         if progress is None or progress["id"] != run_id:
@@ -353,6 +414,17 @@ class CheckinService:
             step.pop("error", None)
         else:
             step["error"] = error
+        if bot_response is not None:
+            step["botResponse"] = bot_response
+        labels = {"running": "开始执行", "success": "执行成功", "failed": "执行失败"}
+        self._append_run_log(
+            task_id,
+            run_id,
+            error if status == "failed" and error else labels.get(status, status),
+            level="ERROR" if status == "failed" else "INFO",
+            step_index=index,
+        )
+        self._persist_run_progress(task_id, run_id)
         self._publish_task_updated(task_id)
 
     def _finalize_run_progress(
@@ -380,13 +452,24 @@ class CheckinService:
             elif step["status"] == "pending":
                 step["status"] = "skipped"
                 step.pop("error", None)
+        self._append_run_log(
+            task_id,
+            run_id,
+            error if error else f"运行{status}",
+            level="ERROR" if status == "failed" else "INFO",
+        )
+        self._persist_run_progress(task_id, run_id)
 
     async def start(self) -> None:
         self.settings.ensure_directories()
         self.database.create_all()
         self.scheduler.start()
         for task in self.database.list_tasks():
-            if task.enabled and not task.archived:
+            if (
+                task.enabled
+                and not task.archived
+                and self.database.get_latest_workflow_version(task.id) is not None
+            ):
                 self._ensure_next_run(task)
                 self._schedule_task(task)
 
@@ -535,12 +618,49 @@ class CheckinService:
         self._publish_task_updated(task.id)
         return updated
 
+    @staticmethod
+    def _execution_definition(definition: TaskDefinition) -> dict[str, object]:
+        """Return the immutable portion of a published workflow.
+
+        Scheduling and task-management metadata remain on ``Task`` so they can
+        be adjusted without forcing a workflow release.  All values consumed
+        while executing steps or sending notifications are frozen here.
+        """
+
+        payload = definition.model_dump(mode="json")
+        payload.pop("name", None)
+        payload.pop("schedule", None)
+        return payload
+
+    def publish_task(self, task_id: str, release_note: str | None = None) -> WorkflowVersion:
+        task = self.database.get_task_any(task_id)
+        if task is None:
+            raise TaskNotFound("任务不存在")
+        if task.archived:
+            raise TaskStateError("归档任务不能发布")
+        try:
+            definition = TaskDefinition.model_validate(task.config)
+        except Exception as exc:
+            raise TaskStateError("当前任务配置无效，无法发布") from exc
+        version = self.database.publish_workflow(
+            task.id,
+            self._execution_definition(definition),
+            release_note=release_note,
+        )
+        self._publish_task_updated(task.id)
+        return version
+
+    def workflow_versions(self, task_id: str) -> list[WorkflowVersion]:
+        return self.database.list_workflow_versions(task_id)
+
     def enable_task(self, task_id: str) -> Task:
         task = self.database.get_task_any(task_id)
         if task is None:
             raise TaskNotFound("任务不存在")
         if task.archived:
             raise TaskStateError("归档任务需先恢复后才能启用")
+        if self.database.get_latest_workflow_version(task.id) is None:
+            raise TaskStateError("请先发布工作流后再启用任务")
         next_run = next_run_for(schedule_from_task(task), now=utc_now())
         updated = self.database.update_task(task.id, enabled=True, next_run_at=next_run)
         self._bump_task_revision(task.id)
@@ -597,6 +717,37 @@ class CheckinService:
                 running.cancel()
                 return
 
+    def _execution_snapshot(
+        self,
+        task: Task,
+        execution_definition: dict[str, object],
+        *,
+        task_name: str | None = None,
+    ) -> tuple[Task, Account]:
+        """Build an isolated Task object for one published/test execution."""
+
+        account_name = execution_definition.get("account")
+        if not isinstance(account_name, str):
+            raise AccountNotFoundError("任务绑定的账号不存在")
+        account = self.database.get_account(account_name)
+        if account is None:
+            raise AccountNotFoundError("任务绑定的账号不存在")
+        target = execution_definition.get("target")
+        if not isinstance(target, str) or not target:
+            raise TaskStateError("工作流版本缺少执行目标")
+        merged = task.config.copy()
+        merged.update(execution_definition)
+        # Schedule is intentionally task-level.  It controls when a run is
+        # created, not the behavior of an already-created workflow version.
+        merged["schedule"] = task.config.get("schedule")
+        merged["name"] = task_name or task.name
+        snapshot = copy.copy(task)
+        snapshot.account_id = account.id
+        snapshot.target = target
+        snapshot.name = task_name or task.name
+        snapshot.config_json = json.dumps(merged, ensure_ascii=False)
+        return snapshot, account
+
     @staticmethod
     def _log_bot_response_enabled(task: Task) -> bool:
         configured = task.config.get("log_bot_response")
@@ -604,10 +755,24 @@ class CheckinService:
             return bool(configured)
         return bool(task.config.get("output_bot_response", False))
 
-    async def _record_skipped(self, task: Task) -> None:
+    async def _record_skipped(
+        self,
+        task: Task,
+        execution_task: Task,
+        *,
+        version: WorkflowVersion,
+    ) -> None:
         finished = utc_now()
-        run = self.database.add_run(TaskRun(task_id=task.id, planned_at=task.next_run_at))
-        self._initialize_run_progress(task, run)
+        run = self.database.add_run(
+            TaskRun(
+                task_id=task.id,
+                planned_at=task.next_run_at,
+                run_kind="published",
+                workflow_version=str(version.version_number),
+                workflow_version_id=version.id,
+            )
+        )
+        self._initialize_run_progress(execution_task, run)
         self.database.update_run(
             run.id,
             finished_at=finished,
@@ -673,12 +838,17 @@ class CheckinService:
         run: TaskRun,
         *,
         manual: bool,
+        update_task_state: bool = True,
+        state_task: Task | None = None,
     ) -> bool:
+        state_snapshot = state_task or task
         lock_key = (account.id, task.target)
         lock = self.locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
             revision = self._task_revisions.get(task.id, 0)
-            self.database.update_task(task.id, cancel_requested=False)
+            current = self.database.get_task_any(task.id)
+            if current is not None and current.cancel_requested:
+                self.database.update_task(task.id, cancel_requested=False)
             running = asyncio.current_task()
             if running is None:
                 raise RuntimeError("无法获取当前任务实例")
@@ -701,12 +871,18 @@ class CheckinService:
                 ) -> None:
                     self._update_run_step(task.id, run.id, index, status, error)
 
+                async def on_step_response(index: int, response: str) -> None:
+                    self._update_run_step(
+                        task.id, run.id, index, "running", bot_response=response
+                    )
+
                 success, error, attempts, bot_response = await run_with_retries(
                     CheckinExecutor(
                         client,
                         is_cancelled=is_cancelled,
                         on_attempt=on_attempt,
                         on_step_status=on_step_status,
+                        on_step_response=on_step_response,
                     ),
                     task,
                 )
@@ -720,9 +896,13 @@ class CheckinService:
                     error=error,
                 )
                 self._finalize_run_progress(task.id, run.id, status, error)
-                next_run = self._update_after_run(
-                    task, status, finished, manual=manual, revision=revision
-                )
+                if update_task_state:
+                    next_run = self._update_after_run(
+                        state_snapshot, status, finished, manual=manual, revision=revision
+                    )
+                else:
+                    current = self.database.get_task_any(task.id)
+                    next_run = current.next_run_at if current else None
                 if self._log_bot_response_enabled(task) and bot_response is not None:
                     logger.info(
                         "机器人回复 task_id=%s name=%s status=%s\n%s",
@@ -747,9 +927,13 @@ class CheckinService:
                     run.id, finished_at=finished, status="canceled", error=reason
                 )
                 self._finalize_run_progress(task.id, run.id, "canceled", reason)
-                next_run = self._update_after_run(
-                    task, "canceled", finished, manual=manual, revision=revision
-                )
+                if update_task_state:
+                    next_run = self._update_after_run(
+                        state_snapshot, "canceled", finished, manual=manual, revision=revision
+                    )
+                else:
+                    current = self.database.get_task_any(task.id)
+                    next_run = current.next_run_at if current else None
                 await self.notifications.canceled(task, next_run, reason)
                 if not requested:
                     raise
@@ -760,16 +944,22 @@ class CheckinService:
                     run.id, finished_at=finished, status="failed", error=str(exc)
                 )
                 self._finalize_run_progress(task.id, run.id, "failed", str(exc))
-                next_run = self._update_after_run(
-                    task, "failed", finished, manual=manual, revision=revision
-                )
+                if update_task_state:
+                    next_run = self._update_after_run(
+                        state_snapshot, "failed", finished, manual=manual, revision=revision
+                    )
+                else:
+                    current = self.database.get_task_any(task.id)
+                    next_run = current.next_run_at if current else None
                 await self.notifications.failure(task, str(exc), next_run, bot_response)
                 return False
             finally:
                 cancel_watcher.cancel()
                 with suppress(asyncio.CancelledError):
                     await cancel_watcher
-                self.database.update_task(task.id, cancel_requested=False)
+                current = self.database.get_task_any(task.id)
+                if current is not None and current.cancel_requested:
+                    self.database.update_task(task.id, cancel_requested=False)
                 if self.running.get(task.id) is running:
                     self.running.pop(task.id, None)
                 self._publish_task_updated(task.id)
@@ -778,18 +968,35 @@ class CheckinService:
         task = self.database.get_task(task_id)
         if not task or task.archived or not task.enabled:
             raise RuntimeError("任务不存在、已归档或未启用")
-        account = self.database.get_account_by_id(task.account_id)
-        if not account:
-            raise RuntimeError("任务绑定的账号不存在")
-        lock_key = (account.id, task.target)
+        version = self.database.get_latest_workflow_version(task.id)
+        if version is None:
+            raise WorkflowVersionNotFound("请先发布工作流后再运行任务")
+        execution_task, account = self._execution_snapshot(
+            task, version.execution_definition
+        )
+        lock_key = (account.id, execution_task.target)
         lock = self.locks.setdefault(lock_key, asyncio.Lock())
         if lock.locked() or lock_key in self._manual_reservations:
             logger.warning("任务 %s 因目标聊天忙碌而跳过本次执行", task.name)
-            await self._record_skipped(task)
+            await self._record_skipped(task, execution_task, version=version)
             return False
-        run = self.database.add_run(TaskRun(task_id=task.id, planned_at=task.next_run_at))
-        self._initialize_run_progress(task, run)
-        return await self._execute_run(task, account, run, manual=False)
+        run = self.database.add_run(
+            TaskRun(
+                task_id=task.id,
+                planned_at=task.next_run_at,
+                run_kind="published",
+                workflow_version=str(version.version_number),
+                workflow_version_id=version.id,
+            )
+        )
+        self._initialize_run_progress(execution_task, run)
+        return await self._execute_run(
+            execution_task,
+            account,
+            run,
+            manual=False,
+            state_task=task,
+        )
 
     def start_manual_run(self, task_id: str) -> str:
         """Start a manual execution in the background and return its run row.
@@ -804,10 +1011,13 @@ class CheckinService:
             raise TaskNotFound("任务不存在")
         if task.archived:
             raise TaskStateError("归档任务不能手动运行")
-        account = self.database.get_account_by_id(task.account_id)
-        if account is None:
-            raise AccountNotFoundError("任务绑定的账号不存在")
-        lock_key = (account.id, task.target)
+        version = self.database.get_latest_workflow_version(task.id)
+        if version is None:
+            raise WorkflowVersionNotFound("请先发布工作流后再运行任务")
+        execution_task, account = self._execution_snapshot(
+            task, version.execution_definition
+        )
+        lock_key = (account.id, execution_task.target)
         lock = self.locks.setdefault(lock_key, asyncio.Lock())
         if (
             lock.locked()
@@ -817,14 +1027,28 @@ class CheckinService:
             raise ManualRunConflict("同一账号和目标当前已有运行实例")
 
         self.database.update_task(task.id, cancel_requested=False)
-        run = self.database.add_run(TaskRun(task_id=task.id, planned_at=None))
-        self._initialize_run_progress(task, run)
+        run = self.database.add_run(
+            TaskRun(
+                task_id=task.id,
+                planned_at=None,
+                run_kind="published",
+                workflow_version=str(version.version_number),
+                workflow_version_id=version.id,
+            )
+        )
+        self._initialize_run_progress(execution_task, run)
         self._manual_reservations.add(lock_key)
         revision = self._task_revisions.get(task.id, 0)
 
         async def execute() -> bool:
             try:
-                return await self._execute_run(task, account, run, manual=True)
+                return await self._execute_run(
+                    execution_task,
+                    account,
+                    run,
+                    manual=True,
+                    state_task=task,
+                )
             finally:
                 self._manual_reservations.discard(lock_key)
 
@@ -859,6 +1083,79 @@ class CheckinService:
                     manual=True,
                     revision=revision,
                 )
+            self._publish_task_updated(task.id)
+
+        running.add_done_callback(cleanup)
+        return run.id
+
+    def start_test_run(self, task_id: str, definition: TaskDefinition) -> str:
+        """Start a test run from the editor's current (possibly unsaved) state."""
+
+        task = self.database.get_task_any(task_id)
+        if task is None:
+            raise TaskNotFound("任务不存在")
+        if task.archived:
+            raise TaskStateError("归档任务不能测试")
+        execution_definition = definition.model_dump(mode="json")
+        execution_task, account = self._execution_snapshot(
+            task, execution_definition, task_name=definition.name
+        )
+        lock_key = (account.id, execution_task.target)
+        lock = self.locks.setdefault(lock_key, asyncio.Lock())
+        if lock.locked() or lock_key in self._manual_reservations or task.id in self.running:
+            raise ManualRunConflict("同一账号和目标当前已有运行实例")
+
+        run = self.database.add_run(
+            TaskRun(
+                task_id=task.id,
+                planned_at=None,
+                run_kind="test",
+                workflow_version="main",
+                workflow_version_id=None,
+            )
+        )
+        self._initialize_run_progress(
+            execution_task,
+            run,
+            workflow_snapshot=execution_definition,
+        )
+        self._manual_reservations.add(lock_key)
+
+        async def execute() -> bool:
+            try:
+                return await self._execute_run(
+                    execution_task,
+                    account,
+                    run,
+                    manual=True,
+                    update_task_state=False,
+                    state_task=task,
+                )
+            finally:
+                self._manual_reservations.discard(lock_key)
+
+        running = asyncio.create_task(execute(), name=f"test:{task.id}:{run.id}")
+        self.running[task.id] = running
+        self._publish_task_updated(task.id)
+
+        def cleanup(completed: asyncio.Task) -> None:
+            self._manual_reservations.discard(lock_key)
+            if self.running.get(task.id) is completed:
+                self.running.pop(task.id, None)
+            if not completed.cancelled():
+                completed.exception()
+            stored = self.database.get_run(run.id)
+            if stored is not None and stored.status == "running":
+                status = "canceled" if completed.cancelled() else "failed"
+                finished = utc_now()
+                error = "执行在启动前被取消" if completed.cancelled() else "执行异常中止"
+                self.database.update_run(
+                    run.id,
+                    finished_at=finished,
+                    status=status,
+                    error=error,
+                )
+                self._finalize_run_progress(task.id, run.id, status, error)
             self._publish_task_updated(task.id)
 
         running.add_done_callback(cleanup)

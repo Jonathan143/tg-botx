@@ -99,12 +99,17 @@ Task JSON 的 `run` 为当前或本进程内最近一次运行进度；从未运
 ```
 
 步骤 `status` 取值为 `pending`、`running`、`success`、`failed` 或 `skipped`，失败步骤
-可带 `error`；运行级 `run.status` 取值为 `running`、`success`、`failed`、`canceled`
+可带 `error`；`wait_message` 步骤收到消息后会在步骤状态中带上脱敏后的 `botResponse`；运行级 `run.status` 取值为 `running`、`success`、`failed`、`canceled`
 或 `skipped`，失败或取消时可带 `error`。`attempt=0` 表示运行已预留、执行器尚未开始；
 重试开始时 `attempt` 增加，步骤状态按新 attempt 重置。运行结束的最后一次事件保留最终
 步骤状态。服务每 15 秒发送一次 `: keepalive`
 注释，响应包含 `X-Accel-Buffering: no`，反向代理也应关闭该路由的响应缓冲。客户端断开
 时服务会释放对应任务的订阅。
+
+任务工作流分为可编辑的 `main` 草稿和手动发布的不可变版本（`v1`、`v2`……）。只有发布后
+才能启用任务并进入正式调度；正式运行记录只保存发布版本号，详情通过版本表读取固定定义。
+编辑页的“测试工作流”可直接执行当前未保存内容，测试记录保存执行瞬间的工作流快照，且不改变
+任务的正式运行状态。
 
 Compose 配置只通过 `expose` 向同一 Compose 网络公布 8000 端口，没有宿主机
 `ports` 映射。请将 Web 反向代理加入同一网络，由它将同源 `/api` 转发到
@@ -135,6 +140,7 @@ tg-bot logout
 tg-bot task create --config <yaml>
 tg-bot task list
 tg-bot task validate <task-id>
+tg-bot task publish <task-id> [--note <发布说明>]
 tg-bot task enable <task-id>
 tg-bot task disable <task-id>
 tg-bot task run <task-id>

@@ -12,8 +12,10 @@ from sqlalchemy import (
     String,
     Text,
     TypeDecorator,
+    UniqueConstraint,
     create_engine,
     func,
+    inspect,
     or_,
     select,
 )
@@ -103,6 +105,29 @@ class Task(Base):
         return json.loads(self.config_json)
 
 
+class WorkflowVersion(Base):
+    __tablename__ = "workflow_versions"
+    __table_args__ = (UniqueConstraint("task_id", "version_number", name="uq_workflow_version_task_number"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id: Mapped[str] = mapped_column(String(36), index=True)
+    version_number: Mapped[int] = mapped_column(Integer)
+    workflow_json: Mapped[str] = mapped_column(Text)
+    release_note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    published_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    published_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    @property
+    def execution_definition(self) -> dict[str, Any]:
+        return json.loads(self.workflow_json)
+
+    @property
+    def version(self) -> int:
+        """Short alias used by API serializers and callers."""
+
+        return self.version_number
+
+
 class TaskRun(Base):
     __tablename__ = "task_runs"
 
@@ -114,6 +139,11 @@ class TaskRun(Base):
     status: Mapped[str] = mapped_column(String(30), default="running")
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_kind: Mapped[str] = mapped_column(String(20), default="published")
+    workflow_version: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    workflow_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    workflow_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    progress_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class AdminSession(Base):
@@ -150,6 +180,22 @@ class Database:
 
     def create_all(self) -> None:
         Base.metadata.create_all(self.engine)
+        # Keep the local development database usable after the destructive
+        # version-model change.  New installations are created from metadata;
+        # existing SQLite tables receive only the new nullable columns.
+        task_run_columns = {item["name"] for item in inspect(self.engine).get_columns("task_runs")}
+        missing = {
+            "run_kind": "TEXT DEFAULT 'published'",
+            "workflow_version": "VARCHAR(30)",
+            "workflow_version_id": "VARCHAR(36)",
+            "workflow_json": "TEXT",
+            "progress_json": "TEXT",
+        }
+        additions = {name: ddl for name, ddl in missing.items() if name not in task_run_columns}
+        if additions:
+            with self.engine.begin() as connection:
+                for name, ddl in additions.items():
+                    connection.exec_driver_sql(f"ALTER TABLE task_runs ADD COLUMN {name} {ddl}")
 
     def session(self) -> Session:
         return self.Session()
@@ -287,6 +333,56 @@ class Database:
             session.commit()
             session.refresh(run)
             return run
+
+    def publish_workflow(
+        self,
+        task_id: str,
+        execution_definition: dict[str, Any],
+        *,
+        release_note: str | None = None,
+        published_by: str | None = None,
+    ) -> WorkflowVersion:
+        with self.session() as session:
+            latest = session.scalar(
+                select(WorkflowVersion.version_number)
+                .where(WorkflowVersion.task_id == task_id)
+                .order_by(WorkflowVersion.version_number.desc())
+                .limit(1)
+            )
+            version = WorkflowVersion(
+                task_id=task_id,
+                version_number=(latest or 0) + 1,
+                workflow_json=json.dumps(execution_definition, ensure_ascii=False),
+                release_note=release_note.strip() if release_note else None,
+                published_by=published_by,
+            )
+            session.add(version)
+            session.commit()
+            session.refresh(version)
+            return version
+
+    def get_workflow_version(self, version_id: str) -> WorkflowVersion | None:
+        with self.session() as session:
+            return session.get(WorkflowVersion, version_id)
+
+    def get_latest_workflow_version(self, task_id: str) -> WorkflowVersion | None:
+        with self.session() as session:
+            return session.scalar(
+                select(WorkflowVersion)
+                .where(WorkflowVersion.task_id == task_id)
+                .order_by(WorkflowVersion.version_number.desc())
+                .limit(1)
+            )
+
+    def list_workflow_versions(self, task_id: str) -> list[WorkflowVersion]:
+        with self.session() as session:
+            return list(
+                session.scalars(
+                    select(WorkflowVersion)
+                    .where(WorkflowVersion.task_id == task_id)
+                    .order_by(WorkflowVersion.version_number.desc())
+                )
+            )
 
     def update_run(self, run_id: str, **values) -> TaskRun:
         with self.session() as session:

@@ -11,7 +11,7 @@ import typer
 
 from tg_botx.config import Settings
 from tg_botx.features.accounts.auth import AuthService
-from tg_botx.features.checkin.runtime import CheckinService
+from tg_botx.features.checkin.runtime import CheckinService, TaskStateError
 from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
 from tg_botx.infrastructure.observability.logging import SensitiveDataFilter
 from tg_botx.infrastructure.persistence.db import Database, Task
@@ -156,10 +156,29 @@ def enable_task(task_id: str):
     task = database.get_task(task_id)
     if not task:
         raise typer.BadParameter("任务不存在")
+    if database.get_latest_workflow_version(task.id) is None:
+        raise typer.BadParameter("请先发布工作流后再启用任务")
     next_run = next_run_for(schedule_from_task(task))
     database.update_task(task.id, enabled=True, next_run_at=next_run)
     logger.info("启用任务 task_id=%s name=%s next_run_at=%s", task.id, task.name, next_run)
     typer.echo(f"任务已启用，下次执行：{next_run}")
+
+
+@task_app.command("publish")
+def publish_task(
+    task_id: str,
+    release_note: str | None = typer.Option(None, "--note", help="可选的发布说明"),
+):
+    """发布当前任务的 main 工作流。"""
+    settings, database = resources()
+    service = CheckinService(settings, database)
+    try:
+        version = service.publish_task(task_id, release_note)
+    except TaskStateError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        asyncio.run(service.close())
+    typer.echo(f"工作流已发布：v{version.version_number}")
 
 
 @task_app.command("disable")

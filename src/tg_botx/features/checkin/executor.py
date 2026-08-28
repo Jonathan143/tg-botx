@@ -25,11 +25,13 @@ class CheckinExecutor:
             [int, Literal["running", "success", "failed"], str | None], Awaitable[None]
         ]
         | None = None,
+        on_step_response: Callable[[int, str], Awaitable[None]] | None = None,
     ):
         self.client = client
         self.is_cancelled = is_cancelled or (lambda: False)
         self.on_attempt = on_attempt
         self.on_step_status = on_step_status
+        self.on_step_response = on_step_response
 
     async def begin_attempt(self, attempt: int) -> None:
         if self.on_attempt is not None:
@@ -43,6 +45,10 @@ class CheckinExecutor:
     ) -> None:
         if self.on_step_status is not None:
             await self.on_step_status(index, status, error)
+
+    async def report_step_response(self, index: int, response: str) -> None:
+        if self.on_step_response is not None:
+            await self.on_step_response(index, response)
 
     async def execute(self, task: Any) -> str | None:
         entity = await self.client.get_entity(task.target)
@@ -58,6 +64,7 @@ class CheckinExecutor:
                 raise asyncio.CancelledError
             kind = step["type"]
             await self.report_step_status(index, "running")
+            step_response_reported = False
             try:
                 if kind == "send_message":
                     current_message = await self.client.send_message(entity, step["text"])
@@ -75,6 +82,8 @@ class CheckinExecutor:
                         editable_message_texts=editable_message_texts,
                     )
                     bot_response = current_message.raw_text or ""
+                    await self.report_step_response(index, bot_response)
+                    step_response_reported = True
                     baseline = max(baseline, current_message.id)
                     editable_message_ids.clear()
                     editable_message_texts.clear()
@@ -95,6 +104,9 @@ class CheckinExecutor:
                 await self.report_step_status(index, "failed", str(error))
                 raise error from exc
             except CheckinError as exc:
+                if exc.bot_response is not None and not step_response_reported:
+                    bot_response = exc.bot_response
+                    await self.report_step_response(index, bot_response)
                 if exc.bot_response is None:
                     exc.bot_response = bot_response
                 await self.report_step_status(index, "failed", str(exc))
