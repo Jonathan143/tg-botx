@@ -21,6 +21,7 @@ app = typer.Typer(help="Telegram 用户账号签到调度器")
 task_app = typer.Typer(help="管理签到任务")
 app.add_typer(task_app, name="task")
 logger = logging.getLogger(__name__)
+SERVER_APP_FACTORY = "tg_botx.interfaces.cli:create_server_app"
 
 
 def configure_logging(settings: Settings) -> None:
@@ -56,6 +57,17 @@ def resources(*, create_schema: bool = True) -> tuple[Settings, Database]:
     if create_schema:
         database.create_all()
     return settings, database
+
+
+def create_server_app():
+    """Create a fresh admin application for the Uvicorn worker process."""
+    settings, database = resources()
+    settings.require_admin_config()
+
+    from tg_botx.interfaces.admin.admin_api import create_admin_app
+
+    service = CheckinService(settings, database)
+    return create_admin_app(settings, database, service)
 
 
 @app.command()
@@ -231,20 +243,26 @@ def import_task(config: Path = typer.Option(..., "--config", exists=True, readab
 
 
 @app.command()
-def serve():
+def serve(
+    reload: bool = typer.Option(
+        False,
+        "--reload",
+        help="监控 Python 文件变化并自动重启服务（仅用于开发环境）",
+    ),
+):
     """启动常驻调度服务和后台管理 API。"""
-    # Ensure newly introduced persistence tables (including administrator
-    # sessions) are present when an existing installation is restarted.
-    settings, database = resources()
+    # The parent process needs these values before Uvicorn imports the factory.
+    # The factory repeats validation and initializes process-local resources in
+    # every worker, including workers restarted by the development reloader.
+    settings = Settings()
     settings.require_admin_config()
-    from tg_botx.interfaces.admin.admin_api import create_admin_app
 
     import uvicorn
 
-    service = CheckinService(settings, database)
-    api = create_admin_app(settings, database, service)
     uvicorn.run(
-        api,
+        SERVER_APP_FACTORY,
+        factory=True,
+        reload=reload,
         host=settings.api_host,
         port=settings.api_port,
         log_config=None,

@@ -26,6 +26,9 @@ tg-bot serve
 后台 API。未配置 `TG_BOT_ADMIN_KEY`/`TG_BOT_ADMIN_ORIGIN` 或密钥少于 32 个 UTF-8 字节时，
 管理 API 会拒绝启动。
 
+开发时可使用 `tg-bot serve --reload` 监控 Python 文件变化并自动重启服务。该参数仅适合
+本地开发，不应在生产环境中启用。
+
 `data/` 中包含 SQLite 数据库（以及 Telegram session 和日志），必须持久化并避免提交到 Git。
 
 数据库默认使用 SQLite。可通过环境变量切换到 PostgreSQL：
@@ -139,7 +142,7 @@ tg-bot task cancel <task-id>
 tg-bot task history <task-id>
 tg-bot task export <task-id> --output task.yaml
 tg-bot task import --config task.yaml
-tg-bot serve
+tg-bot serve [--reload]
 ```
 
 ## 开发与代码规范

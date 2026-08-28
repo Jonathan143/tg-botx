@@ -19,7 +19,17 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
      "https://api.telegram.org/bot[REDACTED]"),
     (re.compile(r"(?i)(postgres(?:ql)?(?:\+\w+)?://[^:\s/]+:)([^@\s]+)(@)"), r"\1[REDACTED]\3"),
     (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b"), "[REDACTED_TOKEN]"),
-    (re.compile(r"(?<!\d)\+?\d[\d\s()-]{7,}\d(?!\d)"), "[REDACTED_PHONE]"),
+    # Do not treat the date portion of an ISO-style log timestamp as a phone
+    # number.  The generic phone pattern accepts hyphens, so values such as
+    # ``2026-08-28`` were previously replaced before the admin log parser saw
+    # them, turning an otherwise valid timestamp into ``[REDACTED_PHONE]``.
+    (
+        re.compile(
+            r"(?<!\d)(?!\d{4}[-/]\d{1,2}[-/]\d{1,2}(?!\d))"
+            r"\+?\d[\d\s()-]{7,}\d(?!\d)"
+        ),
+        "[REDACTED_PHONE]",
+    ),
 )
 
 

@@ -6,6 +6,8 @@ import ipaddress
 import json
 import logging
 import re
+import signal
+import threading
 import time
 import uuid
 import zipfile
@@ -46,11 +48,39 @@ logger = logging.getLogger(__name__)
 SESSION_COOKIE = "tg_bot_admin_session"
 CSRF_HEADER = "X-CSRF-Token"
 TASK_EVENT_KEEPALIVE_SECONDS = 15
+LOG_EVENT_POLL_SECONDS = 1
 _LOG_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[ T][^ ]+)\s+"
     r"(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+"
     r"(?P<logger>\S+)\s*(?P<message>.*)$"
 )
+
+
+def _install_shutdown_signal_handlers(
+    shutdown_event: asyncio.Event,
+) -> dict[signal.Signals, Any]:
+    """Notify streaming responses before Uvicorn starts graceful shutdown."""
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+
+    previous_handlers: dict[signal.Signals, Any] = {}
+    for received in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.getsignal(received)
+        if not callable(previous):
+            continue
+
+        def handle_shutdown(signum: int, frame: Any, previous: Any = previous) -> None:
+            shutdown_event.set()
+            previous(signum, frame)
+
+        signal.signal(received, handle_shutdown)
+        previous_handlers[received] = previous
+    return previous_handlers
+
+
+def _restore_signal_handlers(previous_handlers: dict[signal.Signals, Any]) -> None:
+    for received, previous in previous_handlers.items():
+        signal.signal(received, previous)
 
 
 class APIError(Exception):
@@ -368,11 +398,13 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     except ValueError as exc:
         raise RuntimeError("TG_BOT_TRUSTED_PROXIES 包含无效 CIDR") from exc
     started_at = time.monotonic()
+    shutdown_event = asyncio.Event()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         rotation_task: asyncio.Task | None = None
         started = False
+        previous_signal_handlers = _install_shutdown_signal_handlers(shutdown_event)
         try:
             await service.start()
             started = True
@@ -381,14 +413,18 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             logger.info("后台管理 API 已启动")
             yield
         finally:
-            if rotation_task:
-                rotation_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await rotation_task
-            await accounts.close()
-            if started:
-                await service.notifications.service_stopped("管理 API 服务停止")
-            await service.close()
+            shutdown_event.set()
+            try:
+                if rotation_task:
+                    rotation_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await rotation_task
+                await accounts.close()
+                if started:
+                    await service.notifications.service_stopped("管理 API 服务停止")
+                await service.close()
+            finally:
+                _restore_signal_handlers(previous_signal_handlers)
 
     app = FastAPI(
         title="tg-bot 后台管理 API",
@@ -403,6 +439,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     app.state.login_flows = accounts
     app.state.database = database
     app.state.checkin_service = service
+    app.state.shutdown_event = shutdown_event
 
     def error_response(request: Request, error: APIError) -> JSONResponse:
         request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
@@ -702,14 +739,26 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 )
                 yield f"id: {event_id}\nevent: task.updated\ndata: {payload}\n\n"
 
-                while not await request.is_disconnected():
+                while not shutdown_event.is_set() and not await request.is_disconnected():
+                    queue_get = asyncio.create_task(queue.get())
+                    shutdown_wait = asyncio.create_task(shutdown_event.wait())
                     try:
-                        event_id = await asyncio.wait_for(
-                            queue.get(), timeout=TASK_EVENT_KEEPALIVE_SECONDS
+                        done, _ = await asyncio.wait(
+                            {queue_get, shutdown_wait},
+                            timeout=TASK_EVENT_KEEPALIVE_SECONDS,
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
-                    except TimeoutError:
+                    finally:
+                        for pending_task in (queue_get, shutdown_wait):
+                            if not pending_task.done():
+                                pending_task.cancel()
+                        await asyncio.gather(queue_get, shutdown_wait, return_exceptions=True)
+                    if shutdown_wait in done:
+                        return
+                    if queue_get not in done:
                         yield ": keepalive\n\n"
                         continue
+                    event_id = queue_get.result()
                     current = database.get_task_any(task.id)
                     if current is None:
                         return
@@ -1001,7 +1050,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         async def events() -> AsyncIterator[str]:
             seen = len(_filter_logs(_read_log_entries(settings), level, query, None, None))
             last_keepalive = time.monotonic()
-            while not await request.is_disconnected():
+            while not shutdown_event.is_set() and not await request.is_disconnected():
                 entries = _filter_logs(_read_log_entries(settings), level, query, None, None)
                 if len(entries) < seen:
                     seen = 0
@@ -1011,7 +1060,12 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 if time.monotonic() - last_keepalive >= 15:
                     yield ": keepalive\n\n"
                     last_keepalive = time.monotonic()
-                await asyncio.sleep(1)
+                try:
+                    await asyncio.wait_for(
+                        shutdown_event.wait(), timeout=LOG_EVENT_POLL_SECONDS
+                    )
+                except TimeoutError:
+                    pass
 
         return StreamingResponse(
             events(), media_type="text/event-stream",
