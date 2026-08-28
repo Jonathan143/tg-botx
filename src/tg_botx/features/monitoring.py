@@ -70,7 +70,7 @@ class GroupMonitor:
 
     def ingest(self, message: GroupMessage) -> tuple[str, ...]:
         self._history.append(message)
-        del self._history[:-self.max_history]
+        del self._history[: -self.max_history]
         return tuple(rule.name for rule in self.rules if rule.matches(message))
 
     def reply_for(self, message: GroupMessage) -> str | None:

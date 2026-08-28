@@ -58,7 +58,9 @@ class CommandRegistry:
         def decorator(handler: CommandHandler) -> CommandHandler:
             if normalized in self._handlers or normalized in self._aliases:
                 raise ValueError(f"命令已注册：{normalized}")
-            if any(alias in self._handlers or alias in self._aliases for alias in normalized_aliases):
+            if any(
+                alias in self._handlers or alias in self._aliases for alias in normalized_aliases
+            ):
                 raise ValueError("命令别名已注册")
             self._handlers[normalized] = handler
             for alias in normalized_aliases:

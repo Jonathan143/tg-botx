@@ -31,9 +31,7 @@ class ChannelNotifier:
     a queue, making channel maintenance independently testable.
     """
 
-    def __init__(
-        self, transport: ChannelTransport | Callable[[ChannelNotification], object]
-    ):
+    def __init__(self, transport: ChannelTransport | Callable[[ChannelNotification], object]):
         self._transport = transport
 
     async def publish(self, notification: ChannelNotification) -> None:
