@@ -189,6 +189,9 @@ def test_task_crud_actions_and_yaml_preflight_use_live_scheduler(tmp_path):
         task_id = created.json()["id"]
         assert created.json()["enabled"] is False
 
+        published = client.post(f"/api/tasks/{task_id}/publish", headers=headers, json={})
+        assert published.status_code == 200
+
         enabled = client.post(f"/api/tasks/{task_id}/enable", headers=headers, json={})
         assert enabled.status_code == 200
         assert enabled.json()["enabled"] is True
@@ -378,6 +381,9 @@ def test_manual_run_returns_running_task_with_initialized_step_statuses(
         task_id = client.post(
             "/api/tasks", headers=headers, json={"definition": definition}
         ).json()["id"]
+
+        published = client.post(f"/api/tasks/{task_id}/publish", headers=headers, json={})
+        assert published.status_code == 200
 
         response = client.post(f"/api/tasks/{task_id}/run", headers=headers, json={})
 

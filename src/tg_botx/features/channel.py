@@ -38,6 +38,6 @@ class ChannelNotifier:
         if hasattr(self._transport, "send"):
             result = self._transport.send(notification)
         else:
-            result = self._transport(notification)  # type: ignore[operator]
+            result = self._transport(notification)
         if inspect.isawaitable(result):
             await result

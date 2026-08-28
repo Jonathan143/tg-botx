@@ -37,11 +37,17 @@ def resources(tmp_path):
     return settings, database
 
 
+def create_published_task(service: CheckinService, definition: TaskDefinition):
+    task = service.create_task(definition)
+    service.publish_task(task.id)
+    return task
+
+
 def test_database_admin_queries_and_dashboard_stats(tmp_path):
     settings, database = resources(tmp_path)
     service = CheckinService(settings, database)
-    first = service.create_task(definition("alpha"))
-    second = service.create_task(definition("beta", target="another_bot"))
+    first = create_published_task(service, definition("alpha"))
+    second = create_published_task(service, definition("beta", target="another_bot"))
     service.enable_task(first.id)
     service.archive_task(second.id)
 
@@ -86,7 +92,7 @@ def test_task_mutations_synchronize_scheduler(tmp_path):
         service = CheckinService(settings, database)
         await service.start()
         try:
-            task = service.create_task(definition("daily"))
+            task = create_published_task(service, definition("daily"))
             assert task.enabled is False
             assert task.next_run_at is None
             assert service.scheduler.get_job(f"task:{task.id}") is None
@@ -128,8 +134,8 @@ def test_manual_busy_conflict_does_not_record_skipped(tmp_path, monkeypatch):
     async def scenario():
         settings, database = resources(tmp_path)
         service = CheckinService(settings, database)
-        first = service.create_task(definition("first"))
-        second = service.create_task(definition("second"))
+        first = create_published_task(service, definition("first"))
+        second = create_published_task(service, definition("second"))
         started = asyncio.Event()
         release = asyncio.Event()
 
@@ -169,7 +175,7 @@ def test_task_update_subscription_tracks_manual_run_state(tmp_path, monkeypatch)
     async def scenario():
         settings, database = resources(tmp_path)
         service = CheckinService(settings, database)
-        task = service.create_task(definition("events"))
+        task = create_published_task(service, definition("events"))
         queue = service.subscribe_task(task.id)
         started = asyncio.Event()
         release = asyncio.Event()
@@ -218,7 +224,8 @@ def test_step_progress_is_published_by_index_and_retries_reset_attempt(tmp_path)
     async def scenario():
         settings, database = resources(tmp_path)
         service = CheckinService(settings, database)
-        task = service.create_task(
+        task = create_published_task(
+            service,
             TaskDefinition.model_validate(
                 {
                     "name": "step-events",
@@ -299,7 +306,8 @@ def test_cancel_marks_running_step_failed_and_remaining_steps_skipped(tmp_path):
     async def scenario():
         settings, database = resources(tmp_path)
         service = CheckinService(settings, database)
-        task = service.create_task(
+        task = create_published_task(
+            service,
             TaskDefinition.model_validate(
                 {
                     "name": "cancel-steps",
@@ -360,7 +368,8 @@ def test_failed_run_keeps_failed_step_error_and_skips_later_steps(tmp_path):
     async def scenario():
         settings, database = resources(tmp_path)
         service = CheckinService(settings, database)
-        task = service.create_task(
+        task = create_published_task(
+            service,
             TaskDefinition.model_validate(
                 {
                     "name": "failed-steps",
@@ -422,7 +431,7 @@ def test_cancel_before_execution_starts_still_finalizes_task_and_steps(tmp_path)
     async def scenario():
         settings, database = resources(tmp_path)
         service = CheckinService(settings, database)
-        task = service.create_task(definition("cancel-before-start"))
+        task = create_published_task(service, definition("cancel-before-start"))
         await service.start()
         try:
             service.start_manual_run(task.id)
@@ -450,7 +459,7 @@ def test_running_snapshot_cannot_overwrite_edit_or_disable(tmp_path, monkeypatch
     async def scenario():
         settings, database = resources(tmp_path)
         service = CheckinService(settings, database)
-        task = service.create_task(definition("snapshot", at="23:59:00"))
+        task = create_published_task(service, definition("snapshot", at="23:59:00"))
         service.enable_task(task.id)
         started = asyncio.Event()
         release = asyncio.Event()

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol, TypeVar
 
-T = TypeVar("T")
+T = TypeVar("T", contravariant=True)
 
 
 class AsyncSender(Protocol[T]):
