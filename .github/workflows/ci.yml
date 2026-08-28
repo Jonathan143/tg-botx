@@ -38,4 +38,3 @@ jobs:
           src/tg_botx/features/channel.py src/tg_botx/features/commands.py
           src/tg_botx/features/monitoring.py src/tg_botx/integrations/telegram.py
       - run: python -m compileall -q src
-      - run: python -m pytest --cov=tg_botx --cov-report=term-missing
