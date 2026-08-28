@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -20,13 +20,13 @@ class DomainEvent:
 
     name: str
     payload: dict[str, Any] = field(default_factory=dict)
-    occurred_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class EventSubscription:
     """Async iterator returned by :meth:`EventBus.subscribe`."""
 
-    def __init__(self, bus: "EventBus", event_name: str | None):
+    def __init__(self, bus: EventBus, event_name: str | None):
         self._bus = bus
         self._event_name = event_name
         self._queue: asyncio.Queue[DomainEvent] = asyncio.Queue()

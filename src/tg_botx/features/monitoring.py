@@ -10,7 +10,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from tg_botx.features.checkin.matching import matches
@@ -22,7 +22,7 @@ class GroupMessage:
     message_id: int
     text: str
     sender_id: int | str | None = None
-    received_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    received_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass(frozen=True, slots=True)

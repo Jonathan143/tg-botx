@@ -6,7 +6,6 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol, TypeVar
 
-
 T = TypeVar("T")
 
 
