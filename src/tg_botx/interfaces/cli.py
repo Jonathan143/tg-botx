@@ -13,7 +13,7 @@ from tg_botx.config import Settings
 from tg_botx.features.accounts.auth import AuthService
 from tg_botx.features.checkin.runtime import CheckinService, TaskStateError
 from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
-from tg_botx.infrastructure.observability.logging import SensitiveDataFilter
+from tg_botx.infrastructure.observability.logging import IconFormatter, SensitiveDataFilter
 from tg_botx.infrastructure.persistence.db import Database, Task
 from tg_botx.schemas import TaskDefinition
 
@@ -28,7 +28,7 @@ def configure_logging(settings: Settings) -> None:
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
     if not isinstance(level, int):
         level = logging.INFO
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    formatter = IconFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     file_handler = RotatingFileHandler(
         settings.log_path,
         maxBytes=settings.log_max_bytes,

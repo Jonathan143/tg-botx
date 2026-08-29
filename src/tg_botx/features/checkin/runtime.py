@@ -82,12 +82,19 @@ class NotificationService:
 
     _MAX_ATTEMPTS = 3
     _RETRY_DELAYS = (1, 2)
+    _DIVIDER = "──────────────"
+    _STATUS_ICONS = {
+        "INFO": "ℹ️",
+        "ERROR": "❌",
+        "WARNING": "⚠️",
+    }
 
     def __init__(self, settings: Settings):
         self.settings = settings
         secret = settings.notification_bot_token
         self._token = secret.get_secret_value().strip() if secret else ""
         self._chat_id = settings.notification_chat_id
+        self._notification_timezone = settings.notification_timezone
         self._client: httpx.AsyncClient | None = None
         self._send_lock = asyncio.Lock()
         # httpx's INFO access log includes the full request URL.  Telegram Bot
@@ -119,15 +126,26 @@ class NotificationService:
         return [text[index : index + limit] for index in range(0, len(text), limit)]
 
     @staticmethod
-    def _task_time(task: Task, value: datetime | None) -> str:
+    def _format_time(value: datetime | None, timezone_name: str) -> str:
         if value is None:
             return "未安排"
         zone: ZoneInfo | timezone
         try:
-            zone = ZoneInfo(task.timezone)
+            zone = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
             zone = timezone.utc
-        return value.astimezone(zone).isoformat(timespec="seconds") + f" ({task.timezone})"
+        # Keep the wall-clock time and named timezone for readability.  The
+        # numeric UTC offset is intentionally omitted because it is redundant
+        # with the timezone name and makes notifications harder to scan.
+        local = value.astimezone(zone)
+        return local.strftime("%Y-%m-%d %H:%M:%S") + f" ({timezone_name})"
+
+    @staticmethod
+    def _task_time(task: Task, value: datetime | None) -> str:
+        return NotificationService._format_time(value, task.timezone)
+
+    def _notification_time(self, value: datetime | None) -> str:
+        return self._format_time(value, self._notification_timezone)
 
     async def _http_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -198,24 +216,29 @@ class NotificationService:
         error: str | None = None,
         bot_response: str | None = None,
         include_next_run: bool = True,
+        icon: str | None = None,
     ) -> None:
+        icon = icon or self._STATUS_ICONS.get(level, "📣")
         lines = [
-            f"[{level}] {title}",
-            f"任务：{task.name}",
-            f"目标：{task.target}",
-            f"时间：{self._task_time(task, utc_now())}",
+            f"{icon} {title}",
+            self._DIVIDER,
+            f"📋 任务：{task.name}",
+            f"🎯 目标：{task.target}",
+            f"🕒 时间：{self._task_time(task, utc_now())}",
         ]
         if error:
-            lines.append(f"原因：{error}")
+            lines.append(f"📝 原因：{error}")
         if include_next_run:
-            lines.append(f"下次计划：{self._task_time(task, next_run)}")
+            lines.append(f"⏭️ 下次计划：{self._task_time(task, next_run)}")
         if bot_response is not None and self._include_response(task):
-            lines.extend(("机器人回复：", bot_response))
+            lines.extend((self._DIVIDER, "🤖 机器人回复：", bot_response))
         await self._send_text("\n".join(lines))
 
     async def success(self, task: Task, next_run: datetime | None, bot_response: str | None) -> None:
         if self._is_enabled(task, "success"):
-            await self._task_event(task, "INFO", "签到成功", next_run, bot_response=bot_response)
+            await self._task_event(
+                task, "INFO", "签到成功", next_run, bot_response=bot_response, icon="✅"
+            )
 
     async def failure(
         self,
@@ -232,10 +255,13 @@ class NotificationService:
                 next_run,
                 error=error,
                 bot_response=bot_response,
+                icon="❌",
             )
 
     async def skipped(self, task: Task, next_run: datetime | None) -> None:
-        await self._task_event(task, "WARNING", "任务因目标聊天忙碌而跳过", next_run)
+        await self._task_event(
+            task, "WARNING", "任务因目标聊天忙碌而跳过", next_run, icon="⏭️"
+        )
 
     async def cancel_requested(self, task: Task) -> None:
         await self._task_event(
@@ -244,25 +270,45 @@ class NotificationService:
             "任务取消请求已提交",
             None,
             include_next_run=False,
+            icon="🛑",
         )
 
     async def canceled(self, task: Task, next_run: datetime | None, reason: str) -> None:
-        await self._task_event(task, "INFO", "任务已取消", next_run, error=reason)
+        await self._task_event(task, "INFO", "任务已取消", next_run, error=reason, icon="🛑")
 
     async def service_started(self) -> None:
         await self._send_text(
-            f"[INFO] 签到服务已启动\n时间：{utc_now().isoformat(timespec='seconds')}"
+            "\n".join(
+                (
+                    "🚀 签到服务已启动",
+                    self._DIVIDER,
+                    f"🕒 时间：{self._notification_time(utc_now())}",
+                )
+            )
         )
 
     async def service_stopped(self, reason: str) -> None:
         await self._send_text(
-            f"[INFO] 签到服务已停止\n时间：{utc_now().isoformat(timespec='seconds')}\n原因：{reason}"
+            "\n".join(
+                (
+                    "🛑 签到服务已停止",
+                    self._DIVIDER,
+                    f"🕒 时间：{self._notification_time(utc_now())}",
+                    f"📝 原因：{reason}",
+                )
+            )
         )
 
     async def service_failed(self, error_type: str) -> None:
         await self._send_text(
-            f"[ERROR] 签到服务发生致命异常\n时间：{utc_now().isoformat(timespec='seconds')}"
-            f"\n异常类型：{error_type}"
+            "\n".join(
+                (
+                    "💥 签到服务发生致命异常",
+                    self._DIVIDER,
+                    f"🕒 时间：{self._notification_time(utc_now())}",
+                    f"📝 异常类型：{error_type}",
+                )
+            )
         )
 
     async def close(self) -> None:
@@ -507,7 +553,7 @@ class CheckinService:
         try:
             await self.start()
             started = True
-            logger.info("签到服务已启动")
+            logger.info("🚀 签到服务已启动")
             await self.notifications.service_started()
             await stop_event.wait()
         except asyncio.CancelledError:
@@ -905,7 +951,7 @@ class CheckinService:
                     next_run = current.next_run_at if current else None
                 if self._log_bot_response_enabled(task) and bot_response is not None:
                     logger.info(
-                        "机器人回复 task_id=%s name=%s status=%s\n%s",
+                        "🤖 机器人回复 task_id=%s name=%s status=%s\n%s",
                         task.id,
                         task.name,
                         status,
@@ -977,7 +1023,7 @@ class CheckinService:
         lock_key = (account.id, execution_task.target)
         lock = self.locks.setdefault(lock_key, asyncio.Lock())
         if lock.locked() or lock_key in self._manual_reservations:
-            logger.warning("任务 %s 因目标聊天忙碌而跳过本次执行", task.name)
+            logger.warning("⚠️ 任务 %s 因目标聊天忙碌而跳过本次执行", task.name)
             await self._record_skipped(task, execution_task, version=version)
             return False
         run = self.database.add_run(

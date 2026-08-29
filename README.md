@@ -43,7 +43,7 @@ TG_BOT_DATABASE=sqlite
 `postgresql://` 或 `postgres://` 写法，程序会自动使用 psycopg 驱动；SQLite
 仍使用 `TG_BOT_DATA_DIR/database.sqlite3`。
 
-日志默认同时输出到终端和 `data/logs/tg-bot.log`，并按 10 MB 自动轮转，保留 5 个历史文件。可通过以下环境变量调整：
+日志默认同时输出到终端和 `data/logs/tg-bot.log`，并按 10 MB 自动轮转，保留 5 个历史文件；终端和文件日志会按级别加图标，便于快速扫读。可通过以下环境变量调整：
 
 ```text
 TG_BOT_LOG_LEVEL=INFO
@@ -122,6 +122,8 @@ Compose 配置只通过 `expose` 向同一 Compose 网络公布 8000 端口，�
 ```text
 TG_BOT_NOTIFICATION_BOT_TOKEN=replace-with-bot-token
 TG_BOT_ADMIN_CHAT_IDS=123456789
+# 服务启动/停止等通知的默认时间展示时区；任务结果通知优先使用任务 schedule.timezone
+TG_BOT_NOTIFICATION_TIMEZONE=Asia/Shanghai
 ```
 
 管理员必须先在 Telegram 中打开该机器人并发送 `/start`，否则机器人不能主动发起私聊。通知只发送到
@@ -130,7 +132,9 @@ TG_BOT_ADMIN_CHAT_IDS=123456789
 
 机器人通知包括任务最终成功或失败、取消请求与实际取消、忙碌跳过，以及 `serve` 常驻服务的启动、
 SIGINT/SIGTERM 优雅停止和可捕获的致命异常。投递发生网络错误、限流或服务端错误时最多重试 3 次；
-最终投递失败只写日志，不改变签到任务结果。任务事件按任务时区显示，服务事件使用 UTC。
+最终投递失败只写日志，不改变签到任务结果。通知使用图标区分状态，任务事件按任务时区显示，服务事件使用
+`TG_BOT_NOTIFICATION_TIMEZONE`（默认 `Asia/Shanghai`）。开启 `notify_bot_response` 后，通知会附带最后一次机器人回复；
+日志对应使用 `log_bot_response`，两者默认关闭并继续执行敏感信息脱敏。
 
 ## CLI
 

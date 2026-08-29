@@ -1,9 +1,33 @@
 from __future__ import annotations
 
+import copy
 import logging
 import re
 from collections.abc import Iterable
 from pathlib import Path
+
+
+class IconFormatter(logging.Formatter):
+    """Keep the machine-readable log prefix while adding a visual level cue."""
+
+    _ICONS = {
+        logging.DEBUG: "🔎",
+        logging.INFO: "ℹ️",
+        logging.WARNING: "⚠️",
+        logging.ERROR: "❌",
+        logging.CRITICAL: "💥",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        # Format a shallow copy so handlers do not mutate the shared record
+        # (and so the icon is added exactly once when multiple handlers run).
+        rendered = copy.copy(record)
+        message = rendered.getMessage()
+        icon = self._ICONS.get(rendered.levelno)
+        if icon and not message.startswith(tuple(self._ICONS.values())):
+            rendered.msg = f"{icon} {message}"
+            rendered.args = ()
+        return super().format(rendered)
 
 
 _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (

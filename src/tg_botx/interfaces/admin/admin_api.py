@@ -23,6 +23,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import OperationalError
 
 from tg_botx.config import Settings
 from tg_botx.features.checkin.runtime import (
@@ -542,6 +543,23 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         return error_response(
             request,
             APIError("VALIDATION_FAILED", "请求参数无效", 422, details=_validation_details(exc)),
+        )
+
+    @app.exception_handler(OperationalError)
+    async def handle_database_unavailable(request: Request, exc: OperationalError) -> JSONResponse:
+        logger.error(
+            "管理 API 数据库不可用 request_id=%s",
+            getattr(request.state, "request_id", "-"),
+            exc_info=exc,
+        )
+        return error_response(
+            request,
+            APIError(
+                "DATABASE_UNAVAILABLE",
+                "数据库暂时不可用，请稍后重试",
+                503,
+                headers={"Retry-After": "5"},
+            ),
         )
 
     @app.exception_handler(Exception)
@@ -1239,6 +1257,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 settings.notification_bot_token
                 and settings.notification_bot_token.get_secret_value().strip()
             ),
+            "notificationTimezone": settings.notification_timezone,
             "logLevel": settings.log_level,
             "logFile": settings.log_file,
             "logMaxBytes": settings.log_max_bytes,

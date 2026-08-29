@@ -175,6 +175,17 @@ class Database:
         engine_kwargs = {}
         if database_url.get_backend_name() == "sqlite":
             engine_kwargs["connect_args"] = {"check_same_thread": False}
+        elif database_url.get_backend_name() == "postgresql":
+            # Admin requests are long-lived enough to encounter stale pooled
+            # connections (for example after a database failover).  Probe a
+            # connection before handing it to SQLAlchemy and recycle idle
+            # connections before common cloud load balancer timeouts.
+            engine_kwargs.update(
+                pool_pre_ping=True,
+                pool_recycle=1_800,
+                pool_timeout=10,
+                connect_args={"connect_timeout": 10},
+            )
         self.engine = create_engine(url, **engine_kwargs)
         self.Session = sessionmaker(self.engine, expire_on_commit=False)
 

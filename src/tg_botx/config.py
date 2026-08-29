@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -21,6 +22,9 @@ class Settings(BaseSettings):
     )
     admin_chat_ids: str = Field(default="")
     notification_bot_token: SecretStr | None = Field(default=None)
+    # Timezone used when formatting notification timestamps that are not tied
+    # to a task schedule (service lifecycle and fatal-error events).
+    notification_timezone: str = Field(default="Asia/Shanghai")
     log_level: str = Field(default="INFO")
     log_file: str = Field(default="tg-bot.log")
     log_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
@@ -59,6 +63,16 @@ class Settings(BaseSettings):
         if normalized in {"sqlite", "sqlite3"}:
             return "sqlite"
         raise ValueError("TG_BOT_DATABASE 仅支持 sqlite 或 postgresql")
+
+    @field_validator("notification_timezone")
+    @classmethod
+    def validate_notification_timezone(cls, value: str) -> str:
+        normalized = value.strip()
+        try:
+            ZoneInfo(normalized)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("TG_BOT_NOTIFICATION_TIMEZONE 无效") from exc
+        return normalized
 
     @field_validator("admin_origin")
     @classmethod

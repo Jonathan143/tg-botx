@@ -498,11 +498,15 @@ class SessionManager:
         session_days: float = 30,
         clock: Callable[[], float] = time.time,
         session_store: SessionStore | None = None,
+        prune_interval_seconds: float = 60,
     ) -> None:
         if session_days <= 0:
             raise ValueError("session_days must be positive")
+        if prune_interval_seconds <= 0:
+            raise ValueError("prune_interval_seconds must be positive")
         key = validate_admin_key(admin_key)
         self.session_seconds = float(session_days) * 86_400
+        self.prune_interval_seconds = float(prune_interval_seconds)
         self._clock = clock
         self._lock = threading.RLock()
         self._token_hash_key = hmac.new(
@@ -513,6 +517,7 @@ class SessionManager:
         ).digest()
         self._session_store = session_store
         self._sessions: dict[bytes, _Session] = {}
+        self._last_prune_at: float | None = None
 
     def create(self) -> SessionCredentials:
         now = self._clock()
@@ -616,7 +621,7 @@ class SessionManager:
 
     def prune(self) -> None:
         with self._lock:
-            self._prune_locked(self._clock())
+            self._prune_locked(self._clock(), force=True)
 
     def _token_digest(self, token: str) -> bytes:
         return hmac.new(
@@ -628,16 +633,25 @@ class SessionManager:
             hmac.new(self._csrf_key, token.encode("utf-8"), hashlib.sha256).digest()
         ).decode("ascii").rstrip("=")
 
-    def _prune_locked(self, now: float) -> None:
+    def _prune_locked(self, now: float, *, force: bool = False) -> None:
         self._sessions = {
             token_hash: session
             for token_hash, session in self._sessions.items()
             if session.expires_at > now
         }
-        if self._session_store is not None:
-            self._session_store.delete_expired_admin_sessions(
-                datetime.fromtimestamp(now, tz=UTC)
-            )
+        if self._session_store is None:
+            return
+        # Cleanup is maintenance work; running a DELETE for every authenticated
+        # request makes a transient database outage take down the entire admin
+        # API.  Keep it bounded to once per minute while retaining an explicit
+        # ``prune()`` method for startup/shutdown jobs that need an immediate run.
+        if not force and self._last_prune_at is not None:
+            if now - self._last_prune_at < self.prune_interval_seconds:
+                return
+        self._last_prune_at = now
+        self._session_store.delete_expired_admin_sessions(
+            datetime.fromtimestamp(now, tz=UTC)
+        )
 
 
 class FailureRateLimiter:

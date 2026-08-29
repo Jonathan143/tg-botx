@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -23,7 +23,9 @@ class RetryConfig(BaseModel):
     model_config = _MODEL_CONFIG
 
     max_attempts: int = Field(default=3, ge=1, le=10)
-    backoff_seconds: list[int] = Field(default_factory=lambda: [30, 60, 120])
+    backoff_seconds: list[Annotated[int, Field(ge=0)]] = Field(
+        default_factory=lambda: [30, 60, 120]
+    )
 
 
 class NotificationConfig(BaseModel):
