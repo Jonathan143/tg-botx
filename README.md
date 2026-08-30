@@ -115,6 +115,39 @@ Compose 配置只通过 `expose` 向同一 Compose 网络公布 8000 端口，�
 `ports` 映射。请将 Web 反向代理加入同一网络，由它将同源 `/api` 转发到
 `http://tg-bot:8000`；不应直接将 Uvicorn 端口暴露到公网。
 
+## GitHub Actions 发布 Docker 镜像
+
+`.github/workflows/docker-publish.yml` 会使用 GitHub Actions 构建并发布多架构镜像到
+GitHub Container Registry（GHCR），镜像地址为
+`ghcr.io/<github 用户名>/<仓库名>`，支持 `linux/amd64` 和 `linux/arm64`。
+
+- 只有推送 Git tag 时才会运行工作流；普通分支 push、Pull Request 和手动运行都不会构建。
+- 每个 tag 都会发布同名镜像标签、`latest` 和提交 SHA 标签；符合 SemVer 的 `v*` 标签
+  （例如 `v1.2.3`）还会发布 `1.2.3` 和 `1.2` 标签。
+
+工作流使用自动生成的 `GITHUB_TOKEN`，仓库无需额外配置密码；请确保仓库的 Actions 已启用，
+并允许工作流写入 Packages（工作流已声明 `packages: write` 权限）。发布后可按需设置 GHCR
+包的可见性，然后使用对应标签拉取：
+
+```bash
+docker pull ghcr.io/<github 用户名>/<仓库名>:latest
+```
+
+## Release 发布脚本
+
+使用 [`scripts/release.sh`](scripts/release.sh) 可自动递增项目版本、提交版本变更、推送当前分支，
+再创建并推送对应的 `v<版本>` tag，从而触发上面的镜像发布工作流。默认递增 patch 版本：
+
+```bash
+./scripts/release.sh              # 例如 0.0.1 -> 0.0.2
+./scripts/release.sh major        # 例如 0.0.1 -> 1.0.0
+./scripts/release.sh minor        # 例如 0.0.1 -> 0.1.0
+./scripts/release.sh patch        # 例如 0.0.1 -> 0.0.2
+```
+
+脚本默认推送到 `origin`，也可通过 `RELEASE_REMOTE=<远程名>` 指定其他远程。为避免误提交，
+执行前需要保持工作区干净，并确保当前分支不是 detached HEAD。
+
 ## Telegram 机器人通知
 
 通知通过 BotFather 创建的独立机器人和 Telegram Bot API 发送，不复用签到用户账号的 session：
