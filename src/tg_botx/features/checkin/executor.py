@@ -90,6 +90,15 @@ class CheckinExecutor:
                 elif kind == "click_button":
                     if current_message is None:
                         raise CheckinError("点击按钮步骤前没有可用的机器人消息")
+                    # ``Message.buttons`` can be empty when Telethon has not
+                    # resolved the input chat/sender yet (notably for messages
+                    # received through an update).  ``get_buttons`` performs
+                    # the documented asynchronous fallback and caches the
+                    # resolved rows for the matcher.
+                    if not getattr(current_message, "buttons", None):
+                        get_buttons = getattr(current_message, "get_buttons", None)
+                        if callable(get_buttons):
+                            await get_buttons()
                     button = match_button(current_message, step)
                     editable_message_ids = {current_message.id}
                     editable_message_texts = {current_message.id: current_message.raw_text or ""}
@@ -195,6 +204,10 @@ class CheckinExecutor:
             return
         if selector.get("row") is not None and selector.get("column") is not None:
             await message.click(selector["row"], selector["column"])
+            return
+        click = getattr(button, "click", None)
+        if callable(click):
+            await click()
             return
         await message.click(text=getattr(button, "text", ""))
 

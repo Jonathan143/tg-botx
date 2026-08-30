@@ -236,7 +236,7 @@ def test_step_progress_is_published_by_index_and_retries_reset_attempt(tmp_path)
                         "timezone": "UTC",
                         "time": "23:59:00",
                     },
-                    "retry": {"maxAttempts": 2, "backoffSeconds": [0]},
+                    "retry": {"max_attempts": 2, "backoff_seconds": [0]},
                     "steps": [
                         {"type": "send_message", "text": "/start"},
                         {"type": "send_message", "text": "/finish"},
@@ -380,7 +380,7 @@ def test_failed_run_keeps_failed_step_error_and_skips_later_steps(tmp_path):
                         "timezone": "UTC",
                         "time": "23:59:00",
                     },
-                    "retry": {"maxAttempts": 1, "backoffSeconds": []},
+                    "retry": {"max_attempts": 1, "backoff_seconds": []},
                     "steps": [
                         {"type": "send_message", "text": "/fail"},
                         {"type": "send_message", "text": "/never"},

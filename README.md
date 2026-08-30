@@ -213,6 +213,8 @@ TG_BOT_GROUP_MONITOR_HISTORY_LIMIT=500
 `tg_botx.features` 提供可复用的 `CommandRegistry`、`ChannelNotifier` 和 `GroupMonitor`；它们只依赖抽象 transport/handler，可在管理 API、常驻服务或独立 worker 中组装。
 
 任务配置采用 YAML，步骤仅允许内置类型，不执行任意 Python 或 Shell。
+YAML 与管理 API 中的任务定义统一使用 `snake_case` 字段名，例如
+`max_attempts`、`timeout_seconds`、`text_contains` 和 `callback_data`，不接受 camelCase 别名。
 
 可在任务中分别控制失败和成功通知。未配置 `notifications` 时默认仅发送失败通知：
 
@@ -232,5 +234,4 @@ log_bot_response: false
 notify_bot_response: false
 ```
 
-旧配置 `output_bot_response` 仍兼容：未配置对应新开关时，它会同时控制日志和通知输出。新开关优先于旧配置。
 回复超过单条 Telegram 消息长度时，通知会自动分段发送。

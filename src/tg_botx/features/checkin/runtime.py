@@ -116,10 +116,7 @@ class NotificationService:
 
     @staticmethod
     def _include_response(task: Task) -> bool:
-        configured = task.config.get("notify_bot_response")
-        if configured is not None:
-            return bool(configured)
-        return bool(task.config.get("output_bot_response", False))
+        return bool(task.config.get("notify_bot_response", False))
 
     @staticmethod
     def _message_chunks(text: str, limit: int = 4000) -> list[str]:
@@ -796,10 +793,7 @@ class CheckinService:
 
     @staticmethod
     def _log_bot_response_enabled(task: Task) -> bool:
-        configured = task.config.get("log_bot_response")
-        if configured is not None:
-            return bool(configured)
-        return bool(task.config.get("output_bot_response", False))
+        return bool(task.config.get("log_bot_response", False))
 
     async def _record_skipped(
         self,

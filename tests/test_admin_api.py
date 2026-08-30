@@ -249,7 +249,7 @@ steps:
         assert overwritten.json()["overwritten"] is True
 
 
-def test_task_json_accepts_and_returns_camel_case_for_create_detail_and_edit(tmp_path):
+def test_task_json_uses_snake_case_for_create_detail_and_edit(tmp_path):
     app = app_for(tmp_path)
     with TestClient(app, base_url=ORIGIN) as client:
         verified = authenticate(client).json()
@@ -263,45 +263,42 @@ def test_task_json_accepts_and_returns_camel_case_for_create_detail_and_edit(tmp
             "account": "default",
             "target": "checkin_bot",
             "schedule": {"type": "fixed", "timezone": "UTC", "time": "12:00:00"},
-            "retry": {"maxAttempts": 2, "backoffSeconds": [1, 2]},
+            "retry": {"max_attempts": 2, "backoff_seconds": [1, 2]},
             "steps": [
                 {"type": "send_message", "text": "/start"},
                 {
                     "type": "wait_message",
-                    "timeoutSeconds": 45,
+                    "timeout_seconds": 45,
                     "success": {"mode": "contains", "value": "ok"},
                 },
-                {"type": "click_button", "textContains": "签到"},
+                {"type": "click_button", "text_contains": "签到"},
             ],
-            "outputBotResponse": True,
-            "logBotResponse": False,
-            "notifyBotResponse": True,
+            "log_bot_response": False,
+            "notify_bot_response": True,
         }
 
         created = client.post("/api/tasks", headers=headers, json={"definition": definition})
         assert created.status_code == 201
         task_id = created.json()["id"]
         created_definition = created.json()["definition"]
-        assert created_definition["retry"] == {"maxAttempts": 2, "backoffSeconds": [1, 2]}
-        assert created_definition["outputBotResponse"] is True
-        assert created_definition["steps"][1]["timeoutSeconds"] == 45
-        assert created_definition["steps"][2]["textContains"] == "签到"
-        assert "output_bot_response" not in created_definition
-        assert "timeout_seconds" not in created_definition["steps"][1]
+        assert created_definition["retry"] == {
+            "max_attempts": 2,
+            "backoff_seconds": [1, 2],
+        }
+        assert created_definition["steps"][1]["timeout_seconds"] == 45
+        assert created_definition["steps"][2]["text_contains"] == "签到"
 
         detail = client.get(f"/api/tasks/{task_id}")
         assert detail.status_code == 200
-        assert detail.json()["definition"]["retry"]["maxAttempts"] == 2
-        assert detail.json()["definition"]["notifyBotResponse"] is True
+        assert detail.json()["definition"]["retry"]["max_attempts"] == 2
+        assert detail.json()["definition"]["notify_bot_response"] is True
 
-        definition["retry"]["maxAttempts"] = 4
-        definition["outputBotResponse"] = False
+        definition["retry"]["max_attempts"] = 4
         edited = client.patch(
             f"/api/tasks/{task_id}", headers=headers, json={"definition": definition}
         )
         assert edited.status_code == 200
-        assert edited.json()["definition"]["retry"]["maxAttempts"] == 4
-        assert edited.json()["definition"]["outputBotResponse"] is False
+        assert edited.json()["definition"]["retry"]["max_attempts"] == 4
 
 
 def test_task_events_require_session_and_send_full_initial_snapshot(
@@ -375,7 +372,7 @@ def test_manual_run_returns_running_task_with_initialized_step_statuses(
             "schedule": {"type": "fixed", "timezone": "UTC", "time": "12:00:00"},
             "steps": [
                 {"type": "send_message", "text": "/start"},
-                {"type": "wait_message", "timeoutSeconds": 10},
+                {"type": "wait_message", "timeout_seconds": 10},
             ],
         }
         task_id = client.post(

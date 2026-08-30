@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 
@@ -22,7 +23,46 @@ def matches(text: str, rule: Any) -> bool:
     return value.casefold() in text.casefold()
 
 
+def _button_text(value: Any) -> str:
+    """Normalize button labels before comparing them.
+
+    Telegram labels can contain non-breaking spaces, zero-width formatting
+    characters, or full-width punctuation.  Those characters are invisible
+    in the workflow editor but would otherwise make a contains comparison
+    fail unexpectedly.
+    """
+
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = "".join(
+        char
+        for char in text
+        if unicodedata.category(char) != "Cf" and not char.isspace()
+    )
+    return text.casefold()
+
+
+def _callback_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        # Callback data is an opaque Telegram payload.  It is common for it
+        # to contain arbitrary bytes, so decoding must never break text-based
+        # button matching.
+        return value.decode("utf-8", errors="surrogateescape")
+    return str(value or "")
+
+
 def match_button(message: Any, selector: dict[str, Any]) -> Any:
+    unsupported = set(selector) - {
+        "type",
+        "text",
+        "text_contains",
+        "callback_data",
+        "row",
+        "column",
+    }
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise ValueError(f"按钮定位包含不支持的字段: {names}")
+
     buttons = getattr(message, "buttons", None) or []
     candidates = []
     wanted_text = selector.get("text")
@@ -37,24 +77,25 @@ def match_button(message: Any, selector: dict[str, Any]) -> Any:
                 continue
             if wanted_column is not None and column_index != wanted_column:
                 continue
-            button_text = str(getattr(button, "text", ""))
-            callback = getattr(button, "data", None)
-            callback_text = callback.decode() if isinstance(callback, bytes) else str(callback or "")
-            if wanted_callback is not None and callback_text != str(wanted_callback):
-                continue
+            if wanted_callback is not None:
+                callback = getattr(button, "data", None)
+                if _callback_text(callback) != _callback_text(wanted_callback):
+                    continue
             candidates.append(button)
 
     if wanted_callback is None:
         if wanted_text_contains is not None:
-            needle = str(wanted_text_contains).casefold()
-            candidates = [button for button in candidates if needle in str(getattr(button, "text", "")).casefold()]
+            needle = _button_text(wanted_text_contains)
+            candidates = [
+                button for button in candidates if needle in _button_text(getattr(button, "text", ""))
+            ]
         elif wanted_text is not None:
             # Preserve exact matching when possible, then allow a unique
             # substring match such as "每日签到" -> "✅每日签到".
-            needle = str(wanted_text).casefold()
-            exact = [button for button in candidates if str(getattr(button, "text", "")).casefold() == needle]
+            needle = _button_text(wanted_text)
+            exact = [button for button in candidates if _button_text(getattr(button, "text", "")) == needle]
             candidates = exact or [
-                button for button in candidates if needle in str(getattr(button, "text", "")).casefold()
+                button for button in candidates if needle in _button_text(getattr(button, "text", ""))
             ]
 
     if len(candidates) != 1:

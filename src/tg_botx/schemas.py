@@ -7,16 +7,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from pydantic.alias_generators import to_camel
 
 
-_MODEL_CONFIG = ConfigDict(extra="forbid", alias_generator=to_camel, populate_by_name=True)
-_STEP_INPUT_ALIASES = {
-    "timeoutSeconds": "timeout_seconds",
-    "textContains": "text_contains",
-    "callbackData": "callback_data",
-}
-_STEP_OUTPUT_ALIASES = {value: key for key, value in _STEP_INPUT_ALIASES.items()}
+_MODEL_CONFIG = ConfigDict(extra="forbid")
 
 
 class RetryConfig(BaseModel):
@@ -83,31 +76,31 @@ class TaskDefinition(BaseModel):
     retry: RetryConfig = Field(default_factory=RetryConfig)
     steps: list[dict[str, Any]] = Field(min_length=1)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
-    output_bot_response: bool = False
     log_bot_response: bool | None = None
     notify_bot_response: bool | None = None
-
-    @field_validator("steps", mode="before")
-    @classmethod
-    def normalize_step_aliases(cls, value: Any) -> Any:
-        if not isinstance(value, list):
-            return value
-        normalized = []
-        for step in value:
-            if not isinstance(step, dict):
-                normalized.append(step)
-                continue
-            normalized.append(
-                {_STEP_INPUT_ALIASES.get(key, key): item for key, item in step.items()}
-            )
-        return normalized
 
     @model_validator(mode="after")
     def validate_steps(self) -> "TaskDefinition":
         valid_types = {"send_message", "wait_message", "click_button"}
+        fields_by_type = {
+            "send_message": {"type", "text"},
+            "wait_message": {"type", "timeout_seconds", "success", "failure"},
+            "click_button": {
+                "type",
+                "text",
+                "text_contains",
+                "callback_data",
+                "row",
+                "column",
+            },
+        }
         for index, step in enumerate(self.steps):
             if step.get("type") not in valid_types:
                 raise ValueError(f"steps[{index}] 的 type 必须是: {', '.join(sorted(valid_types))}")
+            unsupported = set(step) - fields_by_type[step["type"]]
+            if unsupported:
+                names = ", ".join(sorted(unsupported))
+                raise ValueError(f"steps[{index}] 包含不支持的字段: {names}")
             if step["type"] == "send_message" and not isinstance(step.get("text"), str):
                 raise ValueError(f"steps[{index}] send_message 必须配置 text")
             if step["type"] == "click_button" and not any(
@@ -127,9 +120,4 @@ class TaskDefinition(BaseModel):
         )
 
     def to_api_dict(self) -> dict[str, Any]:
-        payload = self.model_dump(mode="json", by_alias=True)
-        payload["steps"] = [
-            {_STEP_OUTPUT_ALIASES.get(key, key): value for key, value in step.items()}
-            for step in payload["steps"]
-        ]
-        return payload
+        return self.model_dump(mode="json")
