@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ from telethon.tl.types import Channel, Chat, User
 
 from tg_botx.config import Settings
 from tg_botx.infrastructure.persistence.db import Account, Database, utc_now
+
+logger = logging.getLogger(__name__)
 
 
 LoginMethod = Literal["qr", "phone"]
@@ -89,6 +92,16 @@ class ChatView:
     title: str
     username: str | None
     has_avatar: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ChatPullView:
+    account_id: str
+    added: int
+    updated: int
+    removed: int
+    total: int
+    synced_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,37 +365,79 @@ class LoginFlowManager:
             raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
         if chat_type not in {"all", "bot", "group", "private"}:
             raise AdminAccountError("CHAT_TYPE_INVALID", "聊天类型无效")
-        client = await self._get_pooled_client(account)
-        normalized_query = (query or "").strip().casefold()
-        result: list[ChatView] = []
         try:
-            async for dialog in client.iter_dialogs(limit=limit):
-                entity = dialog.entity
-                kind = self._chat_type(entity)
-                if kind is None or (chat_type != "all" and kind != chat_type):
-                    continue
-                username = getattr(entity, "username", None)
-                username_value = f"@{username}" if username else None
-                title = self._chat_title(entity, dialog)
-                haystack = f"{title} {username_value or ''} {entity.id}".casefold()
-                if normalized_query and normalized_query not in haystack:
-                    continue
-                result.append(
-                    ChatView(
-                        chat_id=str(entity.id),
-                        chat_type=kind,
-                        title=title,
-                        username=username_value,
-                        has_avatar=self._chat_photo_id(entity) is not None,
-                    )
-                )
-                if len(result) >= limit:
-                    break
+            rows = self.database.list_account_chats(
+                account.id,
+                chat_type=chat_type,
+                query=query,
+                limit=limit,
+            )
         except Exception:
             raise AdminAccountError("CHAT_LIST_FAILED", "无法加载账号对话") from None
-        return result
+        return [
+            ChatView(
+                chat_id=row.chat_id,
+                chat_type=row.chat_type,  # type: ignore[arg-type]
+                title=row.title,
+                username=row.username,
+                has_avatar=row.has_avatar,
+            )
+            for row in rows
+        ]
+
+    async def pull_chats(
+        self,
+        account_id_or_name: str,
+        *,
+        client: Any | None = None,
+    ) -> ChatPullView:
+        """Pull all dialogs from Telegram and incrementally cache them."""
+
+        account = self._find_account(account_id_or_name)
+        if account is None:
+            raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
+        if not account.is_active:
+            raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
+        telegram_client = client or await self._get_pooled_client(account)
+        chats: list[dict[str, Any]] = []
+        try:
+            async for dialog in telegram_client.iter_dialogs():
+                entity = dialog.entity
+                kind = self._chat_type(entity)
+                if kind is None:
+                    continue
+                avatar_photo_id = self._chat_photo_id(entity)
+                username = getattr(entity, "username", None)
+                username_value = f"@{username}" if username else None
+                chats.append(
+                    {
+                        "chat_id": str(entity.id),
+                        "chat_type": kind,
+                        "title": self._chat_title(entity, dialog),
+                        "username": username_value,
+                        "has_avatar": avatar_photo_id is not None,
+                        "avatar_photo_id": avatar_photo_id,
+                    }
+                )
+        except Exception:
+            raise AdminAccountError("CHAT_PULL_FAILED", "无法拉取账号对话") from None
+
+        try:
+            result = self.database.upsert_account_chats(account.id, chats)
+        except Exception:
+            raise AdminAccountError("CHAT_PULL_FAILED", "无法保存账号对话") from None
+        return ChatPullView(
+            account_id=account.id,
+            added=result["added"],
+            updated=result["updated"],
+            removed=result["removed"],
+            total=result["total"],
+            synced_at=utc_now(),
+        )
 
     async def download_chat_avatar(self, account_id_or_name: str, chat_id: str) -> Path | None:
+        """Return a locally cached avatar, downloading it only when needed."""
+
         account = self._find_account(account_id_or_name)
         if account is None:
             raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
@@ -390,17 +445,51 @@ class LoginFlowManager:
             raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
         if not re.fullmatch(r"-?\d+", chat_id):
             raise AdminAccountError("CHAT_ID_INVALID", "聊天 ID 无效")
+
+        cache_dir = self.settings.data_dir / "cache" / "avatars" / account.id
+        try:
+            get_account_chat = getattr(self.database, "get_account_chat", None)
+            chat = get_account_chat(account.id, chat_id) if get_account_chat else None
+        except AdminAccountError:
+            raise
+        except Exception:
+            raise AdminAccountError("CHAT_AVATAR_FAILED", "无法读取聊天头像缓存") from None
+
+        # A pulled chat carries the Telegram photo id, so a cache hit can be
+        # served without acquiring a Telegram client.  The glob fallback keeps
+        # avatars cached by older versions usable until the next chat pull.
+        photo_id = getattr(chat, "avatar_photo_id", None) if chat is not None else None
+        if photo_id is not None:
+            cache_path = cache_dir / f"{chat_id}-{photo_id}.jpg"
+            if self._valid_avatar_file(cache_path):
+                return cache_path
+        elif chat is None or getattr(chat, "has_avatar", False):
+            cached_path = self._find_legacy_avatar(cache_dir, chat_id)
+            if cached_path is not None:
+                return cached_path
+
         client = await self._get_pooled_client(account)
         try:
             entity = await client.get_entity(int(chat_id))
             photo_id = self._chat_photo_id(entity)
             if photo_id is None:
                 return None
-            cache_dir = self.settings.data_dir / "cache" / "avatars" / account.id
             cache_path = cache_dir / f"{chat_id}-{photo_id}.jpg"
+            if self._valid_avatar_file(cache_path):
+                # A pull may not have run since Telegram changed the photo;
+                # still return the newly observed local version immediately.
+                try:
+                    update_avatar = getattr(self.database, "update_account_chat_avatar", None)
+                    if update_avatar:
+                        update_avatar(account.id, chat_id, photo_id)
+                except Exception:
+                    logger.warning(
+                        "保存聊天头像版本失败 account_id=%s chat_id=%s",
+                        account.id,
+                        chat_id,
+                    )
+                return cache_path
             try:
-                if cache_path.is_file() and cache_path.stat().st_size > 0:
-                    return cache_path
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 temporary_path = cache_dir / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
                 try:
@@ -419,13 +508,49 @@ class LoginFlowManager:
                 for stale_path in cache_dir.glob(f"{chat_id}-*.jpg"):
                     if stale_path != cache_path:
                         stale_path.unlink(missing_ok=True)
-                return cache_path
             except OSError:
                 raise AdminAccountError("CHAT_AVATAR_FAILED", "无法保存聊天头像") from None
+            try:
+                update_avatar = getattr(self.database, "update_account_chat_avatar", None)
+                if update_avatar:
+                    update_avatar(account.id, chat_id, photo_id)
+            except Exception:
+                # The file is valid and can be served even if metadata
+                # persistence is temporarily unavailable.
+                logger.warning(
+                    "保存聊天头像版本失败 account_id=%s chat_id=%s",
+                    account.id,
+                    chat_id,
+                )
+            return cache_path
         except AdminAccountError:
             raise
         except Exception:
             raise AdminAccountError("CHAT_AVATAR_FAILED", "无法加载聊天头像") from None
+
+    @staticmethod
+    def _valid_avatar_file(path: Path) -> bool:
+        try:
+            return path.is_file() and path.stat().st_size > 0
+        except OSError:
+            return False
+
+    def _find_legacy_avatar(self, cache_dir: Path, chat_id: str) -> Path | None:
+        try:
+            candidates = [
+                path for path in cache_dir.glob(f"{chat_id}-*.jpg") if self._valid_avatar_file(path)
+            ]
+        except OSError:
+            return None
+        if not candidates:
+            return None
+        # There should normally be one file.  Choosing the newest makes the
+        # fallback deterministic if an interrupted previous download left
+        # multiple versions behind.
+        try:
+            return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+        except OSError:
+            return None
 
     async def _get_pooled_client(self, account: Account) -> Any:
         if self._client_pool is None:
@@ -565,6 +690,7 @@ class LoginFlowManager:
     async def _complete(self, flow: _LoginFlow, user: Any) -> None:
         phone = getattr(user, "phone", None)
         account = self.database.get_account(flow.account_name)
+        is_new_account = account is None
         if account is None:
             account = self.database.save_account(
                 Account(
@@ -585,6 +711,19 @@ class LoginFlowManager:
                 session.refresh(stored)
                 account = stored
         flow.account_id = account.id
+        if is_new_account and flow.client is not None:
+            try:
+                await self.pull_chats(account.id, client=flow.client)
+            except AdminAccountError as exc:
+                # Login has completed successfully; an unavailable Telegram
+                # dialog snapshot should not invalidate the new account.
+                logger.warning("账号首次同步聊天失败 account_id=%s code=%s", account.id, exc.code)
+            except Exception as exc:
+                logger.warning(
+                    "账号首次同步聊天发生未预期异常 account_id=%s type=%s",
+                    account.id,
+                    type(exc).__name__,
+                )
         flow.qr_url = None
         flow.qr_expires_at = None
         flow.qr_login = None

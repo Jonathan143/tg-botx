@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    BigInteger,
     DateTime,
     Integer,
     String,
@@ -76,6 +77,37 @@ class Account(Base):
     session_name: Mapped[str] = mapped_column(String(100), unique=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+
+
+class AccountChat(Base):
+    """A cached Telegram dialog belonging to an account.
+
+    Telegram dialogs are refreshed from the account client by the admin API.
+    Rows are retained when a dialog disappears from Telegram so a transient
+    sync or an administrator's old task configuration cannot lose metadata;
+    ``is_active`` controls whether the row is returned by the chat list API.
+    """
+
+    __tablename__ = "account_chats"
+    __table_args__ = (
+        UniqueConstraint("account_id", "chat_id", name="uq_account_chat_account_chat"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    account_id: Mapped[str] = mapped_column(String(36), index=True)
+    chat_id: Mapped[str] = mapped_column(String(64))
+    chat_type: Mapped[str] = mapped_column(String(20))
+    title: Mapped[str] = mapped_column(String(255))
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    has_avatar: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Telegram photo ids are stable for the lifetime of a photo and are used
+    # as the cache-file version.  Keep this nullable for databases created by
+    # older builds that only persisted ``has_avatar``.
+    avatar_photo_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
 
 
 class Task(Base):
@@ -193,7 +225,7 @@ class Database:
         Base.metadata.create_all(self.engine)
         # Keep the local development database usable after the destructive
         # version-model change.  New installations are created from metadata;
-        # existing SQLite tables receive only the new nullable columns.
+        # existing tables receive only the new nullable columns.
         task_run_columns = {item["name"] for item in inspect(self.engine).get_columns("task_runs")}
         missing = {
             "run_kind": "TEXT DEFAULT 'published'",
@@ -207,6 +239,18 @@ class Database:
             with self.engine.begin() as connection:
                 for name, ddl in additions.items():
                     connection.exec_driver_sql(f"ALTER TABLE task_runs ADD COLUMN {name} {ddl}")
+
+        # ``account_chats`` was introduced after the initial admin release.
+        # Add the nullable avatar version to an existing local database
+        # without requiring a destructive migration.
+        account_chat_columns = {
+            item["name"] for item in inspect(self.engine).get_columns("account_chats")
+        }
+        if "avatar_photo_id" not in account_chat_columns:
+            with self.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "ALTER TABLE account_chats ADD COLUMN avatar_photo_id BIGINT"
+                )
 
     def session(self) -> Session:
         return self.Session()
@@ -283,6 +327,144 @@ class Database:
             session.commit()
             session.refresh(account)
             return account
+
+    def list_account_chats(
+        self,
+        account_id: str,
+        *,
+        chat_type: str = "all",
+        query: str | None = None,
+        limit: int = 200,
+    ) -> list[AccountChat]:
+        """Return active cached chats with optional type/text filtering."""
+
+        limit = min(max(limit, 1), 500)
+        filters: list[Any] = [
+            AccountChat.account_id == account_id,
+            AccountChat.is_active.is_(True),
+        ]
+        if chat_type != "all":
+            filters.append(AccountChat.chat_type == chat_type)
+        if query and (term := query.strip()):
+            pattern = f"%{term}%"
+            filters.append(
+                or_(
+                    AccountChat.chat_id.ilike(pattern),
+                    AccountChat.title.ilike(pattern),
+                    AccountChat.username.ilike(pattern),
+                )
+            )
+        with self.session() as session:
+            statement = (
+                select(AccountChat)
+                .where(*filters)
+                .order_by(AccountChat.sort_order, AccountChat.title, AccountChat.chat_id)
+                .limit(limit)
+            )
+            return list(session.scalars(statement))
+
+    def get_account_chat(self, account_id: str, chat_id: str) -> AccountChat | None:
+        """Return one cached chat row, including inactive rows."""
+
+        with self.session() as session:
+            return session.scalar(
+                select(AccountChat).where(
+                    AccountChat.account_id == account_id,
+                    AccountChat.chat_id == chat_id,
+                )
+            )
+
+    def update_account_chat_avatar(
+        self, account_id: str, chat_id: str, photo_id: int | None
+    ) -> None:
+        """Persist the photo version observed while downloading an avatar."""
+
+        with self.session() as session:
+            row = session.scalar(
+                select(AccountChat).where(
+                    AccountChat.account_id == account_id,
+                    AccountChat.chat_id == chat_id,
+                )
+            )
+            if row is not None:
+                row.has_avatar = photo_id is not None
+                row.avatar_photo_id = photo_id
+                row.updated_at = utc_now()
+                session.commit()
+
+    def upsert_account_chats(
+        self,
+        account_id: str,
+        chats: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        """Incrementally persist a freshly pulled dialog snapshot.
+
+        Existing rows are updated only when metadata changed.  Dialogs absent
+        from the snapshot are marked inactive instead of being deleted, which
+        keeps old task references and metadata recoverable.
+        """
+
+        with self.session() as session:
+            existing_rows = list(
+                session.scalars(
+                    select(AccountChat).where(AccountChat.account_id == account_id)
+                )
+            )
+            existing = {row.chat_id: row for row in existing_rows}
+            seen: set[str] = set()
+            added = 0
+            updated = 0
+            for sort_order, payload in enumerate(chats):
+                chat_id = str(payload["chat_id"])
+                if chat_id in seen:
+                    continue
+                seen.add(chat_id)
+                values: dict[str, Any] = {
+                    "chat_type": str(payload["chat_type"]),
+                    "title": str(payload.get("title") or chat_id)[:255],
+                    "username": payload.get("username"),
+                    "has_avatar": bool(payload.get("has_avatar", False)),
+                    "sort_order": sort_order,
+                }
+                # Keep the version captured by a newer build when an older
+                # caller submits a payload that does not know this field yet.
+                if "avatar_photo_id" in payload:
+                    values["avatar_photo_id"] = payload.get("avatar_photo_id")
+                row = existing.get(chat_id)
+                if row is None:
+                    session.add(
+                        AccountChat(
+                            account_id=account_id,
+                            chat_id=chat_id,
+                            is_active=True,
+                            **values,
+                        )
+                    )
+                    added += 1
+                    continue
+                changed = any(getattr(row, key) != value for key, value in values.items())
+                if not row.is_active:
+                    changed = True
+                if changed:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+                    row.is_active = True
+                    row.updated_at = utc_now()
+                    updated += 1
+
+            removed = 0
+            for row in existing_rows:
+                if row.chat_id not in seen and row.is_active:
+                    row.is_active = False
+                    row.updated_at = utc_now()
+                    removed += 1
+            session.commit()
+            return {
+                "added": added,
+                "updated": updated,
+                "removed": removed,
+                "total": len(seen),
+            }
 
     def save_task(self, task: Task) -> Task:
         with self.session() as session:

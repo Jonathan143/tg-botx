@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
@@ -10,9 +12,15 @@ from tg_botx.features.checkin.matching import match_button, matches
 
 
 class CheckinError(RuntimeError):
-    def __init__(self, message: str, bot_response: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        bot_response: str | None = None,
+        bot_buttons: list[list[str]] | None = None,
+    ):
         super().__init__(message)
         self.bot_response = bot_response
+        self.bot_buttons = bot_buttons
 
 
 class CheckinExecutor:
@@ -21,11 +29,8 @@ class CheckinExecutor:
         client: TelegramClient,
         is_cancelled: Callable[[], bool] | None = None,
         on_attempt: Callable[[int], Awaitable[None]] | None = None,
-        on_step_status: Callable[
-            [int, Literal["running", "success", "failed"], str | None], Awaitable[None]
-        ]
-        | None = None,
-        on_step_response: Callable[[int, str], Awaitable[None]] | None = None,
+        on_step_status: Callable[..., Awaitable[None]] | None = None,
+        on_step_response: Callable[..., Awaitable[None]] | None = None,
     ):
         self.client = client
         self.is_cancelled = is_cancelled or (lambda: False)
@@ -42,13 +47,133 @@ class CheckinExecutor:
         index: int,
         status: Literal["running", "success", "failed"],
         error: str | None = None,
+        duration_ms: int | None = None,
     ) -> None:
-        if self.on_step_status is not None:
-            await self.on_step_status(index, status, error)
+        callback = self.on_step_status
+        if callback is None:
+            return
+        try:
+            parameters = inspect.signature(callback).parameters.values()
+            positional = [
+                parameter
+                for parameter in parameters
+                if parameter.kind
+                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            has_varargs = any(
+                parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            has_varargs = True
+            positional = []
+        if len(positional) >= 4 or (duration_ms is not None and has_varargs):
+            await callback(index, status, error, duration_ms)
+        else:
+            # Preserve compatibility with the original three-argument hook.
+            await callback(index, status, error)
 
-    async def report_step_response(self, index: int, response: str) -> None:
-        if self.on_step_response is not None:
-            await self.on_step_response(index, response)
+    async def report_step_response(
+        self,
+        index: int,
+        response: str,
+        buttons: list[list[str]] | None = None,
+    ) -> None:
+        callback = self.on_step_response
+        if callback is None:
+            return
+        try:
+            parameters = inspect.signature(callback).parameters.values()
+            positional = [
+                parameter
+                for parameter in parameters
+                if parameter.kind
+                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            has_varargs = any(
+                parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            # Some extension callables do not expose a signature.  The new
+            # callback form is the safest default for those callables.
+            has_varargs = True
+            positional = []
+        if len(positional) >= 3 or (buttons is not None and has_varargs):
+            await callback(index, response, buttons)
+        else:
+            # Keep compatibility with integrations using the original
+            # two-argument callback while allowing the runtime to consume the
+            # optional button rows.
+            await callback(index, response)
+
+    async def _hydrate_message(self, entity: Any, message: Any) -> Any:
+        """Reload a message so event updates carry a usable Telegram client."""
+
+        get_messages = getattr(self.client, "get_messages", None)
+        if not callable(get_messages):
+            return message
+        try:
+            refreshed = await get_messages(entity, ids=message.id)
+        except Exception:
+            return message
+        if isinstance(refreshed, (list, tuple)):
+            refreshed = refreshed[0] if refreshed else None
+        return refreshed or message
+
+    async def _message_buttons(
+        self,
+        message: Any,
+        entity: Any | None = None,
+    ) -> list[list[str]] | None:
+        """Return visible Telegram button labels while preserving rows."""
+
+        def read_buttons(value: Any) -> list[list[Any]]:
+            try:
+                buttons = getattr(value, "buttons", None) or []
+            except Exception:
+                buttons = []
+            if buttons:
+                return buttons
+            # ``Message.buttons`` needs a resolved client/input chat.  The
+            # raw reply markup still contains the visible labels, so use it
+            # as a rendering-only fallback when that context is unavailable.
+            try:
+                markup_rows = getattr(getattr(value, "reply_markup", None), "rows", None) or []
+                return [
+                    raw_row_buttons
+                    for raw_row in markup_rows
+                    if (raw_row_buttons := getattr(raw_row, "buttons", None))
+                ]
+            except Exception:
+                return []
+
+        buttons = read_buttons(message)
+        if not buttons and entity is not None:
+            refreshed = await self._hydrate_message(entity, message)
+            buttons = read_buttons(refreshed)
+        if not buttons:
+            get_buttons = getattr(message, "get_buttons", None)
+            if callable(get_buttons):
+                try:
+                    resolved = get_buttons()
+                    if inspect.isawaitable(resolved):
+                        resolved = await resolved
+                    buttons = read_buttons(message) or resolved or []
+                except Exception:
+                    # Button metadata is supplementary to the message text;
+                    # a failed refresh must not turn a successful wait into a
+                    # failed task.
+                    buttons = []
+
+        rows: list[list[str]] = []
+        for row in buttons:
+            labels = [
+                label
+                for label in (str(getattr(button, "text", "") or "") for button in row)
+                if label
+            ]
+            if labels:
+                rows.append(labels)
+        return rows or None
 
     async def execute(self, task: Any) -> str | None:
         entity = await self.client.get_entity(task.target)
@@ -56,6 +181,7 @@ class CheckinExecutor:
         baseline = await self._latest_message_id(entity)
         current_message = None
         bot_response: str | None = None
+        bot_buttons: list[list[str]] | None = None
         editable_message_ids: set[int] = set()
         editable_message_texts: dict[int, str] = {}
 
@@ -64,6 +190,11 @@ class CheckinExecutor:
                 raise asyncio.CancelledError
             kind = step["type"]
             await self.report_step_status(index, "running")
+            step_started_at = time.perf_counter()
+
+            def step_duration_ms() -> int:
+                return max(0, round((time.perf_counter() - step_started_at) * 1000))
+
             step_response_reported = False
             try:
                 if kind == "send_message":
@@ -81,8 +212,13 @@ class CheckinExecutor:
                         editable_message_ids=editable_message_ids,
                         editable_message_texts=editable_message_texts,
                     )
+                    current_message = await self._hydrate_message(entity, current_message)
                     bot_response = current_message.raw_text or ""
-                    await self.report_step_response(index, bot_response)
+                    bot_buttons = await self._message_buttons(current_message, entity)
+                    if bot_buttons is None:
+                        await self.report_step_response(index, bot_response)
+                    else:
+                        await self.report_step_response(index, bot_response, bot_buttons)
                     step_response_reported = True
                     baseline = max(baseline, current_message.id)
                     editable_message_ids.clear()
@@ -90,6 +226,12 @@ class CheckinExecutor:
                 elif kind == "click_button":
                     if current_message is None:
                         raise CheckinError("点击按钮步骤前没有可用的机器人消息")
+                    # A message received from an update can still carry an
+                    # incomplete Telegram client/input-chat context.  Reload
+                    # it immediately before matching/clicking so the click
+                    # request is sent through the active client rather than
+                    # being silently ignored by ``Message.click``.
+                    current_message = await self._hydrate_message(entity, current_message)
                     # ``Message.buttons`` can be empty when Telethon has not
                     # resolved the input chat/sender yet (notably for messages
                     # received through an update).  ``get_buttons`` performs
@@ -106,25 +248,50 @@ class CheckinExecutor:
                 else:
                     raise CheckinError(f"不支持的步骤类型：{kind}")
             except asyncio.CancelledError:
-                await self.report_step_status(index, "failed", "任务已取消")
+                await self.report_step_status(
+                    index,
+                    "failed",
+                    "任务已取消",
+                    duration_ms=step_duration_ms(),
+                )
                 raise
             except asyncio.TimeoutError as exc:
-                error = CheckinError(f"步骤 {index + 1} 等待超时", bot_response)
-                await self.report_step_status(index, "failed", str(error))
+                error = CheckinError(f"步骤 {index + 1} 等待超时", bot_response, bot_buttons)
+                await self.report_step_status(
+                    index,
+                    "failed",
+                    str(error),
+                    duration_ms=step_duration_ms(),
+                )
                 raise error from exc
             except CheckinError as exc:
                 if exc.bot_response is not None and not step_response_reported:
                     bot_response = exc.bot_response
-                    await self.report_step_response(index, bot_response)
+                    if exc.bot_buttons is None:
+                        await self.report_step_response(index, bot_response)
+                    else:
+                        await self.report_step_response(index, bot_response, exc.bot_buttons)
                 if exc.bot_response is None:
                     exc.bot_response = bot_response
-                await self.report_step_status(index, "failed", str(exc))
+                await self.report_step_status(
+                    index,
+                    "failed",
+                    str(exc),
+                    duration_ms=step_duration_ms(),
+                )
                 raise
             except Exception as exc:
-                error = CheckinError(f"步骤 {index + 1} 执行失败：{exc}", bot_response)
-                await self.report_step_status(index, "failed", str(error))
+                error = CheckinError(
+                    f"步骤 {index + 1} 执行失败：{exc}", bot_response, bot_buttons
+                )
+                await self.report_step_status(
+                    index,
+                    "failed",
+                    str(error),
+                    duration_ms=step_duration_ms(),
+                )
                 raise error from exc
-            await self.report_step_status(index, "success")
+            await self.report_step_status(index, "success", duration_ms=step_duration_ms())
         return bot_response
 
     async def _latest_message_id(self, entity: Any) -> int:
@@ -169,7 +336,8 @@ class CheckinExecutor:
                     return
             text = message.raw_text or ""
             if matches(text, step.get("failure")):
-                future.set_exception(CheckinError("机器人返回失败消息", text))
+                buttons = await self._message_buttons(message, entity)
+                future.set_exception(CheckinError("机器人返回失败消息", text, buttons))
                 return
             success_rule = step.get("success")
             if success_rule is None or matches(text, success_rule):
@@ -198,6 +366,11 @@ class CheckinExecutor:
             self.client.remove_event_handler(handler, events.MessageEdited(chats=entity))
 
     async def _click(self, message: Any, button: Any, selector: dict[str, Any]) -> None:
+        # Telethon's ``Message.click`` returns ``None`` without raising when
+        # the message is not attached to a client.  Treat that state as an
+        # actionable error so a workflow cannot report a false success.
+        if hasattr(message, "_client") and getattr(message, "_client", None) is None:
+            raise CheckinError("Telegram 消息未完成加载，无法点击按钮")
         if selector.get("callback_data") is not None:
             value = selector["callback_data"]
             await message.click(data=value.encode() if isinstance(value, str) else value)
@@ -205,10 +378,9 @@ class CheckinExecutor:
         if selector.get("row") is not None and selector.get("column") is not None:
             await message.click(selector["row"], selector["column"])
             return
-        click = getattr(button, "click", None)
-        if callable(click):
-            await click()
-            return
+        # Resolve the action from the refreshed message instead of invoking a
+        # button object retained from an event update.  The latter may not
+        # carry the input chat/client and can silently do nothing.
         await message.click(text=getattr(button, "text", ""))
 
 

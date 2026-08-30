@@ -145,6 +145,18 @@ def _iso(value: datetime | str | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat() if value else None
 
 
+def _redact_step_buttons(step: dict[str, Any]) -> None:
+    buttons = step.get("botButtons")
+    if not isinstance(buttons, list):
+        return
+    for row in buttons:
+        if not isinstance(row, list):
+            continue
+        for index, label in enumerate(row):
+            if isinstance(label, str):
+                row[index] = redact_sensitive(label)
+
+
 def _task_json(task: Task, database: Database, service: CheckinService) -> dict[str, Any]:
     account = database.get_account_by_id(task.account_id)
     run = service.get_task_run_progress(task.id)
@@ -156,6 +168,7 @@ def _task_json(task: Task, database: Database, service: CheckinService) -> dict[
                 step["error"] = redact_sensitive(step["error"])
             if isinstance(step.get("botResponse"), str):
                 step["botResponse"] = redact_sensitive(step["botResponse"])
+            _redact_step_buttons(step)
         for log in run.get("logs", []):
             if isinstance(log.get("message"), str):
                 log["message"] = redact_sensitive(log["message"])
@@ -221,6 +234,7 @@ def _run_json(
                 step["error"] = redact_sensitive(step["error"])
             if isinstance(step.get("botResponse"), str):
                 step["botResponse"] = redact_sensitive(step["botResponse"])
+            _redact_step_buttons(step)
         for log in progress.get("logs", []):
             if isinstance(log.get("message"), str):
                 log["message"] = redact_sensitive(log["message"])
@@ -1106,6 +1120,18 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 for item in items
             ],
             "total": len(items),
+        }
+
+    @app.post("/api/accounts/{account_id}/chats/pull")
+    async def pull_account_chats(account_id: str, _: EmptyBody) -> dict[str, Any]:
+        result = await accounts.pull_chats(account_id)
+        return {
+            "accountId": result.account_id,
+            "added": result.added,
+            "updated": result.updated,
+            "removed": result.removed,
+            "total": result.total,
+            "syncedAt": _iso(result.synced_at),
         }
 
     @app.get("/api/accounts/{account_id}/chats/avatar")

@@ -432,6 +432,8 @@ class CheckinService:
             step["status"] = "pending"
             step.pop("error", None)
             step.pop("botResponse", None)
+            step.pop("botButtons", None)
+            step.pop("durationMs", None)
         self._append_run_log(task_id, run_id, f"开始第 {attempt} 次尝试")
         self._persist_run_progress(task_id, run_id)
         self._publish_task_updated(task_id)
@@ -444,6 +446,8 @@ class CheckinService:
         status: str,
         error: str | None = None,
         bot_response: str | None = None,
+        bot_buttons: list[list[str]] | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         progress = self._task_run_progress.get(task_id)
         if progress is None or progress["id"] != run_id:
@@ -459,6 +463,10 @@ class CheckinService:
             step["error"] = error
         if bot_response is not None:
             step["botResponse"] = bot_response
+        if bot_buttons is not None:
+            step["botButtons"] = bot_buttons
+        if duration_ms is not None:
+            step["durationMs"] = duration_ms
         labels = {"running": "开始执行", "success": "执行成功", "failed": "执行失败"}
         self._append_run_log(
             task_id,
@@ -907,13 +915,32 @@ class CheckinService:
                     self._begin_run_attempt(task.id, run.id, attempt)
 
                 async def on_step_status(
-                    index: int, status: str, error: str | None
+                    index: int,
+                    status: str,
+                    error: str | None,
+                    duration_ms: int | None = None,
                 ) -> None:
-                    self._update_run_step(task.id, run.id, index, status, error)
-
-                async def on_step_response(index: int, response: str) -> None:
                     self._update_run_step(
-                        task.id, run.id, index, "running", bot_response=response
+                        task.id,
+                        run.id,
+                        index,
+                        status,
+                        error,
+                        duration_ms=duration_ms,
+                    )
+
+                async def on_step_response(
+                    index: int,
+                    response: str,
+                    buttons: list[list[str]] | None = None,
+                ) -> None:
+                    self._update_run_step(
+                        task.id,
+                        run.id,
+                        index,
+                        "running",
+                        bot_response=response,
+                        bot_buttons=buttons,
                     )
 
                 success, error, attempts, bot_response = await run_with_retries(

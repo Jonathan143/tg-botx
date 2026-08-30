@@ -99,7 +99,8 @@ Task JSON 的 `run` 为当前或本进程内最近一次运行进度；从未运
 ```
 
 步骤 `status` 取值为 `pending`、`running`、`success`、`failed` 或 `skipped`，失败步骤
-可带 `error`；`wait_message` 步骤收到消息后会在步骤状态中带上脱敏后的 `botResponse`；运行级 `run.status` 取值为 `running`、`success`、`failed`、`canceled`
+可带 `error` 和节点耗时 `durationMs`；`wait_message` 步骤收到消息后会在步骤状态中带上脱敏后的 `botResponse`，以及按 Telegram 原始行排列的
+`botButtons`（仅包含按钮显示文字）；运行级 `run.status` 取值为 `running`、`success`、`failed`、`canceled`
 或 `skipped`，失败或取消时可带 `error`。`attempt=0` 表示运行已预留、执行器尚未开始；
 重试开始时 `attempt` 增加，步骤状态按新 attempt 重置。运行结束的最后一次事件保留最终
 步骤状态。服务每 15 秒发送一次 `: keepalive`
