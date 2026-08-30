@@ -21,7 +21,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import OperationalError
 
@@ -1075,6 +1075,52 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     async def list_accounts() -> dict[str, Any]:
         items = accounts.list_accounts()
         return {"items": [_account_json(item, database) for item in items], "total": len(items)}
+
+    @app.get("/api/accounts/{account_id}/chats")
+    async def list_account_chats(
+        account_id: str,
+        chat_type: str = Query("all", alias="type"),
+        query: str | None = Query(None, max_length=100),
+        limit: int = Query(200, ge=1, le=500),
+    ) -> dict[str, Any]:
+        items = await accounts.list_chats(
+            account_id,
+            chat_type=chat_type,  # type: ignore[arg-type]
+            query=query,
+            limit=limit,
+        )
+        return {
+            "items": [
+                {
+                    "id": item.chat_id,
+                    "type": item.chat_type,
+                    "title": item.title,
+                    "username": item.username,
+                    "hasAvatar": item.has_avatar,
+                    "avatarUrl": (
+                        f"/api/accounts/{account_id}/chats/avatar?chatId={item.chat_id}"
+                        if item.has_avatar
+                        else None
+                    ),
+                }
+                for item in items
+            ],
+            "total": len(items),
+        }
+
+    @app.get("/api/accounts/{account_id}/chats/avatar")
+    async def account_chat_avatar(
+        account_id: str,
+        chat_id: str = Query(..., alias="chatId", min_length=1, max_length=40),
+    ) -> Response:
+        path = await accounts.download_chat_avatar(account_id, chat_id)
+        if path is None:
+            return Response(status_code=404)
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "private, max-age=300"},
+        )
 
     @app.post("/api/accounts/login-flows", status_code=201)
     async def start_login(body: LoginStartBody) -> dict[str, Any]:

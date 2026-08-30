@@ -6,6 +6,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Literal
 
 from sqlalchemy import select
@@ -20,6 +21,7 @@ from telethon.errors import (
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
 )
+from telethon.tl.types import Channel, Chat, User
 
 from tg_botx.config import Settings
 from tg_botx.infrastructure.persistence.db import Account, Database, utc_now
@@ -78,6 +80,15 @@ class AccountView:
     created_at: datetime
     task_count: int
     enabled_task_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ChatView:
+    chat_id: str
+    chat_type: Literal["bot", "group", "private"]
+    title: str
+    username: str | None
+    has_avatar: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +336,132 @@ class LoginFlowManager:
             )
             for account in accounts
         ]
+
+    async def list_chats(
+        self,
+        account_id_or_name: str,
+        *,
+        chat_type: Literal["all", "bot", "group", "private"] = "all",
+        query: str | None = None,
+        limit: int = 200,
+    ) -> list[ChatView]:
+        account = self._find_account(account_id_or_name)
+        if account is None:
+            raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
+        if not account.is_active:
+            raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
+        if chat_type not in {"all", "bot", "group", "private"}:
+            raise AdminAccountError("CHAT_TYPE_INVALID", "聊天类型无效")
+        client = await self._get_pooled_client(account)
+        normalized_query = (query or "").strip().casefold()
+        result: list[ChatView] = []
+        try:
+            async for dialog in client.iter_dialogs(limit=limit):
+                entity = dialog.entity
+                kind = self._chat_type(entity)
+                if kind is None or (chat_type != "all" and kind != chat_type):
+                    continue
+                username = getattr(entity, "username", None)
+                username_value = f"@{username}" if username else None
+                title = self._chat_title(entity, dialog)
+                haystack = f"{title} {username_value or ''} {entity.id}".casefold()
+                if normalized_query and normalized_query not in haystack:
+                    continue
+                result.append(
+                    ChatView(
+                        chat_id=str(entity.id),
+                        chat_type=kind,
+                        title=title,
+                        username=username_value,
+                        has_avatar=self._chat_photo_id(entity) is not None,
+                    )
+                )
+                if len(result) >= limit:
+                    break
+        except Exception:
+            raise AdminAccountError("CHAT_LIST_FAILED", "无法加载账号对话") from None
+        return result
+
+    async def download_chat_avatar(self, account_id_or_name: str, chat_id: str) -> Path | None:
+        account = self._find_account(account_id_or_name)
+        if account is None:
+            raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
+        if not account.is_active:
+            raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
+        if not re.fullmatch(r"-?\d+", chat_id):
+            raise AdminAccountError("CHAT_ID_INVALID", "聊天 ID 无效")
+        client = await self._get_pooled_client(account)
+        try:
+            entity = await client.get_entity(int(chat_id))
+            photo_id = self._chat_photo_id(entity)
+            if photo_id is None:
+                return None
+            cache_dir = self.settings.data_dir / "cache" / "avatars" / account.id
+            cache_path = cache_dir / f"{chat_id}-{photo_id}.jpg"
+            try:
+                if cache_path.is_file() and cache_path.stat().st_size > 0:
+                    return cache_path
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                temporary_path = cache_dir / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
+                try:
+                    downloaded = await client.download_profile_photo(
+                        entity, file=str(temporary_path)
+                    )
+                    if downloaded is None or not temporary_path.is_file():
+                        return None
+                    if temporary_path.stat().st_size <= 0:
+                        return None
+                    temporary_path.replace(cache_path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+                # Keep only the current photo for this chat.  Old versions are
+                # never needed after the photo id has changed.
+                for stale_path in cache_dir.glob(f"{chat_id}-*.jpg"):
+                    if stale_path != cache_path:
+                        stale_path.unlink(missing_ok=True)
+                return cache_path
+            except OSError:
+                raise AdminAccountError("CHAT_AVATAR_FAILED", "无法保存聊天头像") from None
+        except AdminAccountError:
+            raise
+        except Exception:
+            raise AdminAccountError("CHAT_AVATAR_FAILED", "无法加载聊天头像") from None
+
+    async def _get_pooled_client(self, account: Account) -> Any:
+        if self._client_pool is None:
+            raise AdminAccountError("TELEGRAM_UNAVAILABLE", "Telegram 服务暂不可用")
+        try:
+            return await self._client_pool.get(account)
+        except Exception:
+            raise AdminAccountError("TELEGRAM_UNAVAILABLE", "无法连接 Telegram 账号") from None
+
+    @staticmethod
+    def _chat_type(entity: Any) -> Literal["bot", "group", "private"] | None:
+        if isinstance(entity, User):
+            return "bot" if bool(getattr(entity, "bot", False)) else "private"
+        if isinstance(entity, (Chat, Channel)):
+            return "group"
+        return None
+
+    @staticmethod
+    def _chat_photo_id(entity: Any) -> int | None:
+        photo = getattr(entity, "photo", None)
+        photo_id = getattr(photo, "photo_id", None)
+        return photo_id if isinstance(photo_id, int) else None
+
+    @staticmethod
+    def _chat_title(entity: Any, dialog: Any) -> str:
+        if isinstance(entity, User):
+            name = " ".join(
+                value
+                for value in (
+                    getattr(entity, "first_name", None),
+                    getattr(entity, "last_name", None),
+                )
+                if value
+            ).strip()
+            return name or getattr(entity, "username", None) or str(entity.id)
+        return getattr(dialog, "title", None) or getattr(entity, "title", None) or str(entity.id)
 
     def logout_impact(self, account_id_or_name: str) -> LogoutImpact:
         account = self._find_account(account_id_or_name)
