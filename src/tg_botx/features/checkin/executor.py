@@ -378,6 +378,15 @@ class CheckinExecutor:
         if selector.get("row") is not None and selector.get("column") is not None:
             await message.click(selector["row"], selector["column"])
             return
+        # A text match identifies a concrete button object, but resolving it
+        # again through ``Message.click(text=...)`` can lose the opaque
+        # callback payload (especially when labels contain emoji or invisible
+        # formatting).  Send the payload from the matched button directly so
+        # Telegram receives exactly the callback data that was inspected.
+        button_data = getattr(button, "data", None)
+        if button_data is not None:
+            await message.click(data=button_data)
+            return
         # Resolve the action from the refreshed message instead of invoking a
         # button object retained from an event update.  The latter may not
         # carry the input chat/client and can silently do nothing.

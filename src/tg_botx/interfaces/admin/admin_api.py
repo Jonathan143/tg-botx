@@ -134,6 +134,13 @@ class EmptyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class MessageProbeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target: str = Field(min_length=1, max_length=200)
+    text: str = Field(min_length=1, max_length=4096)
+    timeout_seconds: int = Field(default=30, alias="timeoutSeconds", ge=1, le=120)
+
+
 class PublishBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     release_note: str | None = Field(default=None, alias="releaseNote", max_length=500)
@@ -1132,6 +1139,23 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             "removed": result.removed,
             "total": result.total,
             "syncedAt": _iso(result.synced_at),
+        }
+
+    @app.post("/api/accounts/{account_id}/messages/probe")
+    async def probe_account_message(
+        account_id: str,
+        body: MessageProbeBody,
+    ) -> dict[str, Any]:
+        result = await accounts.probe_message(
+            account_id,
+            body.target,
+            body.text,
+            timeout_seconds=body.timeout_seconds,
+        )
+        return {
+            "messageId": result.message_id,
+            "text": result.text,
+            "buttons": list(result.buttons),
         }
 
     @app.get("/api/accounts/{account_id}/chats/avatar")
