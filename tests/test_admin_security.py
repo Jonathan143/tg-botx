@@ -32,9 +32,7 @@ class FakeClock:
 
 
 def encrypt(challenge: dict[str, str], payload: dict[str, object]) -> str:
-    public_key = serialization.load_pem_public_key(
-        challenge["publicKey"].encode("ascii")
-    )
+    public_key = serialization.load_pem_public_key(challenge["publicKey"].encode("ascii"))
     ciphertext = public_key.encrypt(
         json.dumps(payload, separators=(",", ":")).encode(),
         padding.OAEP(
@@ -59,9 +57,7 @@ def auth_ciphertext(
             "value": key,
             "nonce": challenge["nonce"],
             "timestamp": (
-                datetime.fromtimestamp(clock(), tz=UTC)
-                .isoformat()
-                .replace("+00:00", "Z")
+                datetime.fromtimestamp(clock(), tz=UTC).isoformat().replace("+00:00", "Z")
                 if timestamp is None
                 else str(timestamp)
             ),
@@ -109,9 +105,7 @@ def test_wrong_key_stale_timestamp_and_wrong_purpose_are_uniform_failures() -> N
         "AUTH_FAILED",
         lambda: manager.verify_admin_payload(
             challenge["keyId"],
-            auth_ciphertext(
-                challenge, clock, key="Pm8nQw3xZa6vFd1rTy9kLc4jHg7sBe2uIo5pXs0A"
-            ),
+            auth_ciphertext(challenge, clock, key="Pm8nQw3xZa6vFd1rTy9kLc4jHg7sBe2uIo5pXs0A"),
             ADMIN_KEY,
         ),
     )
@@ -133,22 +127,16 @@ def test_wrong_key_stale_timestamp_and_wrong_purpose_are_uniform_failures() -> N
     )
     assert_security_error(
         "AUTH_FAILED",
-        lambda: manager.decrypt_payload(
-            challenge["keyId"], ciphertext, "telegram_code"
-        ),
+        lambda: manager.decrypt_payload(challenge["keyId"], ciphertext, "telegram_code"),
     )
     # Purpose mismatches consume the nonce instead of allowing an oracle retry.
     assert_security_error(
         "AUTH_FAILED",
-        lambda: manager.decrypt_payload(
-            challenge["keyId"], ciphertext, "telegram_phone"
-        ),
+        lambda: manager.decrypt_payload(challenge["keyId"], ciphertext, "telegram_phone"),
     )
 
 
-def test_admin_payload_rejects_field_aliases_extra_fields_and_non_string_timestamp() -> (
-    None
-):
+def test_admin_payload_rejects_field_aliases_extra_fields_and_non_string_timestamp() -> None:
     clock = FakeClock()
     manager = TransportKeyManager(clock=clock)
     invalid_payloads = [
@@ -163,8 +151,8 @@ def test_admin_payload_rejects_field_aliases_extra_fields_and_non_string_timesta
         ciphertext = encrypt(challenge, payload)
         assert_security_error(
             "AUTH_FAILED",
-            lambda challenge=challenge, ciphertext=ciphertext: (
-                manager.verify_admin_payload(challenge["keyId"], ciphertext, ADMIN_KEY)
+            lambda challenge=challenge, ciphertext=ciphertext: manager.verify_admin_payload(
+                challenge["keyId"], ciphertext, ADMIN_KEY
             ),
         )
 
@@ -220,9 +208,7 @@ def test_rotation_retains_old_private_key_only_for_grace_period() -> None:
     clock.advance(6)
     assert_security_error(
         "AUTH_FAILED",
-        lambda: manager.verify_admin_payload(
-            second_old["keyId"], second_ciphertext, ADMIN_KEY
-        ),
+        lambda: manager.verify_admin_payload(second_old["keyId"], second_ciphertext, ADMIN_KEY),
     )
 
 
@@ -264,12 +250,8 @@ def test_sessions_do_not_survive_a_restart_or_admin_key_change() -> None:
     credentials = first.create()
     restarted = SessionManager(ADMIN_KEY)
     changed = SessionManager("Nm2vYq7tKx4sGa9pWc1jLf8uRh5eZd3bIo6nHs0Q")
-    assert_security_error(
-        "SESSION_INVALID", lambda: restarted.authenticate(credentials.token)
-    )
-    assert_security_error(
-        "SESSION_INVALID", lambda: changed.authenticate(credentials.token)
-    )
+    assert_security_error("SESSION_INVALID", lambda: restarted.authenticate(credentials.token))
+    assert_security_error("SESSION_INVALID", lambda: changed.authenticate(credentials.token))
 
 
 def test_failure_rate_limiter_allows_five_failures_per_window() -> None:
@@ -298,10 +280,7 @@ def test_success_clears_failure_bucket() -> None:
 
 
 def test_forwarded_for_is_used_only_for_explicitly_trusted_proxies() -> None:
-    assert (
-        resolve_client_ip("198.51.100.9", "203.0.113.7", ["10.0.0.0/8"])
-        == "198.51.100.9"
-    )
+    assert resolve_client_ip("198.51.100.9", "203.0.113.7", ["10.0.0.0/8"]) == "198.51.100.9"
     assert resolve_client_ip("10.0.0.3", "203.0.113.7", ["10.0.0.0/8"]) == "203.0.113.7"
     assert (
         resolve_client_ip(

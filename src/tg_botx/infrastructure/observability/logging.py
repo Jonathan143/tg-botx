@@ -39,8 +39,10 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         r"\1\2[REDACTED]",
     ),
-    (re.compile(r"https://api\.telegram\.org/bot[^/\s]+", re.IGNORECASE),
-     "https://api.telegram.org/bot[REDACTED]"),
+    (
+        re.compile(r"https://api\.telegram\.org/bot[^/\s]+", re.IGNORECASE),
+        "https://api.telegram.org/bot[REDACTED]",
+    ),
     (re.compile(r"(?i)(postgres(?:ql)?(?:\+\w+)?://[^:\s/]+:)([^@\s]+)(@)"), r"\1[REDACTED]\3"),
     (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b"), "[REDACTED_TOKEN]"),
     # Do not treat the date portion of an ISO-style log timestamp as a phone

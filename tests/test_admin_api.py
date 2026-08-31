@@ -146,9 +146,7 @@ def test_mutation_requires_json_and_transport_key_can_rotate(tmp_path):
         verified = authenticate(client).json()
         headers = {"Origin": ORIGIN, "X-CSRF-Token": verified["csrfToken"]}
 
-        not_json = client.post(
-            "/api/settings/transport-key/rotate", headers=headers, content=b""
-        )
+        not_json = client.post("/api/settings/transport-key/rotate", headers=headers, content=b"")
         assert not_json.status_code == 415
         assert not_json.json()["error"]["code"] == "JSON_REQUIRED"
 
@@ -301,9 +299,7 @@ def test_task_json_uses_snake_case_for_create_detail_and_edit(tmp_path):
         assert edited.json()["definition"]["retry"]["max_attempts"] == 4
 
 
-def test_task_events_require_session_and_send_full_initial_snapshot(
-    tmp_path, monkeypatch
-):
+def test_task_events_require_session_and_send_full_initial_snapshot(tmp_path, monkeypatch):
     app = app_for(tmp_path)
     with TestClient(app, base_url=ORIGIN) as client:
         unauthorized = client.get("/api/tasks/missing/events")
@@ -333,7 +329,9 @@ def test_task_events_require_session_and_send_full_initial_snapshot(
             return next(disconnect_checks)
 
         monkeypatch.setattr(Request, "is_disconnected", disconnected)
-        monkeypatch.setattr("tg_botx.interfaces.admin.admin_api.TASK_EVENT_KEEPALIVE_SECONDS", 0.001)
+        monkeypatch.setattr(
+            "tg_botx.interfaces.admin.admin_api.TASK_EVENT_KEEPALIVE_SECONDS", 0.001
+        )
         response = client.get(f"/api/tasks/{task_id}/events")
 
         assert response.status_code == 200
@@ -349,9 +347,7 @@ def test_task_events_require_session_and_send_full_initial_snapshot(
         assert app.state.checkin_service._task_subscribers == {}
 
 
-def test_manual_run_returns_running_task_with_initialized_step_statuses(
-    tmp_path, monkeypatch
-):
+def test_manual_run_returns_running_task_with_initialized_step_statuses(tmp_path, monkeypatch):
     app = app_for(tmp_path)
 
     async def blocked_run(executor, task):
@@ -513,13 +509,16 @@ def test_dashboard_returns_trends_health_upcoming_tasks_and_account_status(tmp_p
         dashboard = client.get("/api/dashboard?range=24h")
         assert dashboard.status_code == 200
         body = dashboard.json()
-        assert body["stats"].items() >= {
-            "totalTasks": 1,
-            "enabledTasks": 1,
-            "runningTasks": 0,
-            "failedRuns": 1,
-            "successRate": 66.7,
-        }.items()
+        assert (
+            body["stats"].items()
+            >= {
+                "totalTasks": 1,
+                "enabledTasks": 1,
+                "runningTasks": 0,
+                "failedRuns": 1,
+                "successRate": 66.7,
+            }.items()
+        )
         assert len(body["statusBreakdown"]) == 24
         assert sum(item["success"] for item in body["statusBreakdown"]) == 2
         assert sum(item["failed"] for item in body["statusBreakdown"]) == 1

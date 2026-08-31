@@ -34,9 +34,7 @@ def _button_text(value: Any) -> str:
 
     text = unicodedata.normalize("NFKC", str(value or ""))
     text = "".join(
-        char
-        for char in text
-        if unicodedata.category(char) != "Cf" and not char.isspace()
+        char for char in text if unicodedata.category(char) != "Cf" and not char.isspace()
     )
     return text.casefold()
 
@@ -87,15 +85,23 @@ def match_button(message: Any, selector: dict[str, Any]) -> Any:
         if wanted_text_contains is not None:
             needle = _button_text(wanted_text_contains)
             candidates = [
-                button for button in candidates if needle in _button_text(getattr(button, "text", ""))
+                button
+                for button in candidates
+                if needle in _button_text(getattr(button, "text", ""))
             ]
         elif wanted_text is not None:
             # Preserve exact matching when possible, then allow a unique
             # substring match such as "每日签到" -> "✅每日签到".
             needle = _button_text(wanted_text)
-            exact = [button for button in candidates if _button_text(getattr(button, "text", "")) == needle]
+            exact = [
+                button
+                for button in candidates
+                if _button_text(getattr(button, "text", "")) == needle
+            ]
             candidates = exact or [
-                button for button in candidates if needle in _button_text(getattr(button, "text", ""))
+                button
+                for button in candidates
+                if needle in _button_text(getattr(button, "text", ""))
             ]
 
     if len(candidates) != 1:

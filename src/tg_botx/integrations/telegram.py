@@ -34,19 +34,20 @@ class TelegramSQLiteSession(SQLiteSession):
     """
 
     _BUSY_TIMEOUT_SECONDS = 30.0
+    _conn: sqlite3.Connection | None
 
     def _cursor(self):
-        if self._conn is None:
-            self._conn = sqlite3.connect(
+        conn = self._conn
+        if conn is None:
+            conn = sqlite3.connect(
                 self.filename,
                 timeout=self._BUSY_TIMEOUT_SECONDS,
                 check_same_thread=False,
             )
-            self._conn.execute(
-                f"PRAGMA busy_timeout={int(self._BUSY_TIMEOUT_SECONDS * 1000)}"
-            )
-            self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
-        return self._conn.cursor()
+            self._conn = conn
+            conn.execute(f"PRAGMA busy_timeout={int(self._BUSY_TIMEOUT_SECONDS * 1000)}")
+            conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        return conn.cursor()
 
 
 def create_telethon_client(config: TelegramAccountConfig) -> TelegramClient:

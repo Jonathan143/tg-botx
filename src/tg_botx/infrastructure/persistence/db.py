@@ -135,13 +135,15 @@ class Task(Base):
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
 
     @property
-    def config(self) -> dict:
+    def config(self) -> dict[str, Any]:
         return json.loads(self.config_json)
 
 
 class WorkflowVersion(Base):
     __tablename__ = "workflow_versions"
-    __table_args__ = (UniqueConstraint("task_id", "version_number", name="uq_workflow_version_task_number"),)
+    __table_args__ = (
+        UniqueConstraint("task_id", "version_number", name="uq_workflow_version_task_number"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     task_id: Mapped[str] = mapped_column(String(36), index=True)
@@ -206,7 +208,7 @@ class Database:
             url = "postgresql+psycopg://" + url[len("postgresql://") :]
 
         database_url = make_url(url)
-        engine_kwargs = {}
+        engine_kwargs: dict[str, Any] = {}
         if database_url.get_backend_name() == "sqlite":
             engine_kwargs["connect_args"] = {"check_same_thread": False}
         elif database_url.get_backend_name() == "postgresql":
@@ -274,7 +276,9 @@ class Database:
             task = session.get(Task, task_id_or_name)
             if task:
                 return task
-            return session.scalar(select(Task).where(Task.name == task_id_or_name, Task.archived.is_(False)))
+            return session.scalar(
+                select(Task).where(Task.name == task_id_or_name, Task.archived.is_(False))
+            )
 
     def get_task_any(self, task_id_or_name: str) -> Task | None:
         """Return a task by ID or name, including archived tasks."""
@@ -408,9 +412,7 @@ class Database:
 
         with self.session() as session:
             existing_rows = list(
-                session.scalars(
-                    select(AccountChat).where(AccountChat.account_id == account_id)
-                )
+                session.scalars(select(AccountChat).where(AccountChat.account_id == account_id))
             )
             existing = {row.chat_id: row for row in existing_rows}
             seen: set[str] = set()
@@ -605,7 +607,12 @@ class Database:
 
     def task_history(self, task_id: str, limit: int = 20) -> list[TaskRun]:
         with self.session() as session:
-            query = select(TaskRun).where(TaskRun.task_id == task_id).order_by(TaskRun.started_at.desc()).limit(limit)
+            query = (
+                select(TaskRun)
+                .where(TaskRun.task_id == task_id)
+                .order_by(TaskRun.started_at.desc())
+                .limit(limit)
+            )
             return list(session.scalars(query))
 
     def list_runs(

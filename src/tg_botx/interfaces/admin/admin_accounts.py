@@ -276,7 +276,9 @@ class LoginFlowManager:
             except PhoneNumberInvalidError:
                 raise AdminAccountError("PHONE_INVALID", "手机号无效") from None
             except FloodWaitError:
-                raise AdminAccountError("TELEGRAM_RATE_LIMITED", "请求过于频繁，请稍后重试") from None
+                raise AdminAccountError(
+                    "TELEGRAM_RATE_LIMITED", "请求过于频繁，请稍后重试"
+                ) from None
             except AdminAccountError:
                 raise
             except Exception:
@@ -307,7 +309,9 @@ class LoginFlowManager:
                 flow.updated_at = utc_now()
                 raise AdminAccountError("PHONE_CODE_EXPIRED", "验证码已过期，请重新获取") from None
             except FloodWaitError:
-                raise AdminAccountError("TELEGRAM_RATE_LIMITED", "请求过于频繁，请稍后重试") from None
+                raise AdminAccountError(
+                    "TELEGRAM_RATE_LIMITED", "请求过于频繁，请稍后重试"
+                ) from None
             except Exception:
                 raise AdminAccountError("PHONE_CODE_VERIFY_FAILED", "验证码校验失败") from None
             finally:
@@ -324,7 +328,9 @@ class LoginFlowManager:
             except PasswordHashInvalidError:
                 raise AdminAccountError("TWO_FACTOR_INVALID", "二次验证密码无效") from None
             except FloodWaitError:
-                raise AdminAccountError("TELEGRAM_RATE_LIMITED", "请求过于频繁，请稍后重试") from None
+                raise AdminAccountError(
+                    "TELEGRAM_RATE_LIMITED", "请求过于频繁，请稍后重试"
+                ) from None
             except Exception:
                 raise AdminAccountError("TWO_FACTOR_VERIFY_FAILED", "二次验证失败") from None
             finally:
@@ -358,7 +364,9 @@ class LoginFlowManager:
 
     def list_accounts(self) -> list[AccountView]:
         with self.database.session() as session:
-            accounts = list(session.scalars(select(Account).order_by(Account.created_at, Account.name)))
+            accounts = list(
+                session.scalars(select(Account).order_by(Account.created_at, Account.name))
+            )
         tasks = self.database.list_tasks(include_archived=True)
         return [
             self._account_view(
@@ -608,7 +616,11 @@ class LoginFlowManager:
                     return
                 target_id = getattr(entity, "id", None)
                 sender_id = getattr(message, "sender_id", None)
-                if target_id is not None and getattr(entity, "bot", False) and sender_id != target_id:
+                if (
+                    target_id is not None
+                    and getattr(entity, "bot", False)
+                    and sender_id != target_id
+                ):
                     return
                 future.set_result(message)
 

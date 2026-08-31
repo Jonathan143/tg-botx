@@ -247,7 +247,9 @@ def task_history(task_id: str):
     if not task:
         raise typer.BadParameter("任务不存在")
     for run in database.task_history(task.id):
-        typer.echo(f"{run.id}  {run.status}  attempts={run.attempts}  {run.started_at}  {run.error or ''}")
+        typer.echo(
+            f"{run.id}  {run.status}  attempts={run.attempts}  {run.started_at}  {run.error or ''}"
+        )
 
 
 @task_app.command("export")

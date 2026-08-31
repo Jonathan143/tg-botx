@@ -217,9 +217,7 @@ def test_logout_reports_tasks_and_refuses_enabled_task(manager_parts):
             )
         )
         logout_client = FakeTelegramClient(authorized=True)
-        manager = LoginFlowManager(
-            settings, database, client_factory=ClientFactory(logout_client)
-        )
+        manager = LoginFlowManager(settings, database, client_factory=ClientFactory(logout_client))
 
         impact = manager.logout_impact(account.id)
         assert impact.enabled_task_ids == (task.id,)

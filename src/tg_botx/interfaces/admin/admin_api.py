@@ -157,9 +157,10 @@ class PublishBody(BaseModel):
 def _iso(value: datetime | str | None) -> str | None:
     if isinstance(value, str):
         try:
-            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return value
+        return utc_isoformat(parsed)
     return utc_isoformat(value)
 
 
@@ -365,7 +366,7 @@ def _dashboard_trend(
         )
         label = lambda value: value.date().isoformat()
 
-    buckets = [
+    buckets: list[dict[str, Any]] = [
         {"label": label(first_bucket + index * bucket_width), "success": 0, "failed": 0}
         for index in range(bucket_count)
     ]
@@ -449,8 +450,13 @@ def _read_log_entries(settings: Settings) -> list[dict[str, Any]]:
                 entries[-1]["message"] += "\n" + safe_line
             else:
                 entries.append(
-                    {"timestamp": None, "level": None, "logger": None, "message": safe_line,
-                     "source": path.name}
+                    {
+                        "timestamp": None,
+                        "level": None,
+                        "logger": None,
+                        "message": safe_line,
+                        "source": path.name,
+                    }
                 )
     return entries
 
@@ -521,7 +527,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        rotation_task: asyncio.Task | None = None
+        rotation_task: asyncio.Task[None] | None = None
         started = False
         previous_signal_handlers = _install_shutdown_signal_handlers(shutdown_event)
         try:
@@ -576,7 +582,9 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     @app.exception_handler(SecurityError)
     async def handle_security_error(request: Request, exc: SecurityError) -> JSONResponse:
         headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
-        return error_response(request, APIError(exc.code, exc.message, exc.status_code, headers=headers))
+        return error_response(
+            request, APIError(exc.code, exc.message, exc.status_code, headers=headers)
+        )
 
     @app.exception_handler(AdminAccountError)
     async def handle_account_error(request: Request, exc: AdminAccountError) -> JSONResponse:
@@ -628,7 +636,9 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             if mutating:
                 if request.headers.get("Origin") != admin_origin:
                     raise APIError("ORIGIN_FORBIDDEN", "请求来源不被允许", 403)
-                content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                content_type = (
+                    request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                )
                 if content_type != "application/json":
                     raise APIError("JSON_REQUIRED", "修改请求必须使用 application/json", 415)
             if not is_key and not is_verify:
@@ -687,9 +697,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             keys.verify_admin_payload(body.key_id, body.ciphertext, admin_key, purpose="admin")
         except SecurityError:
             limiter.record_failure(client_ip)
-            raise SecurityError(
-                "AUTH_FAILED", "管理员身份验证失败", status_code=401
-            )
+            raise SecurityError("AUTH_FAILED", "管理员身份验证失败", status_code=401)
         limiter.record_success(client_ip)
         credentials = sessions.create()
         response = JSONResponse(
@@ -1074,7 +1082,9 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         existing = database.get_task_any(definition.name)
         if existing and definition.name not in body.overwrite_names:
             raise APIError(
-                "CONFLICT", "同名任务已存在，必须明确选择覆盖", 409,
+                "CONFLICT",
+                "同名任务已存在，必须明确选择覆盖",
+                409,
                 details={"conflicts": [definition.name]},
             )
         try:
@@ -1099,8 +1109,12 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         started_to: datetime | None = Query(None, alias="to"),
     ) -> dict[str, Any]:
         items, total = database.list_runs(
-            page=page, page_size=page_size, task_id=task_id, status=status,
-            started_from=started_from, started_to=started_to,
+            page=page,
+            page_size=page_size,
+            task_id=task_id,
+            status=status,
+            started_from=started_from,
+            started_to=started_to,
         )
         return {
             "items": [
@@ -1335,14 +1349,13 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                     yield ": keepalive\n\n"
                     last_keepalive = time.monotonic()
                 try:
-                    await asyncio.wait_for(
-                        shutdown_event.wait(), timeout=LOG_EVENT_POLL_SECONDS
-                    )
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=LOG_EVENT_POLL_SECONDS)
                 except TimeoutError:
                     pass
 
         return StreamingResponse(
-            events(), media_type="text/event-stream",
+            events(),
+            media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
 
@@ -1365,7 +1378,8 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 except OSError:
                     continue
         return Response(
-            buffer.getvalue(), media_type="application/zip",
+            buffer.getvalue(),
+            media_type="application/zip",
             headers={"Content-Disposition": 'attachment; filename="tg-bot-logs.zip"'},
         )
 
@@ -1401,6 +1415,8 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
 
     @app.get("/api/docs", include_in_schema=False)
     async def protected_docs() -> Response:
-        return get_swagger_ui_html(openapi_url="/api/openapi.json", title=f"{app.title} - Swagger UI")
+        return get_swagger_ui_html(
+            openapi_url="/api/openapi.json", title=f"{app.title} - Swagger UI"
+        )
 
     return app

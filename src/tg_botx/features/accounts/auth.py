@@ -49,6 +49,8 @@ class AuthService:
             else:
                 with self.database.session() as session:
                     stored = session.get(Account, account.id)
+                    if stored is None:
+                        raise RuntimeError("账号记录在登录过程中丢失")
                     stored.phone = phone
                     stored.is_active = True
                     session.commit()
@@ -72,7 +74,8 @@ class AuthService:
         qr_path = self.settings.data_dir / "login-qr.png"
         while True:
             print(f"请使用 Telegram 扫描二维码（临时文件：{qr_path}）：")
-            qrcode.make(login.url).save(qr_path)
+            with qr_path.open("wb") as image_file:
+                qrcode.make(login.url).save(image_file)
             try:
                 terminal_qr = qrcode.QRCode(border=1)
                 terminal_qr.add_data(login.url)
@@ -110,5 +113,7 @@ class AuthService:
             await client.disconnect()
         with self.database.session() as session:
             stored = session.get(Account, account.id)
+            if stored is None:
+                return
             stored.is_active = False
             session.commit()

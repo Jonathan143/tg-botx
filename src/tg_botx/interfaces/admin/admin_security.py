@@ -101,9 +101,7 @@ def _shannon_entropy(value: bytes) -> float:
     length = len(value)
     if not length:
         return 0.0
-    return -sum(
-        (count / length) * math.log2(count / length) for count in counts.values()
-    )
+    return -sum((count / length) * math.log2(count / length) for count in counts.values())
 
 
 def _iso_timestamp(timestamp: float) -> str:
@@ -119,11 +117,7 @@ def _timestamp_from_datetime(value: Any) -> float | None:
 
 
 def _random_token(byte_count: int = 32) -> str:
-    return (
-        base64.urlsafe_b64encode(secrets.token_bytes(byte_count))
-        .rstrip(b"=")
-        .decode("ascii")
-    )
+    return base64.urlsafe_b64encode(secrets.token_bytes(byte_count)).rstrip(b"=").decode("ascii")
 
 
 def _decode_base64(value: str) -> bytes:
@@ -257,9 +251,7 @@ class TransportKeyManager:
                         label=None,
                     ),
                 )
-                payload = json.loads(
-                    plaintext.decode("utf-8"), object_pairs_hook=_unique_object
-                )
+                payload = json.loads(plaintext.decode("utf-8"), object_pairs_hook=_unique_object)
             except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
                 _authentication_failed()
             if not isinstance(payload, dict):
@@ -288,10 +280,7 @@ class TransportKeyManager:
                 _authentication_failed()
             if max_timestamp_skew_seconds is not None:
                 timestamp = _parse_browser_timestamp(payload.get("timestamp"))
-                if (
-                    timestamp is None
-                    or abs(now - timestamp) > max_timestamp_skew_seconds
-                ):
+                if timestamp is None or abs(now - timestamp) > max_timestamp_skew_seconds:
                     _authentication_failed()
             return payload
 
@@ -363,17 +352,13 @@ class TransportKeyManager:
                 pass
 
     def _generate_key(self, now: float) -> _TransportKey:
-        private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=self.key_size
-        )
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=self.key_size)
         public_der = private_key.public_key().public_bytes(
             encoding=serialization.Encoding.DER,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
         key_id = (
-            base64.urlsafe_b64encode(hashlib.sha256(public_der).digest()[:18])
-            .rstrip(b"=")
-            .decode()
+            base64.urlsafe_b64encode(hashlib.sha256(public_der).digest()[:18]).rstrip(b"=").decode()
         )
         return _TransportKey(key_id=key_id, private_key=private_key, created_at=now)
 
@@ -473,7 +458,9 @@ class _Session:
 class SessionStore(Protocol):
     """Minimal persistence contract used by :class:`SessionManager`."""
 
-    def save_admin_session(self, token_hash: str, expires_at: datetime, last_seen_at: datetime) -> None: ...
+    def save_admin_session(
+        self, token_hash: str, expires_at: datetime, last_seen_at: datetime
+    ) -> None: ...
 
     def get_admin_session(self, token_hash: str) -> Any | None: ...
 
@@ -514,9 +501,7 @@ class SessionManager:
         self._token_hash_key = hmac.new(
             key, b"tg-bot-admin-session-token-v1", hashlib.sha256
         ).digest()
-        self._csrf_key = hmac.new(
-            key, b"tg-bot-admin-session-csrf-v1", hashlib.sha256
-        ).digest()
+        self._csrf_key = hmac.new(key, b"tg-bot-admin-session-csrf-v1", hashlib.sha256).digest()
         self._session_store = session_store
         self._sessions: dict[bytes, _Session] = {}
         self._last_prune_at: float | None = None
@@ -571,9 +556,7 @@ class SessionManager:
                         derived_csrf_token = self._csrf_token(token)
                         session = _Session(
                             csrf_token=derived_csrf_token,
-                            csrf_digest=hashlib.sha256(
-                                derived_csrf_token.encode("ascii")
-                            ).digest(),
+                            csrf_digest=hashlib.sha256(derived_csrf_token.encode("ascii")).digest(),
                             expires_at=expires_at,
                             last_seen_at=last_seen_at or now,
                         )
@@ -582,14 +565,10 @@ class SessionManager:
                 _session_failed()
             if require_csrf:
                 if not isinstance(csrf_token, str) or not csrf_token:
-                    raise SecurityError(
-                        "CSRF_INVALID", "CSRF 校验失败。", status_code=403
-                    )
+                    raise SecurityError("CSRF_INVALID", "CSRF 校验失败。", status_code=403)
                 candidate = hashlib.sha256(csrf_token.encode("utf-8")).digest()
                 if not hmac.compare_digest(candidate, session.csrf_digest):
-                    raise SecurityError(
-                        "CSRF_INVALID", "CSRF 校验失败。", status_code=403
-                    )
+                    raise SecurityError("CSRF_INVALID", "CSRF 校验失败。", status_code=403)
             old_expiry = session.expires_at
             session.last_seen_at = now
             session.expires_at = now + self.session_seconds
@@ -626,14 +605,16 @@ class SessionManager:
             self._prune_locked(self._clock(), force=True)
 
     def _token_digest(self, token: str) -> bytes:
-        return hmac.new(
-            self._token_hash_key, token.encode("utf-8"), hashlib.sha256
-        ).digest()
+        return hmac.new(self._token_hash_key, token.encode("utf-8"), hashlib.sha256).digest()
 
     def _csrf_token(self, token: str) -> str:
-        return base64.urlsafe_b64encode(
-            hmac.new(self._csrf_key, token.encode("utf-8"), hashlib.sha256).digest()
-        ).decode("ascii").rstrip("=")
+        return (
+            base64.urlsafe_b64encode(
+                hmac.new(self._csrf_key, token.encode("utf-8"), hashlib.sha256).digest()
+            )
+            .decode("ascii")
+            .rstrip("=")
+        )
 
     def _prune_locked(self, now: float, *, force: bool = False) -> None:
         self._sessions = {
@@ -651,9 +632,7 @@ class SessionManager:
             if now - self._last_prune_at < self.prune_interval_seconds:
                 return
         self._last_prune_at = now
-        self._session_store.delete_expired_admin_sessions(
-            datetime.fromtimestamp(now, tz=UTC)
-        )
+        self._session_store.delete_expired_admin_sessions(datetime.fromtimestamp(now, tz=UTC))
 
 
 class FailureRateLimiter:
@@ -721,15 +700,11 @@ def resolve_client_ip(
         peer = ipaddress.ip_address(peer_ip)
     except ValueError:
         return "invalid-source"
-    networks = tuple(
-        ipaddress.ip_network(item, strict=False) for item in trusted_proxies
-    )
+    networks = tuple(ipaddress.ip_network(item, strict=False) for item in trusted_proxies)
     if not forwarded_for or not _is_in_networks(peer, networks):
         return peer.compressed
     try:
-        forwarded = [
-            ipaddress.ip_address(item.strip()) for item in forwarded_for.split(",")
-        ]
+        forwarded = [ipaddress.ip_address(item.strip()) for item in forwarded_for.split(",")]
         if not forwarded:
             return peer.compressed
     except ValueError:
@@ -756,10 +731,7 @@ def _is_in_networks(
     address: ipaddress.IPv4Address | ipaddress.IPv6Address,
     networks: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network],
 ) -> bool:
-    return any(
-        address.version == network.version and address in network
-        for network in networks
-    )
+    return any(address.version == network.version and address in network for network in networks)
 
 
 __all__ = [

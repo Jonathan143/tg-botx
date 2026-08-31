@@ -7,6 +7,7 @@ import logging
 import signal
 from contextlib import suppress
 from datetime import UTC, datetime, tzinfo
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -365,7 +366,7 @@ class CheckinService:
         self._task_revisions: dict[str, int] = {}
         self._task_event_sequence = 0
         self._task_subscribers: dict[str, set[asyncio.Queue[int]]] = {}
-        self._task_run_progress: dict[str, dict[str, object]] = {}
+        self._task_run_progress: dict[str, dict[str, Any]] = {}
 
     def next_task_event_id(self) -> int:
         """Reserve a process-local, monotonically increasing task event ID."""
@@ -396,7 +397,7 @@ class CheckinService:
                     queue.get_nowait()
             queue.put_nowait(event_id)
 
-    def get_task_run_progress(self, task_id: str) -> dict[str, object] | None:
+    def get_task_run_progress(self, task_id: str) -> dict[str, Any] | None:
         progress = self._task_run_progress.get(task_id)
         return copy.deepcopy(progress) if progress is not None else None
 
