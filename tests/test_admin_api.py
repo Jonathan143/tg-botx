@@ -412,6 +412,66 @@ def test_manual_run_returns_running_task_with_initialized_step_statuses(
         assert canceled.status_code == 202
 
 
+def test_run_list_omits_workflow_and_progress_logs_but_detail_keeps_them(tmp_path):
+    app = app_for(tmp_path)
+    database = app.state.database
+    account = database.get_account("default")
+    task = database.save_task(
+        Task(
+            account_id=account.id,
+            name="run-response-task",
+            target="checkin_bot",
+            timezone="UTC",
+            schedule_type="fixed",
+            fixed_time="12:00:00",
+            config_json=json.dumps(
+                {
+                    "name": "run-response-task",
+                    "account": "default",
+                    "target": "checkin_bot",
+                    "schedule": {"type": "fixed", "timezone": "UTC", "time": "12:00:00"},
+                    "steps": [{"type": "send_message", "text": "/checkin"}],
+                }
+            ),
+        )
+    )
+    workflow = {"steps": [{"type": "send_message", "text": "/checkin"}]}
+    progress = {
+        "id": "run-response-id",
+        "status": "success",
+        "stepStatuses": [{"index": 0, "status": "success"}],
+        "logs": [{"level": "info", "message": "completed"}],
+    }
+    run = database.add_run(
+        TaskRun(
+            id="run-response-id",
+            task_id=task.id,
+            status="success",
+            run_kind="test",
+            workflow_version="main",
+            workflow_json=json.dumps(workflow),
+            progress_json=json.dumps(progress),
+        )
+    )
+
+    with TestClient(app, base_url=ORIGIN) as client:
+        assert authenticate(client).status_code == 200
+
+        list_response = client.get("/api/runs?page=1&pageSize=25")
+        assert list_response.status_code == 200
+        listed_run = list_response.json()["items"][0]
+        assert listed_run["id"] == run.id
+        assert "workflow" not in listed_run
+        assert "workflowError" not in listed_run
+        assert listed_run["progress"]["stepStatuses"] == progress["stepStatuses"]
+        assert "logs" not in listed_run["progress"]
+
+        detail_response = client.get(f"/api/runs/{run.id}")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["workflow"] == workflow
+        assert detail_response.json()["progress"]["logs"] == progress["logs"]
+
+
 def test_dashboard_returns_trends_health_upcoming_tasks_and_account_status(tmp_path):
     app = app_for(tmp_path)
     database = app.state.database

@@ -23,6 +23,8 @@ from sqlalchemy import (
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
+from tg_botx.core.time import utc_isoformat
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)

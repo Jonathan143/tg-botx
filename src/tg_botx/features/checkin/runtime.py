@@ -6,7 +6,7 @@ import json
 import logging
 import signal
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import UTC, datetime, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -23,8 +23,10 @@ from tg_botx.infrastructure.persistence.db import (
     Task,
     TaskRun,
     WorkflowVersion,
+    utc_isoformat,
     utc_now,
 )
+from tg_botx.integrations.telegram import TelegramAccountConfig, create_telethon_client
 from tg_botx.schemas import TaskDefinition
 
 logger = logging.getLogger(__name__)
@@ -58,23 +60,57 @@ class ClientPool:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.clients: dict[str, TelegramClient] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, account_id: str) -> asyncio.Lock:
+        lock = self._locks.get(account_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[account_id] = lock
+        return lock
 
     async def get(self, account: Account) -> TelegramClient:
-        if account.id in self.clients:
-            return self.clients[account.id]
-        api_id, api_hash = self.settings.require_api_credentials()
-        client = TelegramClient(str(self.settings.sessions_dir / account.session_name), api_id, api_hash)
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            raise RuntimeError(f"账号 {account.name} 尚未登录，请先执行 tg-bot login")
-        self.clients[account.id] = client
-        return client
+        # Telethon SQLite sessions cannot be shared. Serialize construction so
+        # parallel tasks for the same account reuse one connected client.
+        async with self._lock_for(account.id):
+            client = self.clients.get(account.id)
+            if client is not None:
+                return client
+            api_id, api_hash = self.settings.require_api_credentials()
+            client = create_telethon_client(
+                TelegramAccountConfig(
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    session_path=self.settings.sessions_dir / account.session_name,
+                )
+            )
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    raise RuntimeError(f"账号 {account.name} 尚未登录，请先执行 tg-bot login")
+            except Exception:
+                with suppress(Exception):
+                    await client.disconnect()
+                raise
+            self.clients[account.id] = client
+            return client
+
+    async def disconnect_account(self, account: Account) -> None:
+        async with self._lock_for(account.id):
+            client = self.clients.pop(account.id, None)
+            if client is None:
+                return
+            with suppress(Exception):
+                await client.disconnect()
 
     async def close(self) -> None:
-        for client in self.clients.values():
-            await client.disconnect()
-        self.clients.clear()
+        for account_id in list(self.clients):
+            async with self._lock_for(account_id):
+                client = self.clients.pop(account_id, None)
+                if client is None:
+                    continue
+                with suppress(Exception):
+                    await client.disconnect()
 
 
 class NotificationService:
@@ -126,11 +162,11 @@ class NotificationService:
     def _format_time(value: datetime | None, timezone_name: str) -> str:
         if value is None:
             return "未安排"
-        zone: ZoneInfo | timezone
+        zone: tzinfo
         try:
             zone = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
-            zone = timezone.utc
+            zone = UTC
         # Keep the wall-clock time and named timezone for readability.  The
         # numeric UTC offset is intentionally omitted because it is redundant
         # with the timezone name and makes notifications harder to scan.
@@ -231,7 +267,9 @@ class NotificationService:
             lines.extend((self._DIVIDER, "🤖 机器人回复：", bot_response))
         await self._send_text("\n".join(lines))
 
-    async def success(self, task: Task, next_run: datetime | None, bot_response: str | None) -> None:
+    async def success(
+        self, task: Task, next_run: datetime | None, bot_response: str | None
+    ) -> None:
         if self._is_enabled(task, "success"):
             await self._task_event(
                 task, "INFO", "签到成功", next_run, bot_response=bot_response, icon="✅"
@@ -256,9 +294,7 @@ class NotificationService:
             )
 
     async def skipped(self, task: Task, next_run: datetime | None) -> None:
-        await self._task_event(
-            task, "WARNING", "任务因目标聊天忙碌而跳过", next_run, icon="⏭️"
-        )
+        await self._task_event(task, "WARNING", "任务因目标聊天忙碌而跳过", next_run, icon="⏭️")
 
     async def cancel_requested(self, task: Task) -> None:
         await self._task_event(
@@ -322,7 +358,7 @@ class CheckinService:
         self.notifications = NotificationService(settings)
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self.locks: dict[tuple[str, str], asyncio.Lock] = {}
-        self.running: dict[str, asyncio.Task] = {}
+        self.running: dict[str, asyncio.Task[bool]] = {}
         self._manual_reservations: set[tuple[str, str]] = set()
         # In-memory generation counters distinguish administrator scheduling
         # mutations from execution-status writes without a schema migration.
@@ -364,6 +400,54 @@ class CheckinService:
         progress = self._task_run_progress.get(task_id)
         return copy.deepcopy(progress) if progress is not None else None
 
+    @staticmethod
+    def _progress_step_statuses(progress: dict[str, object]) -> list[dict[str, object]]:
+        statuses = progress.get("stepStatuses")
+        if not isinstance(statuses, list):
+            return []
+        return [status for status in statuses if isinstance(status, dict)]
+
+    @classmethod
+    def _workflow_step_statuses(
+        cls,
+        steps: list[dict[str, object]],
+        path_prefix: str = "steps",
+        *,
+        top_level: bool = True,
+    ) -> list[dict[str, object]]:
+        statuses: list[dict[str, object]] = []
+        for index, step in enumerate(steps):
+            path = f"{path_prefix}[{index}]"
+            node_id = step.get("node_id") or step.get("nodeId")
+            status: dict[str, object] = {"status": "pending"}
+            if top_level:
+                status["index"] = index
+            if isinstance(node_id, str) and node_id:
+                status["nodeId"] = node_id
+                status["stepPath"] = path
+            elif not top_level:
+                status["stepPath"] = path
+            statuses.append(status)
+            if step.get("type") != "condition":
+                continue
+            branches = step.get("branches")
+            if not isinstance(branches, list):
+                continue
+            for branch_index, branch in enumerate(branches):
+                if not isinstance(branch, dict):
+                    continue
+                branch_steps = branch.get("steps")
+                if not isinstance(branch_steps, list):
+                    continue
+                statuses.extend(
+                    cls._workflow_step_statuses(
+                        branch_steps,
+                        f"{path}.branches[{branch_index}].steps",
+                        top_level=False,
+                    )
+                )
+        return statuses
+
     def _initialize_run_progress(
         self,
         task: Task,
@@ -375,10 +459,7 @@ class CheckinService:
             "id": run.id,
             "status": "running",
             "attempt": 0,
-            "stepStatuses": [
-                {"index": index, "status": "pending"}
-                for index, _ in enumerate(task.config["steps"])
-            ],
+            "stepStatuses": self._workflow_step_statuses(task.config["steps"]),
             "logs": [],
         }
         self._task_run_progress[task.id] = progress
@@ -404,6 +485,8 @@ class CheckinService:
         *,
         level: str = "INFO",
         step_index: int | None = None,
+        node_id: str | None = None,
+        step_path: str | None = None,
     ) -> None:
         progress = self._task_run_progress.get(task_id)
         if progress is None or progress["id"] != run_id:
@@ -411,14 +494,17 @@ class CheckinService:
         logs = progress.setdefault("logs", [])
         if not isinstance(logs, list):
             return
-        logs.append(
-            {
-                "timestamp": utc_now().isoformat(),
-                "level": level,
-                "message": message,
-                "stepIndex": step_index,
-            }
-        )
+        entry: dict[str, object] = {
+            "timestamp": utc_isoformat(utc_now()),
+            "level": level,
+            "message": message,
+            "stepIndex": step_index,
+        }
+        if node_id is not None:
+            entry["nodeId"] = node_id
+        if step_path is not None:
+            entry["stepPath"] = step_path
+        logs.append(entry)
         del logs[:-200]
 
     def _begin_run_attempt(self, task_id: str, run_id: str, attempt: int) -> None:
@@ -428,12 +514,14 @@ class CheckinService:
         progress["status"] = "running"
         progress["attempt"] = attempt
         progress.pop("error", None)
-        for step in progress["stepStatuses"]:
+        for step in self._progress_step_statuses(progress):
             step["status"] = "pending"
             step.pop("error", None)
             step.pop("botResponse", None)
             step.pop("botButtons", None)
             step.pop("durationMs", None)
+            step.pop("selectedBranch", None)
+            step.pop("conditionVariables", None)
         self._append_run_log(task_id, run_id, f"开始第 {attempt} 次尝试")
         self._persist_run_progress(task_id, run_id)
         self._publish_task_updated(task_id)
@@ -442,20 +530,35 @@ class CheckinService:
         self,
         task_id: str,
         run_id: str,
-        index: int,
+        index: int | None,
         status: str,
         error: str | None = None,
         bot_response: str | None = None,
         bot_buttons: list[list[str]] | None = None,
         duration_ms: int | None = None,
+        node_id: str | None = None,
+        step_path: str | None = None,
+        selected_branch: dict[str, object] | None = None,
+        condition_variables: list[dict[str, object]] | None = None,
+        include_condition_values: bool = False,
     ) -> None:
         progress = self._task_run_progress.get(task_id)
         if progress is None or progress["id"] != run_id:
             return
-        steps = progress["stepStatuses"]
-        if not 0 <= index < len(steps):
+        steps = self._progress_step_statuses(progress)
+        step = next(
+            (
+                item
+                for item in steps
+                if (node_id is not None and item.get("nodeId") == node_id)
+                or (step_path is not None and item.get("stepPath") == step_path)
+            ),
+            None,
+        )
+        if step is None and index is not None:
+            step = next((item for item in steps if item.get("index") == index), None)
+        if step is None:
             return
-        step = steps[index]
         step["status"] = status
         if error is None:
             step.pop("error", None)
@@ -465,8 +568,16 @@ class CheckinService:
             step["botResponse"] = bot_response
         if bot_buttons is not None:
             step["botButtons"] = bot_buttons
-        if duration_ms is not None:
+        if duration_ms is not None and duration_ms > 0:
             step["durationMs"] = duration_ms
+        if selected_branch is not None:
+            step["selectedBranch"] = selected_branch
+        if condition_variables is not None:
+            values = copy.deepcopy(condition_variables)
+            if not include_condition_values:
+                for item in values:
+                    item.pop("value", None)
+            step["conditionVariables"] = values
         labels = {"running": "开始执行", "success": "执行成功", "failed": "执行失败"}
         self._append_run_log(
             task_id,
@@ -474,6 +585,8 @@ class CheckinService:
             error if status == "failed" and error else labels.get(status, status),
             level="ERROR" if status == "failed" else "INFO",
             step_index=index,
+            node_id=node_id,
+            step_path=step_path,
         )
         self._persist_run_progress(task_id, run_id)
         self._publish_task_updated(task_id)
@@ -493,10 +606,16 @@ class CheckinService:
             progress.pop("error", None)
         else:
             progress["error"] = error
-        for step in progress["stepStatuses"]:
+        for step in self._progress_step_statuses(progress):
             if status == "success":
-                step["status"] = "success"
-                step.pop("error", None)
+                if step["status"] == "running":
+                    step["status"] = "success"
+                    step.pop("error", None)
+                elif step["status"] == "pending":
+                    # Old integrations only report a final result. Preserve
+                    # their top-level index behavior while keeping unvisited
+                    # identity-aware branch nodes visibly skipped.
+                    step["status"] = "skipped" if "stepPath" in step else "success"
             elif step["status"] == "running":
                 step["status"] = "failed"
                 step["error"] = error or "任务执行失败"
@@ -576,7 +695,7 @@ class CheckinService:
                 loop.remove_signal_handler(received)
 
     def _ensure_next_run(self, task: Task) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if task.next_run_at is None or task.next_run_at <= now:
             next_run = next_run_for(schedule_from_task(task), now=now)
             self.database.update_task(task.id, next_run_at=next_run)
@@ -735,9 +854,7 @@ class CheckinService:
             raise TaskNotFound("任务不存在")
         # Archiving always disables future scheduling, but deliberately leaves
         # an already running execution untouched.
-        updated = self.database.update_task(
-            task.id, enabled=False, archived=True, next_run_at=None
-        )
+        updated = self.database.update_task(task.id, enabled=False, archived=True, next_run_at=None)
         self._bump_task_revision(task.id)
         self._sync_schedule(updated)
         self._publish_task_updated(task.id)
@@ -758,14 +875,15 @@ class CheckinService:
     async def _scheduled_run(self, task_id: str) -> None:
         await self.run_task(task_id)
 
-    async def _watch_cancellation(self, task_id: str, running: asyncio.Task) -> None:
+    async def _watch_cancellation(self, task_id: str, running: asyncio.Task[bool]) -> None:
         while True:
             await asyncio.sleep(1)
             task = self.database.get_task(task_id)
             if task is None:
                 return
             if task.cancel_requested:
-                running.cancel()
+                if not running.cancelling():
+                    running.cancel()
                 return
 
     def _execution_snapshot(
@@ -802,6 +920,10 @@ class CheckinService:
     @staticmethod
     def _log_bot_response_enabled(task: Task) -> bool:
         return bool(task.config.get("log_bot_response", False))
+
+    @staticmethod
+    def _log_condition_values_enabled(task: Task) -> bool:
+        return bool(task.config.get("log_condition_values", False))
 
     async def _record_skipped(
         self,
@@ -915,10 +1037,14 @@ class CheckinService:
                     self._begin_run_attempt(task.id, run.id, attempt)
 
                 async def on_step_status(
-                    index: int,
+                    index: int | None,
                     status: str,
                     error: str | None,
                     duration_ms: int | None = None,
+                    node_id: str | None = None,
+                    step_path: str | None = None,
+                    selected_branch: dict[str, object] | None = None,
+                    condition_variables: list[dict[str, object]] | None = None,
                 ) -> None:
                     self._update_run_step(
                         task.id,
@@ -927,12 +1053,19 @@ class CheckinService:
                         status,
                         error,
                         duration_ms=duration_ms,
+                        node_id=node_id,
+                        step_path=step_path,
+                        selected_branch=selected_branch,
+                        condition_variables=condition_variables,
+                        include_condition_values=self._log_condition_values_enabled(task),
                     )
 
                 async def on_step_response(
-                    index: int,
+                    index: int | None,
                     response: str,
                     buttons: list[list[str]] | None = None,
+                    node_id: str | None = None,
+                    step_path: str | None = None,
                 ) -> None:
                     self._update_run_step(
                         task.id,
@@ -941,6 +1074,8 @@ class CheckinService:
                         "running",
                         bot_response=response,
                         bot_buttons=buttons,
+                        node_id=node_id,
+                        step_path=step_path,
                     )
 
                 success, error, attempts, bot_response = await run_with_retries(
@@ -1038,9 +1173,7 @@ class CheckinService:
         version = self.database.get_latest_workflow_version(task.id)
         if version is None:
             raise WorkflowVersionNotFound("请先发布工作流后再运行任务")
-        execution_task, account = self._execution_snapshot(
-            task, version.execution_definition
-        )
+        execution_task, account = self._execution_snapshot(task, version.execution_definition)
         lock_key = (account.id, execution_task.target)
         lock = self.locks.setdefault(lock_key, asyncio.Lock())
         if lock.locked() or lock_key in self._manual_reservations:
@@ -1081,16 +1214,10 @@ class CheckinService:
         version = self.database.get_latest_workflow_version(task.id)
         if version is None:
             raise WorkflowVersionNotFound("请先发布工作流后再运行任务")
-        execution_task, account = self._execution_snapshot(
-            task, version.execution_definition
-        )
+        execution_task, account = self._execution_snapshot(task, version.execution_definition)
         lock_key = (account.id, execution_task.target)
         lock = self.locks.setdefault(lock_key, asyncio.Lock())
-        if (
-            lock.locked()
-            or lock_key in self._manual_reservations
-            or task.id in self.running
-        ):
+        if lock.locked() or lock_key in self._manual_reservations or task.id in self.running:
             raise ManualRunConflict("同一账号和目标当前已有运行实例")
 
         self.database.update_task(task.id, cancel_requested=False)
@@ -1123,7 +1250,7 @@ class CheckinService:
         self.running[task.id] = running
         self._publish_task_updated(task.id)
 
-        def cleanup(completed: asyncio.Task) -> None:
+        def cleanup(completed: asyncio.Task[bool]) -> None:
             self._manual_reservations.discard(lock_key)
             if self.running.get(task.id) is completed:
                 self.running.pop(task.id, None)
@@ -1133,9 +1260,7 @@ class CheckinService:
             if stored is not None and stored.status == "running":
                 status = "canceled" if completed.cancelled() else "failed"
                 finished = utc_now()
-                error = (
-                    "执行在启动前被取消" if completed.cancelled() else "执行异常中止"
-                )
+                error = "执行在启动前被取消" if completed.cancelled() else "执行异常中止"
                 self.database.update_run(
                     run.id,
                     finished_at=finished,
@@ -1205,7 +1330,7 @@ class CheckinService:
         self.running[task.id] = running
         self._publish_task_updated(task.id)
 
-        def cleanup(completed: asyncio.Task) -> None:
+        def cleanup(completed: asyncio.Task[bool]) -> None:
             self._manual_reservations.discard(lock_key)
             if self.running.get(task.id) is completed:
                 self.running.pop(task.id, None)
@@ -1237,7 +1362,7 @@ class CheckinService:
             return False
         self.database.update_task(task.id, cancel_requested=True)
         self._publish_task_updated(task.id)
-        await self.notifications.cancel_requested(task)
         if running is not None:
             running.cancel()
+        await self.notifications.cancel_requested(task)
         return True

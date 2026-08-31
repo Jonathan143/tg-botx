@@ -27,6 +27,8 @@ from typing import Any, NoReturn, Protocol
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from tg_botx.core.time import utc_isoformat
+
 ADMIN_KEY_MIN_BYTES = 32
 DEFAULT_NONCE_TTL_SECONDS = 120
 DEFAULT_TIMESTAMP_SKEW_SECONDS = 120
@@ -105,7 +107,7 @@ def _shannon_entropy(value: bytes) -> float:
 
 
 def _iso_timestamp(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp, tz=UTC).isoformat().replace("+00:00", "Z")
+    return utc_isoformat(datetime.fromtimestamp(timestamp, tz=UTC)) or ""
 
 
 def _timestamp_from_datetime(value: Any) -> float | None:

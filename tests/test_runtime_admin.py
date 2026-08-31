@@ -147,7 +147,9 @@ def test_manual_busy_conflict_does_not_record_skipped(tmp_path, monkeypatch):
         async def fake_get(account):
             return object()
 
-        monkeypatch.setattr("tg_botx.features.checkin.runtime.run_with_retries", fake_run_with_retries)
+        monkeypatch.setattr(
+            "tg_botx.features.checkin.runtime.run_with_retries", fake_run_with_retries
+        )
         monkeypatch.setattr(service.pool, "get", fake_get)
         await service.start()
         try:
@@ -188,7 +190,9 @@ def test_task_update_subscription_tracks_manual_run_state(tmp_path, monkeypatch)
         async def fake_get(account):
             return object()
 
-        monkeypatch.setattr("tg_botx.features.checkin.runtime.run_with_retries", fake_run_with_retries)
+        monkeypatch.setattr(
+            "tg_botx.features.checkin.runtime.run_with_retries", fake_run_with_retries
+        )
         monkeypatch.setattr(service.pool, "get", fake_get)
         await service.start()
         try:
@@ -242,7 +246,7 @@ def test_step_progress_is_published_by_index_and_retries_reset_attempt(tmp_path)
                         {"type": "send_message", "text": "/finish"},
                     ],
                 }
-            )
+            ),
         )
         first_attempt_failed = asyncio.Event()
         second_step_started = asyncio.Event()
@@ -323,7 +327,7 @@ def test_cancel_marks_running_step_failed_and_remaining_steps_skipped(tmp_path):
                         {"type": "send_message", "text": "/never"},
                     ],
                 }
-            )
+            ),
         )
         step_started = asyncio.Event()
 
@@ -353,10 +357,16 @@ def test_cancel_marks_running_step_failed_and_remaining_steps_skipped(tmp_path):
             progress = service.get_task_run_progress(task.id)
             assert progress["status"] == "canceled"
             assert progress["error"] == "收到取消请求"
-            assert progress["stepStatuses"] == [
+            step_statuses = progress["stepStatuses"]
+            assert [
+                {key: value for key, value in item.items() if key != "durationMs"}
+                for item in step_statuses
+            ] == [
                 {"index": 0, "status": "failed", "error": "任务已取消"},
                 {"index": 1, "status": "skipped"},
             ]
+            if "durationMs" in step_statuses[0]:
+                assert step_statuses[0]["durationMs"] >= 0
             assert database.get_task(task.id).last_status == "canceled"
         finally:
             await service.close()
@@ -386,7 +396,7 @@ def test_failed_run_keeps_failed_step_error_and_skips_later_steps(tmp_path):
                         {"type": "send_message", "text": "/never"},
                     ],
                 }
-            )
+            ),
         )
 
         class FakeClient:
@@ -446,9 +456,7 @@ def test_cancel_before_execution_starts_still_finalizes_task_and_steps(tmp_path)
             assert current.last_status == "canceled"
             assert current.last_run_at is not None
             assert progress["status"] == "canceled"
-            assert progress["stepStatuses"] == [
-                {"index": 0, "status": "skipped"}
-            ]
+            assert progress["stepStatuses"] == [{"index": 0, "status": "skipped"}]
         finally:
             await service.close()
 
@@ -474,7 +482,9 @@ def test_running_snapshot_cannot_overwrite_edit_or_disable(tmp_path, monkeypatch
         async def fake_get(account):
             return object()
 
-        monkeypatch.setattr("tg_botx.features.checkin.runtime.run_with_retries", fake_run_with_retries)
+        monkeypatch.setattr(
+            "tg_botx.features.checkin.runtime.run_with_retries", fake_run_with_retries
+        )
         monkeypatch.setattr(service.pool, "get", fake_get)
         await service.start()
         try:

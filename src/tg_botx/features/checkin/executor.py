@@ -4,10 +4,22 @@ import asyncio
 import inspect
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, events
 
+from tg_botx.features.checkin.condition import (
+    ConditionEvaluationError,
+    ConditionInput,
+    ConditionVariable,
+    callback_data_values,
+    normalize_legacy_condition,
+    render_matcher_templates,
+    render_template,
+    select_branch,
+)
 from tg_botx.features.checkin.matching import match_button, matches
 
 
@@ -21,6 +33,25 @@ class CheckinError(RuntimeError):
         super().__init__(message)
         self.bot_response = bot_response
         self.bot_buttons = bot_buttons
+
+
+@dataclass(slots=True)
+class ExecutionContext:
+    entity: Any
+    bot_id: int | None
+    timezone: ZoneInfo
+    baseline: int
+    current_message: Any = None
+    last_wait_message: Any = None
+    last_wait_text: str | None = None
+    last_wait_metadata: dict[str, Any] = field(default_factory=dict)
+    last_clicked_callback_data_text: str | None = None
+    last_clicked_callback_data_base64: str | None = None
+    bot_response: str | None = None
+    bot_buttons: list[list[str]] | None = None
+    editable_message_ids: set[int] = field(default_factory=set)
+    editable_message_texts: dict[int, str] = field(default_factory=dict)
+    variables: dict[str, ConditionVariable] = field(default_factory=dict)
 
 
 class CheckinExecutor:
@@ -44,10 +75,14 @@ class CheckinExecutor:
 
     async def report_step_status(
         self,
-        index: int,
-        status: Literal["running", "success", "failed"],
+        index: int | None,
+        status: Literal["pending", "running", "success", "failed", "skipped"],
         error: str | None = None,
         duration_ms: int | None = None,
+        node_id: str | None = None,
+        step_path: str | None = None,
+        selected_branch: dict[str, Any] | None = None,
+        condition_variables: list[dict[str, Any]] | None = None,
     ) -> None:
         callback = self.on_step_status
         if callback is None:
@@ -66,7 +101,18 @@ class CheckinExecutor:
         except (TypeError, ValueError):
             has_varargs = True
             positional = []
-        if len(positional) >= 4 or (duration_ms is not None and has_varargs):
+        if len(positional) >= 8 or has_varargs:
+            await callback(
+                index,
+                status,
+                error,
+                duration_ms,
+                node_id,
+                step_path,
+                selected_branch,
+                condition_variables,
+            )
+        elif len(positional) >= 4:
             await callback(index, status, error, duration_ms)
         else:
             # Preserve compatibility with the original three-argument hook.
@@ -74,9 +120,11 @@ class CheckinExecutor:
 
     async def report_step_response(
         self,
-        index: int,
+        index: int | None,
         response: str,
         buttons: list[list[str]] | None = None,
+        node_id: str | None = None,
+        step_path: str | None = None,
     ) -> None:
         callback = self.on_step_response
         if callback is None:
@@ -97,7 +145,9 @@ class CheckinExecutor:
             # callback form is the safest default for those callables.
             has_varargs = True
             positional = []
-        if len(positional) >= 3 or (buttons is not None and has_varargs):
+        if len(positional) >= 5 or has_varargs:
+            await callback(index, response, buttons, node_id, step_path)
+        elif len(positional) >= 3:
             await callback(index, response, buttons)
         else:
             # Keep compatibility with integrations using the original
@@ -175,76 +225,280 @@ class CheckinExecutor:
                 rows.append(labels)
         return rows or None
 
+    @staticmethod
+    def _message_type(message: Any) -> str:
+        checks = (
+            ("sticker", "sticker"),
+            ("gif", "animation"),
+            ("video_note", "video_note"),
+            ("video", "video"),
+            ("voice", "voice"),
+            ("audio", "audio"),
+            ("photo", "photo"),
+            ("contact", "contact"),
+            ("venue", "venue"),
+            ("geo", "location"),
+            ("poll", "poll"),
+            ("dice", "dice"),
+            ("game", "game"),
+            ("invoice", "invoice"),
+            ("document", "document"),
+            ("action", "service"),
+        )
+        for attribute, label in checks:
+            try:
+                if getattr(message, attribute, None):
+                    return label
+            except Exception:
+                continue
+        if getattr(message, "raw_text", None) is not None:
+            return "text"
+        return "unknown"
+
+    async def _condition_metadata(self, message: Any, entity: Any) -> dict[str, Any]:
+        sender = None
+        get_sender = getattr(message, "get_sender", None)
+        if callable(get_sender):
+            try:
+                sender = await get_sender()
+            except Exception:
+                sender = None
+        username = getattr(sender, "username", None) if sender is not None else None
+        first_name = getattr(sender, "first_name", None) if sender is not None else None
+        last_name = getattr(sender, "last_name", None) if sender is not None else None
+        display_name = " ".join(
+            part for part in (str(first_name or "").strip(), str(last_name or "").strip()) if part
+        )
+        if not display_name:
+            display_name = str(getattr(sender, "title", "") or username or "")
+        is_channel = bool(
+            getattr(message, "is_channel", False) or getattr(entity, "broadcast", False)
+        )
+        is_group = bool(getattr(message, "is_group", False) or getattr(entity, "megagroup", False))
+        chat_type = "channel" if is_channel and not is_group else "group" if is_group else "private"
+        return {
+            "sender.id": getattr(message, "sender_id", None),
+            "sender.username": username,
+            "sender.display_name": display_name or None,
+            "chat.id": getattr(message, "chat_id", None),
+            "chat.title": getattr(entity, "title", None),
+            "chat.username": getattr(entity, "username", None),
+            "chat.type": chat_type,
+            "message.id": getattr(message, "id", None),
+            "message.date": getattr(message, "date", None),
+            "message.text": getattr(message, "raw_text", None) or "",
+            "message.type": self._message_type(message),
+            "runtime.last_clicked_callback_data_text": None,
+            "runtime.last_clicked_callback_data_base64": None,
+        }
+
+    @staticmethod
+    def _step_identity(
+        step: dict[str, Any], step_path: str, top_index: int | None
+    ) -> tuple[int | None, str | None, str]:
+        node_id = step.get("node_id") or step.get("nodeId")
+        return top_index, str(node_id) if node_id else None, step_path
+
+    async def _mark_steps_skipped(
+        self,
+        steps: list[dict[str, Any]],
+        path_prefix: str,
+    ) -> None:
+        for index, nested in enumerate(steps):
+            step_path = f"{path_prefix}[{index}]"
+            _, node_id, resolved_path = self._step_identity(nested, step_path, None)
+            await self.report_step_status(
+                None,
+                "skipped",
+                node_id=node_id,
+                step_path=resolved_path,
+            )
+            if nested.get("type") == "condition":
+                normalized = normalize_legacy_condition(nested)
+                for branch_index, branch in enumerate(normalized.get("branches", [])):
+                    await self._mark_steps_skipped(
+                        branch.get("steps") or [],
+                        f"{step_path}.branches[{branch_index}].steps",
+                    )
+
     async def execute(self, task: Any) -> str | None:
         entity = await self.client.get_entity(task.target)
         bot = await self.client.get_entity(task.target)
-        baseline = await self._latest_message_id(entity)
-        current_message = None
-        bot_response: str | None = None
-        bot_buttons: list[list[str]] | None = None
-        editable_message_ids: set[int] = set()
-        editable_message_texts: dict[int, str] = {}
+        timezone_name = getattr(task, "timezone", None) or task.config.get("schedule", {}).get(
+            "timezone", "Asia/Shanghai"
+        )
+        context = ExecutionContext(
+            entity=entity,
+            bot_id=bot.id if getattr(bot, "bot", False) else None,
+            timezone=ZoneInfo(str(timezone_name)),
+            baseline=await self._latest_message_id(entity),
+        )
+        await self._execute_steps(task.config["steps"], context, "steps", top_level=True)
+        return context.bot_response
 
-        for index, step in enumerate(task.config["steps"]):
+    async def _execute_steps(
+        self,
+        steps: list[dict[str, Any]],
+        context: ExecutionContext,
+        path_prefix: str,
+        *,
+        top_level: bool = False,
+    ) -> None:
+        for sequence_index, original_step in enumerate(steps):
+            step_path = f"{path_prefix}[{sequence_index}]"
+            top_index = sequence_index if top_level else None
+            step = (
+                normalize_legacy_condition(original_step)
+                if original_step.get("type") == "condition"
+                else original_step
+            )
+            index, node_id, resolved_path = self._step_identity(original_step, step_path, top_index)
             if self.is_cancelled():
                 raise asyncio.CancelledError
             kind = step["type"]
-            await self.report_step_status(index, "running")
+            await self.report_step_status(
+                index,
+                "running",
+                node_id=node_id,
+                step_path=resolved_path,
+            )
             step_started_at = time.perf_counter()
 
-            def step_duration_ms() -> int:
-                return max(0, round((time.perf_counter() - step_started_at) * 1000))
+            def step_duration_ms(started_at: float = step_started_at) -> int:
+                return max(0, round((time.perf_counter() - started_at) * 1000))
 
             step_response_reported = False
+            condition_reported = False
+            step_label = f"步骤 {index + 1}" if index is not None else f"节点 {resolved_path}"
             try:
                 if kind == "send_message":
-                    current_message = await self.client.send_message(entity, step["text"])
-                    baseline = max(baseline, current_message.id)
-                    editable_message_ids.clear()
-                    editable_message_texts.clear()
+                    text = render_template(str(step["text"]), context.variables)
+                    context.current_message = await self.client.send_message(context.entity, text)
+                    context.baseline = max(context.baseline, context.current_message.id)
+                    context.editable_message_ids.clear()
+                    context.editable_message_texts.clear()
                 elif kind == "wait_message":
-                    current_message = await self._wait_for_message(
-                        entity=entity,
-                        bot_id=bot.id if getattr(bot, "bot", False) else None,
-                        baseline=baseline,
-                        step=step,
+                    rendered_step = {
+                        **step,
+                        "success": render_matcher_templates(step.get("success"), context.variables),
+                        "failure": render_matcher_templates(step.get("failure"), context.variables),
+                    }
+                    context.current_message = await self._wait_for_message(
+                        entity=context.entity,
+                        bot_id=context.bot_id,
+                        baseline=context.baseline,
+                        step=rendered_step,
                         timeout=step.get("timeout_seconds", 60),
-                        editable_message_ids=editable_message_ids,
-                        editable_message_texts=editable_message_texts,
+                        editable_message_ids=context.editable_message_ids,
+                        editable_message_texts=context.editable_message_texts,
                     )
-                    current_message = await self._hydrate_message(entity, current_message)
-                    bot_response = current_message.raw_text or ""
-                    bot_buttons = await self._message_buttons(current_message, entity)
-                    if bot_buttons is None:
-                        await self.report_step_response(index, bot_response)
+                    context.current_message = await self._hydrate_message(
+                        context.entity, context.current_message
+                    )
+                    context.last_wait_message = context.current_message
+                    context.last_wait_text = context.current_message.raw_text or ""
+                    context.last_wait_metadata = await self._condition_metadata(
+                        context.current_message, context.entity
+                    )
+                    context.last_wait_metadata["runtime.last_clicked_callback_data_text"] = (
+                        context.last_clicked_callback_data_text
+                    )
+                    context.last_wait_metadata["runtime.last_clicked_callback_data_base64"] = (
+                        context.last_clicked_callback_data_base64
+                    )
+                    context.bot_response = context.last_wait_text
+                    context.bot_buttons = await self._message_buttons(
+                        context.current_message, context.entity
+                    )
+                    if context.bot_buttons is None:
+                        await self.report_step_response(
+                            index,
+                            context.bot_response,
+                            node_id=node_id,
+                            step_path=resolved_path,
+                        )
                     else:
-                        await self.report_step_response(index, bot_response, bot_buttons)
+                        await self.report_step_response(
+                            index,
+                            context.bot_response,
+                            context.bot_buttons,
+                            node_id=node_id,
+                            step_path=resolved_path,
+                        )
                     step_response_reported = True
-                    baseline = max(baseline, current_message.id)
-                    editable_message_ids.clear()
-                    editable_message_texts.clear()
+                    context.baseline = max(context.baseline, context.current_message.id)
+                    context.editable_message_ids.clear()
+                    context.editable_message_texts.clear()
                 elif kind == "click_button":
-                    if current_message is None:
+                    if context.current_message is None:
                         raise CheckinError("点击按钮步骤前没有可用的机器人消息")
-                    # A message received from an update can still carry an
-                    # incomplete Telegram client/input-chat context.  Reload
-                    # it immediately before matching/clicking so the click
-                    # request is sent through the active client rather than
-                    # being silently ignored by ``Message.click``.
-                    current_message = await self._hydrate_message(entity, current_message)
-                    # ``Message.buttons`` can be empty when Telethon has not
-                    # resolved the input chat/sender yet (notably for messages
-                    # received through an update).  ``get_buttons`` performs
-                    # the documented asynchronous fallback and caches the
-                    # resolved rows for the matcher.
-                    if not getattr(current_message, "buttons", None):
-                        get_buttons = getattr(current_message, "get_buttons", None)
+                    rendered_step = dict(step)
+                    for field in ("text", "text_contains", "callback_data"):
+                        if isinstance(rendered_step.get(field), str):
+                            rendered_step[field] = render_template(
+                                rendered_step[field], context.variables
+                            )
+                    context.current_message = await self._hydrate_message(
+                        context.entity, context.current_message
+                    )
+                    if not getattr(context.current_message, "buttons", None):
+                        get_buttons = getattr(context.current_message, "get_buttons", None)
                         if callable(get_buttons):
                             await get_buttons()
-                    button = match_button(current_message, step)
-                    editable_message_ids = {current_message.id}
-                    editable_message_texts = {current_message.id: current_message.raw_text or ""}
-                    await self._click(current_message, button, step)
+                    button = match_button(context.current_message, rendered_step)
+                    context.editable_message_ids = {context.current_message.id}
+                    context.editable_message_texts = {
+                        context.current_message.id: context.current_message.raw_text or ""
+                    }
+                    await self._click(context.current_message, button, rendered_step)
+                    callback_value = getattr(button, "data", None)
+                    if callback_value is None:
+                        callback_value = rendered_step.get("callback_data")
+                    callback_text, callback_base64 = callback_data_values(callback_value)
+                    context.last_clicked_callback_data_text = callback_text
+                    context.last_clicked_callback_data_base64 = callback_base64
+                    context.last_wait_metadata["runtime.last_clicked_callback_data_text"] = (
+                        callback_text
+                    )
+                    context.last_wait_metadata["runtime.last_clicked_callback_data_base64"] = (
+                        callback_base64
+                    )
+                elif kind == "condition":
+                    selected_index, selected, extraction_results = select_branch(
+                        step,
+                        ConditionInput(
+                            message_text=context.last_wait_text,
+                            metadata=context.last_wait_metadata,
+                            timezone=context.timezone,
+                        ),
+                        context.variables,
+                    )
+                    selected_branch = {
+                        "index": selected_index,
+                        "kind": selected.get("kind"),
+                        "name": selected.get("name"),
+                    }
+                    await self.report_step_status(
+                        index,
+                        "success",
+                        duration_ms=step_duration_ms(),
+                        node_id=node_id,
+                        step_path=resolved_path,
+                        selected_branch=selected_branch,
+                        condition_variables=extraction_results,
+                    )
+                    condition_reported = True
+                    for branch_index, branch in enumerate(step.get("branches", [])):
+                        if branch_index != selected_index:
+                            await self._mark_steps_skipped(
+                                branch.get("steps") or [],
+                                f"{resolved_path}.branches[{branch_index}].steps",
+                            )
+                    await self._execute_steps(
+                        selected.get("steps") or [],
+                        context,
+                        f"{resolved_path}.branches[{selected_index}].steps",
+                    )
                 else:
                     raise CheckinError(f"不支持的步骤类型：{kind}")
             except asyncio.CancelledError:
@@ -253,46 +507,88 @@ class CheckinExecutor:
                     "failed",
                     "任务已取消",
                     duration_ms=step_duration_ms(),
+                    node_id=node_id,
+                    step_path=resolved_path,
                 )
                 raise
-            except asyncio.TimeoutError as exc:
-                error = CheckinError(f"步骤 {index + 1} 等待超时", bot_response, bot_buttons)
+            except TimeoutError as exc:
+                error = CheckinError(
+                    f"{step_label} 等待超时", context.bot_response, context.bot_buttons
+                )
                 await self.report_step_status(
                     index,
                     "failed",
                     str(error),
                     duration_ms=step_duration_ms(),
+                    node_id=node_id,
+                    step_path=resolved_path,
+                )
+                raise error from exc
+            except ConditionEvaluationError as exc:
+                error = CheckinError(
+                    f"{step_label} 条件判断失败：{exc}",
+                    context.bot_response,
+                    context.bot_buttons,
+                )
+                await self.report_step_status(
+                    index,
+                    "failed",
+                    str(error),
+                    duration_ms=step_duration_ms(),
+                    node_id=node_id,
+                    step_path=resolved_path,
                 )
                 raise error from exc
             except CheckinError as exc:
                 if exc.bot_response is not None and not step_response_reported:
-                    bot_response = exc.bot_response
+                    context.bot_response = exc.bot_response
                     if exc.bot_buttons is None:
-                        await self.report_step_response(index, bot_response)
+                        await self.report_step_response(
+                            index,
+                            context.bot_response,
+                            node_id=node_id,
+                            step_path=resolved_path,
+                        )
                     else:
-                        await self.report_step_response(index, bot_response, exc.bot_buttons)
+                        await self.report_step_response(
+                            index,
+                            context.bot_response,
+                            exc.bot_buttons,
+                            node_id=node_id,
+                            step_path=resolved_path,
+                        )
                 if exc.bot_response is None:
-                    exc.bot_response = bot_response
+                    exc.bot_response = context.bot_response
                 await self.report_step_status(
                     index,
                     "failed",
                     str(exc),
                     duration_ms=step_duration_ms(),
+                    node_id=node_id,
+                    step_path=resolved_path,
                 )
                 raise
             except Exception as exc:
                 error = CheckinError(
-                    f"步骤 {index + 1} 执行失败：{exc}", bot_response, bot_buttons
+                    f"{step_label} 执行失败：{exc}", context.bot_response, context.bot_buttons
                 )
                 await self.report_step_status(
                     index,
                     "failed",
                     str(error),
                     duration_ms=step_duration_ms(),
+                    node_id=node_id,
+                    step_path=resolved_path,
                 )
                 raise error from exc
-            await self.report_step_status(index, "success", duration_ms=step_duration_ms())
-        return bot_response
+            if not condition_reported:
+                await self.report_step_status(
+                    index,
+                    "success",
+                    duration_ms=step_duration_ms(),
+                    node_id=node_id,
+                    step_path=resolved_path,
+                )
 
     async def _latest_message_id(self, entity: Any) -> int:
         message = await self.client.get_messages(entity, limit=1)

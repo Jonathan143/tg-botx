@@ -26,8 +26,19 @@ from telethon.tl.types import Channel, Chat, User
 
 from tg_botx.config import Settings
 from tg_botx.infrastructure.persistence.db import Account, Database, utc_now
+from tg_botx.integrations.telegram import TelegramAccountConfig, create_telethon_client
 
 logger = logging.getLogger(__name__)
+
+
+def _create_telegram_client(session_path: str, api_id: int, api_hash: str) -> TelegramClient:
+    return create_telethon_client(
+        TelegramAccountConfig(
+            api_id=api_id,
+            api_hash=api_hash,
+            session_path=Path(session_path),
+        )
+    )
 
 
 LoginMethod = Literal["qr", "phone"]
@@ -179,7 +190,7 @@ class LoginFlowManager:
         settings: Settings,
         database: Database,
         *,
-        client_factory: Callable[[str, int, str], Any] = TelegramClient,
+        client_factory: Callable[[str, int, str], Any] = _create_telegram_client,
         client_pool: Any | None = None,
     ):
         self.settings = settings
@@ -203,6 +214,9 @@ class LoginFlowManager:
                 raise AdminAccountError("LOGIN_FLOW_CONFLICT", "该账号已有登录流程正在进行")
             if previous is not None:
                 self._flows_by_id.pop(previous.flow_id, None)
+            existing_account = self.database.get_account(account_name)
+            if existing_account is not None:
+                await self._disconnect_pooled_client(existing_account)
             try:
                 client = self._client_factory(
                     str(self.settings.sessions_dir / account_name), api_id, api_hash

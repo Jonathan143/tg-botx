@@ -6,6 +6,7 @@ is safe to use from adapters, background workers and future web frontends.
 
 from tg_botx.core.events import DomainEvent, EventBus, EventSubscription
 from tg_botx.core.ports import AsyncSender, AsyncSummarizer, Clock
+from tg_botx.core.time import utc_isoformat
 
 __all__ = [
     "AsyncSender",
@@ -14,4 +15,5 @@ __all__ = [
     "DomainEvent",
     "EventBus",
     "EventSubscription",
+    "utc_isoformat",
 ]

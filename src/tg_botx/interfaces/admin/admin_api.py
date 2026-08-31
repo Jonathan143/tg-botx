@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import io
 import ipaddress
 import json
@@ -33,7 +34,14 @@ from tg_botx.features.checkin.runtime import (
     TaskStateError,
 )
 from tg_botx.infrastructure.observability.logging import allowed_log_files, redact_sensitive
-from tg_botx.infrastructure.persistence.db import Database, Task, TaskRun, WorkflowVersion, utc_now
+from tg_botx.infrastructure.persistence.db import (
+    Database,
+    Task,
+    TaskRun,
+    WorkflowVersion,
+    utc_isoformat,
+    utc_now,
+)
 from tg_botx.interfaces.admin.admin_accounts import AdminAccountError, LoginFlowManager
 from tg_botx.interfaces.admin.admin_security import (
     FailureRateLimiter,
@@ -148,8 +156,11 @@ class PublishBody(BaseModel):
 
 def _iso(value: datetime | str | None) -> str | None:
     if isinstance(value, str):
-        return value
-    return value.astimezone(timezone.utc).isoformat() if value else None
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+    return utc_isoformat(value)
 
 
 def _redact_step_buttons(step: dict[str, Any]) -> None:
@@ -221,6 +232,9 @@ def _run_json(
     run: TaskRun,
     database: Database,
     service: CheckinService | None = None,
+    *,
+    include_workflow: bool = True,
+    include_progress_logs: bool = True,
 ) -> dict[str, Any]:
     task = database.get_task_any(run.task_id)
     progress = service.get_task_run_progress(run.task_id) if service and task else None
@@ -234,6 +248,13 @@ def _run_json(
         except (TypeError, json.JSONDecodeError):
             progress = None
     if progress is not None:
+        progress = copy.deepcopy(
+            {
+                key: value
+                for key, value in progress.items()
+                if include_progress_logs or key != "logs"
+            }
+        )
         if isinstance(progress.get("error"), str):
             progress["error"] = redact_sensitive(progress["error"])
         for step in progress.get("stepStatuses", []):
@@ -242,26 +263,11 @@ def _run_json(
             if isinstance(step.get("botResponse"), str):
                 step["botResponse"] = redact_sensitive(step["botResponse"])
             _redact_step_buttons(step)
-        for log in progress.get("logs", []):
-            if isinstance(log.get("message"), str):
-                log["message"] = redact_sensitive(log["message"])
-    workflow: dict[str, Any] | None = None
-    if run.run_kind == "test" and run.workflow_json:
-        try:
-            stored_workflow = json.loads(run.workflow_json)
-            if isinstance(stored_workflow, dict):
-                workflow = stored_workflow
-        except (TypeError, json.JSONDecodeError):
-            workflow = None
-    version: WorkflowVersion | None = None
-    if run.workflow_version_id:
-        version = database.get_workflow_version(run.workflow_version_id)
-    if workflow is None and version is not None:
-        workflow = version.execution_definition
-    workflow_error = None
-    if run.run_kind == "published" and workflow is None:
-        workflow_error = "发布版本数据不存在"
-    return {
+        if include_progress_logs:
+            for log in progress.get("logs", []):
+                if isinstance(log.get("message"), str):
+                    log["message"] = redact_sensitive(log["message"])
+    result = {
         "id": run.id,
         "taskId": run.task_id,
         "taskName": task.name if task else None,
@@ -279,10 +285,28 @@ def _run_json(
             else run.workflow_version
         ),
         "workflowVersionId": run.workflow_version_id,
-        "workflow": workflow,
-        "workflowError": workflow_error,
         "progress": progress,
     }
+    if include_workflow:
+        workflow: dict[str, Any] | None = None
+        if run.run_kind == "test" and run.workflow_json:
+            try:
+                stored_workflow = json.loads(run.workflow_json)
+                if isinstance(stored_workflow, dict):
+                    workflow = stored_workflow
+            except (TypeError, json.JSONDecodeError):
+                workflow = None
+        version: WorkflowVersion | None = None
+        if run.workflow_version_id:
+            version = database.get_workflow_version(run.workflow_version_id)
+        if workflow is None and version is not None:
+            workflow = version.execution_definition
+        workflow_error = None
+        if run.run_kind == "published" and workflow is None:
+            workflow_error = "发布版本数据不存在"
+        result["workflow"] = workflow
+        result["workflowError"] = workflow_error
+    return result
 
 
 def _flow_json(flow: Any) -> dict[str, Any]:
@@ -332,7 +356,7 @@ def _dashboard_trend(
         bucket_count = 24
         bucket_width = timedelta(hours=1)
         first_bucket = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
-        label = lambda value: value.isoformat().replace("+00:00", "Z")
+        label = lambda value: utc_isoformat(value) or ""
     else:
         bucket_count = 7 if selected_range == "7d" else 30
         bucket_width = timedelta(days=1)
@@ -1079,7 +1103,16 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             started_from=started_from, started_to=started_to,
         )
         return {
-            "items": [_run_json(item, database, service) for item in items],
+            "items": [
+                _run_json(
+                    item,
+                    database,
+                    service,
+                    include_workflow=False,
+                    include_progress_logs=False,
+                )
+                for item in items
+            ],
             "page": page,
             "pageSize": page_size,
             "total": total,

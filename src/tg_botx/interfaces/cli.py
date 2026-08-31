@@ -10,6 +10,7 @@ from pathlib import Path
 import typer
 
 from tg_botx.config import Settings
+from tg_botx.core.time import utc_isoformat
 from tg_botx.features.accounts.auth import AuthService
 from tg_botx.features.checkin.runtime import CheckinService, TaskStateError
 from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
@@ -134,7 +135,7 @@ def list_tasks():
     for item in tasks:
         typer.echo(
             f"{item.id}  {item.name}  {'启用' if item.enabled else '停用'}  "
-            f"{item.schedule_type}  next={item.next_run_at or '-'}"
+            f"{item.schedule_type}  next={utc_isoformat(item.next_run_at) or '-'}"
         )
 
 
@@ -160,8 +161,13 @@ def enable_task(task_id: str):
         raise typer.BadParameter("请先发布工作流后再启用任务")
     next_run = next_run_for(schedule_from_task(task))
     database.update_task(task.id, enabled=True, next_run_at=next_run)
-    logger.info("启用任务 task_id=%s name=%s next_run_at=%s", task.id, task.name, next_run)
-    typer.echo(f"任务已启用，下次执行：{next_run}")
+    logger.info(
+        "启用任务 task_id=%s name=%s next_run_at=%s",
+        task.id,
+        task.name,
+        utc_isoformat(next_run),
+    )
+    typer.echo(f"任务已启用，下次执行：{utc_isoformat(next_run)}")
 
 
 @task_app.command("publish")

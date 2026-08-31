@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from getpass import getpass
+from pathlib import Path
 
 import qrcode
 from telethon import TelegramClient
@@ -9,6 +10,7 @@ from telethon.errors import SessionPasswordNeededError
 
 from tg_botx.config import Settings
 from tg_botx.infrastructure.persistence.db import Account, Database
+from tg_botx.integrations.telegram import TelegramAccountConfig, create_telethon_client
 
 
 class AuthService:
@@ -16,12 +18,21 @@ class AuthService:
         self.settings = settings
         self.database = database
 
-    def _session_path(self, account_name: str) -> str:
-        return str(self.settings.sessions_dir / account_name)
+    def _session_path(self, account_name: str) -> Path:
+        return self.settings.sessions_dir / account_name
+
+    def _client(self, account_name: str) -> TelegramClient:
+        api_id, api_hash = self.settings.require_api_credentials()
+        return create_telethon_client(
+            TelegramAccountConfig(
+                api_id=api_id,
+                api_hash=api_hash,
+                session_path=self._session_path(account_name),
+            )
+        )
 
     async def login(self, account_name: str = "default", method: str = "qr") -> Account:
-        api_id, api_hash = self.settings.require_api_credentials()
-        client = TelegramClient(self._session_path(account_name), api_id, api_hash)
+        client = self._client(account_name)
         await client.connect()
         try:
             if await client.is_user_authorized():
@@ -90,8 +101,7 @@ class AuthService:
         account = self.database.get_account(account_name)
         if not account:
             return
-        api_id, api_hash = self.settings.require_api_credentials()
-        client = TelegramClient(self._session_path(account_name), api_id, api_hash)
+        client = self._client(account_name)
         await client.connect()
         try:
             if await client.is_user_authorized():
