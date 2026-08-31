@@ -311,6 +311,8 @@ class NotificationService:
         await self._task_event(task, "INFO", "任务已取消", next_run, error=reason, icon="🛑")
 
     async def service_started(self) -> None:
+        if not self.settings.service_lifecycle_notifications_enabled:
+            return
         await self._send_text(
             "\n".join(
                 (
@@ -322,6 +324,8 @@ class NotificationService:
         )
 
     async def service_stopped(self, reason: str) -> None:
+        if not self.settings.service_lifecycle_notifications_enabled:
+            return
         await self._send_text(
             "\n".join(
                 (

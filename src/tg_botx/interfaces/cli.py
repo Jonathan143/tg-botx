@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
 import logging
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -12,6 +12,7 @@ import typer
 from tg_botx.config import Settings
 from tg_botx.core.time import utc_isoformat
 from tg_botx.features.accounts.auth import AuthService
+from tg_botx.features.admin_bot import BotManagementService
 from tg_botx.features.checkin.runtime import CheckinService, TaskStateError
 from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
 from tg_botx.infrastructure.observability.logging import IconFormatter, SensitiveDataFilter
@@ -21,6 +22,10 @@ from tg_botx.schemas import TaskDefinition
 app = typer.Typer(help="Telegram 用户账号签到调度器")
 task_app = typer.Typer(help="管理签到任务")
 app.add_typer(task_app, name="task")
+bot_app = typer.Typer(help="管理 Telegram 管理 Bot")
+binding_app = typer.Typer(help="管理 Telegram Bot 绑定")
+bot_app.add_typer(binding_app, name="binding")
+app.add_typer(bot_app, name="bot")
 logger = logging.getLogger(__name__)
 SERVER_APP_FACTORY = "tg_botx.interfaces.cli:create_server_app"
 
@@ -42,6 +47,8 @@ def configure_logging(settings: Settings) -> None:
         sensitive_values.append(settings.admin_key.get_secret_value())
     if settings.notification_bot_token:
         sensitive_values.append(settings.notification_bot_token.get_secret_value())
+    if settings.admin_bot_token:
+        sensitive_values.append(settings.admin_bot_token.get_secret_value())
     sensitive_filter = SensitiveDataFilter(sensitive_values)
     file_handler.addFilter(sensitive_filter)
     console_handler = logging.StreamHandler()
@@ -90,6 +97,53 @@ def logout(account: str = typer.Option("default", "--account")):
     settings, database = resources()
     asyncio.run(AuthService(settings, database).logout(account))
     typer.echo(f"账号 {account} 已退出登录")
+
+
+@binding_app.command("create")
+def create_bot_binding() -> None:
+    """生成一个一次性 Telegram 管理 Bot 绑定码。"""
+    settings, database = resources()
+    service = BotManagementService(database, CheckinService(settings, database))
+    code, item = service.create_binding_code()
+    typer.echo(f"绑定码：{code}")
+    typer.echo(f"有效期至：{item.expires_at.isoformat()}")
+
+
+@binding_app.command("list")
+def list_bot_bindings() -> None:
+    """查看绑定码和当前已绑定的 Telegram 用户。"""
+    settings, database = resources()
+    service = BotManagementService(database, CheckinService(settings, database))
+    codes = service.binding_codes()
+    bindings = service.bindings()
+    if codes:
+        typer.echo("绑定码：")
+        for item in codes:
+            typer.echo(
+                f"  {item.id}  *{item.hint}  {item.status}  expires={item.expires_at.isoformat()}"
+            )
+    else:
+        typer.echo("暂无绑定码")
+    if bindings:
+        typer.echo("已绑定用户：")
+        for binding in bindings:
+            name = binding.username or binding.first_name or str(binding.user_id)
+            typer.echo(
+                f"  {binding.id}  {name}  user_id={binding.user_id}  bound={binding.bound_at.isoformat()}"
+            )
+    else:
+        typer.echo("暂无已绑定用户")
+
+
+@binding_app.command("revoke")
+def revoke_bot_binding(binding_id: str) -> None:
+    """撤销绑定码或已绑定用户。"""
+    settings, database = resources()
+    service = BotManagementService(database, CheckinService(settings, database))
+    if service.revoke_code(binding_id) or service.revoke_binding(binding_id):
+        typer.echo("绑定已撤销")
+        return
+    raise typer.BadParameter("绑定码或绑定关系不存在，或已经失效")
 
 
 @task_app.command("create")

@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
-    Boolean,
     BigInteger,
+    Boolean,
     DateTime,
     Integer,
     String,
@@ -195,6 +195,66 @@ class AdminSession(Base):
     token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
     last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime())
+
+
+class BotBindingCode(Base):
+    """One-time code issued by the web/CLI administrator for Bot binding."""
+
+    __tablename__ = "bot_binding_codes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    code_hint: Mapped[str] = mapped_column(String(8))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+
+class BotBinding(Base):
+    """A Telegram private user authorized to operate the management bot."""
+
+    __tablename__ = "bot_bindings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # Historical rows are retained after unbinding, so this cannot be unique;
+    # the active row is selected by ``is_active`` in the data-access methods.
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    bound_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    unbound_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class BotCommandConfig(Base):
+    """Administrator-configurable command menu entry for the management bot."""
+
+    __tablename__ = "bot_command_configs"
+
+    command: Mapped[str] = mapped_column(String(32), primary_key=True)
+    description: Mapped[str] = mapped_column(String(256))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
+
+
+class BotAuditLog(Base):
+    """Security-relevant management bot action without secret payloads."""
+
+    __tablename__ = "bot_audit_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    actor_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    actor_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    action: Mapped[str] = mapped_column(String(50), index=True)
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    task_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    result: Mapped[str] = mapped_column(String(30))
+    update_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, index=True)
 
 
 class Database:
@@ -511,6 +571,144 @@ class Database:
         with self.session() as session:
             session.query(AdminSession).delete(synchronize_session=False)
             session.commit()
+
+    def create_bot_binding_code(
+        self, code_hash: str, code_hint: str, expires_at: datetime
+    ) -> BotBindingCode:
+        now = utc_now()
+        with self.session() as session:
+            session.query(BotBindingCode).filter(
+                BotBindingCode.used_at.is_(None),
+                BotBindingCode.revoked_at.is_(None),
+                BotBindingCode.expires_at > now,
+            ).update({BotBindingCode.revoked_at: now}, synchronize_session=False)
+            item = BotBindingCode(code_hash=code_hash, code_hint=code_hint, expires_at=expires_at)
+            session.add(item)
+            session.commit()
+            session.refresh(item)
+            return item
+
+    def get_bot_binding_code(self, code_id: str) -> BotBindingCode | None:
+        with self.session() as session:
+            return session.get(BotBindingCode, code_id)
+
+    def list_bot_binding_codes(self) -> list[BotBindingCode]:
+        with self.session() as session:
+            return list(
+                session.scalars(select(BotBindingCode).order_by(BotBindingCode.created_at.desc()))
+            )
+
+    def revoke_bot_binding_code(self, code_id: str) -> bool:
+        with self.session() as session:
+            item = session.get(BotBindingCode, code_id)
+            if item is None or item.used_at is not None or item.revoked_at is not None:
+                return False
+            item.revoked_at = utc_now()
+            session.commit()
+            return True
+
+    def consume_bot_binding_code(
+        self,
+        code_hash: str,
+        *,
+        user_id: int,
+        chat_id: int,
+        username: str | None,
+        first_name: str | None,
+        last_name: str | None,
+    ) -> BotBinding | None:
+        now = utc_now()
+        with self.session() as session:
+            item = session.scalar(
+                select(BotBindingCode).where(
+                    BotBindingCode.code_hash == code_hash,
+                    BotBindingCode.used_at.is_(None),
+                    BotBindingCode.revoked_at.is_(None),
+                    BotBindingCode.expires_at > now,
+                )
+            )
+            if item is None:
+                return None
+            item.used_at = now
+            previous = session.scalar(select(BotBinding).where(BotBinding.user_id == user_id))
+            if previous is not None:
+                previous.is_active = False
+                previous.unbound_at = now
+            binding = BotBinding(
+                user_id=user_id,
+                chat_id=chat_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                bound_at=now,
+                is_active=True,
+            )
+            session.add(binding)
+            session.commit()
+            session.refresh(binding)
+            return binding
+
+    def get_bot_binding(self, user_id: int, *, active_only: bool = True) -> BotBinding | None:
+        with self.session() as session:
+            filters: list[Any] = [BotBinding.user_id == user_id]
+            if active_only:
+                filters.append(BotBinding.is_active.is_(True))
+            return session.scalar(select(BotBinding).where(*filters))
+
+    def list_bot_bindings(self, *, active_only: bool = True) -> list[BotBinding]:
+        with self.session() as session:
+            query = select(BotBinding).order_by(BotBinding.bound_at.desc())
+            if active_only:
+                query = query.where(BotBinding.is_active.is_(True))
+            return list(session.scalars(query))
+
+    def revoke_bot_binding(self, binding_id: str) -> bool:
+        with self.session() as session:
+            item = session.get(BotBinding, binding_id)
+            if item is None or not item.is_active:
+                return False
+            item.is_active = False
+            item.unbound_at = utc_now()
+            session.commit()
+            return True
+
+    def list_bot_command_configs(self) -> list[BotCommandConfig]:
+        with self.session() as session:
+            return list(
+                session.scalars(select(BotCommandConfig).order_by(BotCommandConfig.command))
+            )
+
+    def upsert_bot_command_config(
+        self, command: str, description: str, enabled: bool
+    ) -> BotCommandConfig:
+        with self.session() as session:
+            item = session.get(BotCommandConfig, command)
+            if item is None:
+                item = BotCommandConfig(command=command)
+                session.add(item)
+            item.description = description
+            item.enabled = enabled
+            item.updated_at = utc_now()
+            session.commit()
+            session.refresh(item)
+            return item
+
+    def add_bot_audit_log(self, item: BotAuditLog) -> BotAuditLog:
+        with self.session() as session:
+            session.add(item)
+            session.commit()
+            session.refresh(item)
+            return item
+
+    def bot_audit_logs_since(self, since: datetime) -> list[BotAuditLog]:
+        with self.session() as session:
+            return list(
+                session.scalars(
+                    select(BotAuditLog)
+                    .where(BotAuditLog.created_at >= since)
+                    .order_by(BotAuditLog.created_at.desc())
+                )
+            )
 
     def update_task(self, task_id: str, **values) -> Task:
         with self.session() as session:

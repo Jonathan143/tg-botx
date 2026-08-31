@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import OperationalError
 
 from tg_botx.config import Settings
+from tg_botx.features.admin_bot import BotBindingError, TelegramManagementBot
 from tg_botx.features.checkin.runtime import (
     CheckinService,
     ManualRunConflict,
@@ -140,6 +141,12 @@ class EncryptedBody(BaseModel):
 
 class EmptyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class BotCommandBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    description: str | None = Field(default=None, max_length=256)
+    enabled: bool | None = None
 
 
 class MessageProbeBody(BaseModel):
@@ -432,6 +439,8 @@ def _read_log_entries(settings: Settings) -> list[dict[str, Any]]:
         secrets.append(settings.admin_key.get_secret_value())
     if settings.notification_bot_token:
         secrets.append(settings.notification_bot_token.get_secret_value())
+    if settings.admin_bot_token:
+        secrets.append(settings.admin_bot_token.get_secret_value())
     # Oldest backup first, current log last.
     paths = list(reversed(allowed_log_files(settings.log_path, settings.log_backup_count)))
     for path in paths:
@@ -516,6 +525,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     )
     limiter = FailureRateLimiter(max_failures=5, window_seconds=600)
     accounts = LoginFlowManager(settings, database, client_pool=service.pool)
+    admin_bot = TelegramManagementBot(settings, database, service)
     trusted_proxies = [item.strip() for item in settings.trusted_proxies.split(",") if item.strip()]
     try:
         for item in trusted_proxies:
@@ -534,6 +544,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             await service.start()
             started = True
             await service.notifications.service_started()
+            await admin_bot.start()
             rotation_task = asyncio.create_task(keys.rotation_loop(), name="admin-key-rotation")
             logger.info("后台管理 API 已启动")
             yield
@@ -544,6 +555,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                     rotation_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await rotation_task
+                await admin_bot.close()
                 await accounts.close()
                 if started:
                     await service.notifications.service_stopped("管理 API 服务停止")
@@ -565,6 +577,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     app.state.database = database
     app.state.checkin_service = service
     app.state.shutdown_event = shutdown_event
+    app.state.admin_bot = admin_bot
 
     def error_response(request: Request, error: APIError) -> JSONResponse:
         request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
@@ -1367,6 +1380,8 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             secrets.append(settings.admin_key.get_secret_value())
         if settings.notification_bot_token:
             secrets.append(settings.notification_bot_token.get_secret_value())
+        if settings.admin_bot_token:
+            secrets.append(settings.admin_bot_token.get_secret_value())
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in files:
@@ -1382,6 +1397,103 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             media_type="application/zip",
             headers={"Content-Disposition": 'attachment; filename="tg-bot-logs.zip"'},
         )
+
+    @app.post("/api/bot/bindings", status_code=201)
+    async def create_bot_binding(_: EmptyBody) -> dict[str, Any]:
+        code, item = admin_bot.management.create_binding_code()
+        return {
+            "id": item.id,
+            "code": code,
+            "createdAt": _iso(item.created_at),
+            "expiresAt": _iso(item.expires_at),
+        }
+
+    @app.get("/api/bot/bindings")
+    async def list_bot_bindings() -> dict[str, Any]:
+        return {
+            "enabled": settings.bot_enabled,
+            "configured": admin_bot.status.configured,
+            "status": admin_bot.public_status(),
+            "codes": [
+                {
+                    "id": item.id,
+                    "hint": item.hint,
+                    "status": item.status,
+                    "createdAt": _iso(item.created_at),
+                    "expiresAt": _iso(item.expires_at),
+                    "usedAt": _iso(item.used_at),
+                    "revokedAt": _iso(item.revoked_at),
+                }
+                for item in admin_bot.management.binding_codes()
+            ],
+            "bindings": [
+                {
+                    "id": item.id,
+                    "userId": item.user_id,
+                    "chatId": item.chat_id,
+                    "username": item.username,
+                    "firstName": item.first_name,
+                    "lastName": item.last_name,
+                    "boundAt": _iso(item.bound_at),
+                }
+                for item in admin_bot.management.bindings()
+            ],
+        }
+
+    @app.delete("/api/bot/binding-codes/{code_id}", status_code=204)
+    async def revoke_bot_binding_code(code_id: str) -> Response:
+        if not admin_bot.management.revoke_code(code_id):
+            raise APIError("NOT_FOUND", "绑定码不存在或已失效", 404)
+        return Response(status_code=204)
+
+    @app.delete("/api/bot/bindings/{binding_id}", status_code=204)
+    async def revoke_bot_binding(binding_id: str) -> Response:
+        if not admin_bot.management.revoke_binding(binding_id):
+            raise APIError("NOT_FOUND", "绑定关系不存在或已解除", 404)
+        return Response(status_code=204)
+
+    @app.get("/api/bot/commands")
+    async def list_bot_commands() -> dict[str, Any]:
+        try:
+            await admin_bot.sync_remote_commands()
+        except Exception as exc:
+            logger.warning("管理 Bot 读取 Telegram 命令菜单失败 type=%s", type(exc).__name__)
+        return {"commands": admin_bot.command_configs()}
+
+    @app.patch("/api/bot/commands/{command}")
+    @app.put("/api/bot/commands/{command}")
+    async def update_bot_command(command: str, body: BotCommandBody) -> dict[str, Any]:
+        normalized = command.casefold().removeprefix("/")
+        current = next(
+            (
+                item
+                for item in admin_bot.management.command_configs()
+                if item["command"] == normalized
+            ),
+            None,
+        )
+        if current is None:
+            raise APIError("COMMAND_NOT_FOUND", "不支持该管理 Bot 指令", 404)
+        description = (
+            body.description if body.description is not None else current["description"]
+        ).strip()
+        if not description:
+            raise APIError("VALIDATION_FAILED", "指令说明不能为空", 422)
+        enabled = body.enabled if body.enabled is not None else current["enabled"]
+        try:
+            item = admin_bot.management.update_command_config(normalized, description, enabled)
+        except ValueError as exc:
+            raise APIError("VALIDATION_FAILED", str(exc), 422) from exc
+        except BotBindingError as exc:
+            raise APIError("COMMAND_NOT_FOUND", str(exc), 404) from exc
+        try:
+            await admin_bot.refresh_commands()
+        except Exception as exc:
+            # Telegram outages must not turn a successfully persisted local
+            # configuration into an opaque 500 response.
+            logger.warning("管理 Bot 指令菜单同步失败 type=%s", type(exc).__name__)
+            return {**item, "syncWarning": "Telegram 菜单同步失败，服务恢复后会自动重试"}
+        return item
 
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:
@@ -1400,6 +1512,9 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 settings.notification_bot_token
                 and settings.notification_bot_token.get_secret_value().strip()
             ),
+            "adminBotEnabled": settings.bot_enabled,
+            "adminBotConfigured": admin_bot.status.configured,
+            "adminBotStatus": admin_bot.public_status(),
             "notificationTimezone": settings.notification_timezone,
             "logLevel": settings.log_level,
             "logFile": settings.log_file,

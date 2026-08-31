@@ -25,11 +25,18 @@ class Settings(BaseSettings):
     # Timezone used when formatting notification timestamps that are not tied
     # to a task schedule (service lifecycle and fatal-error events).
     notification_timezone: str = Field(default="Asia/Shanghai")
+    # Service start/stop messages are noisy during local development (especially
+    # when ``serve --reload`` restarts the worker).  Keep them independently
+    # configurable so task result and error notifications remain available.
+    service_lifecycle_notifications_enabled: bool = Field(default=True)
     log_level: str = Field(default="INFO")
     log_file: str = Field(default="tg-bot.log")
     log_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     log_backup_count: int = Field(default=5, ge=0)
     admin_key: SecretStr | None = Field(default=None)
+    # Separate Telegram Bot API credential for the interactive management bot.
+    # ``admin_key`` remains exclusively the web/API administrator secret.
+    admin_bot_token: SecretStr | None = Field(default=None)
     admin_origin: str | None = Field(default=None)
     admin_session_days: int = Field(default=30, ge=1, le=365)
     api_host: str = Field(default="0.0.0.0")

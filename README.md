@@ -158,14 +158,32 @@ TG_BOT_NOTIFICATION_BOT_TOKEN=replace-with-bot-token
 TG_BOT_ADMIN_CHAT_IDS=123456789
 # 服务启动/停止等通知的默认时间展示时区；任务结果通知优先使用任务 schedule.timezone
 TG_BOT_NOTIFICATION_TIMEZONE=Asia/Shanghai
+# 开发环境可关闭服务启动/停止通知（不影响任务结果和致命异常通知）
+TG_BOT_SERVICE_LIFECYCLE_NOTIFICATIONS_ENABLED=false
 ```
+
+### Telegram 管理 Bot
+
+交互式任务管理 Bot 使用独立的 BotFather Token，不要将它与后台 API 密钥
+`TG_BOT_ADMIN_KEY` 混用：
+
+```text
+TG_BOT_ADMIN_BOT_TOKEN=replace-with-management-bot-token
+TG_BOT_BOT_ENABLED=true
+```
+
+启用后 Bot 通过长轮询运行在 `serve` 进程中，仅接受私聊。管理员在 Web 后台“设置”页生成
+一次性绑定码，也可以使用 `tg-bot bot binding create`，然后在 Bot 中发送
+`/bind ABCD-EFGH-IJKL`。绑定成功后可使用 `/tasks` 分页查看、启用、停用和手动执行任务，
+使用 `/status` 查看脱敏系统状态。绑定码默认 10 分钟有效且只能使用一次；后台可撤销绑定。
 
 管理员必须先在 Telegram 中打开该机器人并发送 `/start`，否则机器人不能主动发起私聊。通知只发送到
 `TG_BOT_ADMIN_CHAT_IDS` 中的第一个 chat ID；未配置 Token 或管理员 chat ID 时，通知功能保持禁用并记录警告，
 不会影响签到任务执行。
 
 机器人通知包括任务最终成功或失败、取消请求与实际取消、忙碌跳过，以及 `serve` 常驻服务的启动、
-SIGINT/SIGTERM 优雅停止和可捕获的致命异常。投递发生网络错误、限流或服务端错误时最多重试 3 次；
+SIGINT/SIGTERM 优雅停止和可捕获的致命异常。通过 `TG_BOT_SERVICE_LIFECYCLE_NOTIFICATIONS_ENABLED=false`
+可关闭服务启动/停止通知（适合开发环境），不影响任务和致命异常通知。投递发生网络错误、限流或服务端错误时最多重试 3 次；
 最终投递失败只写日志，不改变签到任务结果。通知使用图标区分状态，任务事件按任务时区显示，服务事件使用
 `TG_BOT_NOTIFICATION_TIMEZONE`（默认 `Asia/Shanghai`）。开启 `notify_bot_response` 后，通知会附带最后一次机器人回复；
 日志对应使用 `log_bot_response`，两者默认关闭并继续执行敏感信息脱敏。
