@@ -702,7 +702,12 @@ class CheckinService:
     def _ensure_next_run(self, task: Task) -> None:
         now = datetime.now(UTC)
         if task.next_run_at is None or task.next_run_at <= now:
-            next_run = next_run_for(schedule_from_task(task), now=now)
+            try:
+                next_run = next_run_for(schedule_from_task(task), now=now)
+            except ValueError:
+                self.database.update_task(task.id, next_run_at=None)
+                self._remove_scheduled_task(task.id)
+                return
             self.database.update_task(task.id, next_run_at=next_run)
             task.next_run_at = next_run
             self._publish_task_updated(task.id)
@@ -736,6 +741,10 @@ class CheckinService:
     @staticmethod
     def _task_from_definition(account: Account, definition: TaskDefinition) -> Task:
         schedule = definition.schedule
+        if schedule.start_date is None:
+            local_today = utc_now().astimezone(ZoneInfo(schedule.timezone)).date()
+            schedule = schedule.model_copy(update={"start_date": local_today})
+            definition = definition.model_copy(update={"schedule": schedule})
         return Task(
             account_id=account.id,
             name=definition.name,
@@ -774,7 +783,17 @@ class CheckinService:
             raise AccountNotFoundError("任务绑定的账号不存在")
 
         schedule = definition.schedule
-        next_run = next_run_for(schedule, now=utc_now()) if task.enabled else None
+        if schedule.start_date is None:
+            local_today = utc_now().astimezone(ZoneInfo(schedule.timezone)).date()
+            schedule = schedule.model_copy(update={"start_date": local_today})
+            definition = definition.model_copy(update={"schedule": schedule})
+        if task.enabled:
+            try:
+                next_run = next_run_for(schedule, now=utc_now())
+            except ValueError as exc:
+                raise TaskStateError("调度规则没有可执行的未来时间") from exc
+        else:
+            next_run = None
         updated = self.database.update_task(
             task.id,
             account_id=account.id,
@@ -836,7 +855,10 @@ class CheckinService:
             raise TaskStateError("归档任务需先恢复后才能启用")
         if self.database.get_latest_workflow_version(task.id) is None:
             raise TaskStateError("请先发布工作流后再启用任务")
-        next_run = next_run_for(schedule_from_task(task), now=utc_now())
+        try:
+            next_run = next_run_for(schedule_from_task(task), now=utc_now())
+        except ValueError as exc:
+            raise TaskStateError("调度规则没有可执行的未来时间") from exc
         updated = self.database.update_task(task.id, enabled=True, next_run_at=next_run)
         self._bump_task_revision(task.id)
         self._sync_schedule(updated)
@@ -1000,7 +1022,10 @@ class CheckinService:
             and self._task_revisions.get(snapshot.id, 0) == revision
             and self._definition_unchanged(snapshot, current)
         ):
-            values["next_run_at"] = next_run_for(schedule_from_task(current), now=finished)
+            try:
+                values["next_run_at"] = next_run_for(schedule_from_task(current), now=finished)
+            except ValueError:
+                values["next_run_at"] = None
         updated = self.database.update_task(current.id, **values)
         self._sync_schedule(updated)
         self._publish_task_updated(current.id)

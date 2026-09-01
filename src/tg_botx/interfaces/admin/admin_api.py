@@ -34,6 +34,7 @@ from tg_botx.features.checkin.runtime import (
     TaskNotFound,
     TaskStateError,
 )
+from tg_botx.features.checkin.schedule import next_runs, schedule_from_task
 from tg_botx.infrastructure.observability.logging import allowed_log_files, redact_sensitive
 from tg_botx.infrastructure.persistence.db import (
     Database,
@@ -198,11 +199,7 @@ def _task_json(task: Task, database: Database, service: CheckinService) -> dict[
         for log in run.get("logs", []):
             if isinstance(log.get("message"), str):
                 log["message"] = redact_sensitive(log["message"])
-    schedule: dict[str, Any] = {"type": task.schedule_type, "timezone": task.timezone}
-    if task.schedule_type == "fixed":
-        schedule["time"] = task.fixed_time
-    else:
-        schedule.update({"start": task.random_start, "end": task.random_end})
+    schedule = schedule_from_task(task).model_dump(mode="json", exclude_none=True)
     versions = database.list_workflow_versions(task.id)
     latest_version = versions[0] if versions else None
     return {
@@ -867,6 +864,28 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         return {
             "valid": True,
             "definition": body.definition.to_api_dict(),
+        }
+
+    @app.post("/api/tasks/preview")
+    async def preview_task(body: TaskBody) -> dict[str, Any]:
+        schedule = body.definition.schedule
+        runs = next_runs(schedule, now=utc_now(), count=5)
+        return {
+            "items": [_iso(item) for item in runs],
+            "timezone": schedule.timezone,
+        }
+
+    @app.post("/api/tasks/{task_id}/preview")
+    async def preview_existing_task(task_id: str, body: TaskBody) -> dict[str, Any]:
+        task = database.get_task_any(task_id)
+        if not task:
+            raise APIError("NOT_FOUND", "任务不存在", 404)
+        schedule = body.definition.schedule
+        start_after = task.next_run_at - timedelta(microseconds=1) if task.next_run_at else None
+        runs = next_runs(schedule, now=utc_now(), count=5, start_after=start_after)
+        return {
+            "items": [_iso(item) for item in runs],
+            "timezone": schedule.timezone,
         }
 
     @app.get("/api/tasks/{task_id}")

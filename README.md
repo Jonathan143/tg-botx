@@ -235,6 +235,23 @@ TG_BOT_GROUP_MONITOR_HISTORY_LIMIT=500
 YAML 与管理 API 中的任务定义统一使用 `snake_case` 字段名，例如
 `max_attempts`、`timeout_seconds`、`text_contains` 和 `callback_data`，不接受 camelCase 别名。
 
+调度支持固定时间或随机窗口，并可通过 `frequency` 自定义执行维度。未配置 `frequency` 的旧任务按每日执行：
+
+```yaml
+schedule:
+  type: fixed
+  timezone: Asia/Shanghai
+  time: "10:40:00"
+  frequency: weekly        # daily / every_n_days / weekly / monthly_dates
+  start_date: "2026-09-01"
+  weekdays: [1, 3]          # weekly 时使用，ISO 周一=1
+  # interval_days: 2        # every_n_days 时使用（1–365）
+  # month_days: [1, 2, 10]  # monthly_dates 时使用（1–31）
+  # end_date: "2026-12-31" # 可选，结束日包含当天
+```
+
+管理后台的调度表单会在保存前预览后续 5 次执行时间；预览按任务时区计算且不会改变任务状态。
+
 可在任务中分别控制失败和成功通知。未配置 `notifications` 时默认仅发送失败通知：
 
 ```yaml
