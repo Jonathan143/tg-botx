@@ -266,6 +266,10 @@ class BotCommandConfig(Base):
     command: Mapped[str] = mapped_column(String(32), primary_key=True)
     description: Mapped[str] = mapped_column(String(256))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # JSON array of identities allowed to invoke this command.  ``NULL`` is
+    # retained for rows created before command-level authorization existed;
+    # the management service supplies the appropriate default in that case.
+    allowed_roles_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
 
 
@@ -359,6 +363,15 @@ class Database:
             with self.engine.begin() as connection:
                 connection.exec_driver_sql(
                     "ALTER TABLE tasks ADD COLUMN published_schedule_json TEXT"
+                )
+
+        command_columns = {
+            item["name"] for item in inspect(self.engine).get_columns("bot_command_configs")
+        }
+        if "allowed_roles_json" not in command_columns:
+            with self.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "ALTER TABLE bot_command_configs ADD COLUMN allowed_roles_json TEXT"
                 )
         with self.session() as session:
             if session.get(SchemaVersion, 2) is None:
@@ -789,7 +802,11 @@ class Database:
             )
 
     def upsert_bot_command_config(
-        self, command: str, description: str, enabled: bool
+        self,
+        command: str,
+        description: str,
+        enabled: bool,
+        allowed_roles_json: str | None = None,
     ) -> BotCommandConfig:
         with self.session() as session:
             item = session.get(BotCommandConfig, command)
@@ -798,6 +815,8 @@ class Database:
                 session.add(item)
             item.description = description
             item.enabled = enabled
+            if allowed_roles_json is not None:
+                item.allowed_roles_json = allowed_roles_json
             item.updated_at = utc_now()
             session.commit()
             session.refresh(item)

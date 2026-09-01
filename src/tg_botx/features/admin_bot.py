@@ -51,6 +51,15 @@ DEFAULT_BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("tasks", "查看任务列表"),
     ("status", "查看系统状态"),
 )
+_ALL_COMMAND_ROLES = ("anonymous", "user", "admin")
+_DEFAULT_COMMAND_ROLES: dict[str, tuple[str, ...]] = {
+    "start": _ALL_COMMAND_ROLES,
+    "help": _ALL_COMMAND_ROLES,
+    "bind": _ALL_COMMAND_ROLES,
+    "unbind": ("user", "admin"),
+    "tasks": ("user", "admin"),
+    "status": ("user", "admin"),
+}
 _COMMAND_NAME_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
@@ -182,6 +191,7 @@ class BotManagementService:
                     "command": command,
                     "description": item.description if item is not None else default_description,
                     "enabled": item.enabled if item is not None else True,
+                    "allowedRoles": self._item_roles(command, item),
                 }
             )
         default_names = {command for command, _ in DEFAULT_BOT_COMMANDS}
@@ -190,6 +200,7 @@ class BotManagementService:
                 "command": item.command,
                 "description": item.description,
                 "enabled": item.enabled,
+                "allowedRoles": self._item_roles(item.command, item),
             }
             for item in stored.values()
             if item.command not in default_names and _COMMAND_NAME_PATTERN.fullmatch(item.command)
@@ -197,12 +208,49 @@ class BotManagementService:
         return configs
 
     def update_command_config(
-        self, command: str, description: str, enabled: bool
+        self,
+        command: str,
+        description: str,
+        enabled: bool,
+        allowed_roles: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         if not _COMMAND_NAME_PATTERN.fullmatch(command):
             raise BotBindingError("不支持该管理 Bot 指令")
-        item = self.database.upsert_bot_command_config(command, description, enabled)
-        return {"command": item.command, "description": item.description, "enabled": item.enabled}
+        current = next(
+            (item for item in self.database.list_bot_command_configs() if item.command == command),
+            None,
+        )
+        roles = self._normalize_roles(
+            allowed_roles if allowed_roles is not None else self._item_roles(command, current)
+        )
+        item = self.database.upsert_bot_command_config(
+            command, description, enabled, json.dumps(roles, ensure_ascii=False)
+        )
+        return {
+            "command": item.command,
+            "description": item.description,
+            "enabled": item.enabled,
+            "allowedRoles": roles,
+        }
+
+    @staticmethod
+    def _normalize_roles(value: object) -> list[str]:
+        if not isinstance(value, (list, tuple, set)):
+            raise BotBindingError("可调用身份配置无效")
+        roles = list(dict.fromkeys(value))
+        if not roles or any(role not in _ALL_COMMAND_ROLES for role in roles):
+            raise BotBindingError("可调用身份至少选择一项，且只能选择未绑定用户、普通用户或管理员")
+        return [str(role) for role in _ALL_COMMAND_ROLES if role in roles]
+
+    @classmethod
+    def _item_roles(cls, command: str, item: Any) -> list[str]:
+        raw = getattr(item, "allowed_roles_json", None) if item is not None else None
+        if isinstance(raw, str):
+            try:
+                return cls._normalize_roles(json.loads(raw))
+            except (ValueError, TypeError, json.JSONDecodeError, BotBindingError):
+                pass
+        return list(_DEFAULT_COMMAND_ROLES.get(command, ("user", "admin")))
 
     def delete_command_config(self, command: str) -> bool:
         """Delete a command from the persisted menu.
@@ -502,10 +550,13 @@ class TelegramManagementBot:
         ):
             await self._send(chat_id, "该命令当前已停用，请联系管理员。")
             return
+        if not self._command_allowed(user_id, chat_id, canonical_command, update_number):
+            await self._send(chat_id, "你没有权限调用该命令。")
+            return
         if command == "start":
             await self._send(chat_id, self._welcome(user_id, chat_id))
         elif command == "help":
-            await self._send(chat_id, self._help())
+            await self._send(chat_id, self._help(user_id, chat_id))
         elif command == "bind":
             await self._bind(chat_id, user_id, user, argument, update_number)
         elif command == "unbind":
@@ -514,11 +565,9 @@ class TelegramManagementBot:
             else:
                 await self._send(chat_id, "当前没有可解除的绑定。")
         elif canonical_command == "tasks":
-            if self._authorized(user_id, chat_id, update_number, "list_tasks"):
-                await self._send_tasks(chat_id, 1)
+            await self._send_tasks(chat_id, 1)
         elif command == "status":
-            if self._authorized(user_id, chat_id, update_number, "status"):
-                await self._send(chat_id, self._system_status())
+            await self._send(chat_id, self._system_status())
         else:
             await self._send(chat_id, "无法识别该命令，请发送 /help 查看可用命令。")
 
@@ -564,13 +613,14 @@ class TelegramManagementBot:
             if user_id is None or chat_id is None:
                 return
             update_number = update_id if isinstance(update_id, int) else None
-            if not self._authorized(user_id, chat_id, update_number, "callback"):
+            parts = data.split(":")
+            command = "tasks" if parts and parts[0] in {"tasks", "task", "back", "ask", "do"} else None
+            if command is None or not self._command_allowed(user_id, chat_id, command, update_number):
                 if self.client:
-                    await self.client.answer_callback(callback_id, "请先绑定管理权限")
+                    await self.client.answer_callback(callback_id, "你没有权限调用该命令")
                 return
             if self.client:
                 await self.client.answer_callback(callback_id)
-            parts = data.split(":")
             if len(parts) == 2 and parts[0] == "tasks":
                 await self._edit_tasks(chat_id, message_id, self._page(parts[1]))
             elif len(parts) == 2 and parts[0] == "task":
@@ -590,6 +640,18 @@ class TelegramManagementBot:
         allowed = self.management.is_bound(user_id, chat_id)
         if not allowed:
             self.management.audit(user_id, chat_id, action, "denied", update_id=update_id)
+        return allowed
+
+    def _command_allowed(
+        self, user_id: int, chat_id: int, command: str, update_id: int | None
+    ) -> bool:
+        role = self.management.binding_role(user_id, chat_id) or "anonymous"
+        config = next(
+            (item for item in self.command_configs() if item["command"] == command), None
+        )
+        allowed = bool(config and config.get("enabled") and role in config.get("allowedRoles", []))
+        if not allowed:
+            self.management.audit(user_id, chat_id, command, "denied", update_id=update_id)
         return allowed
 
     async def _send_tasks(self, chat_id: int, page: int) -> None:
@@ -744,7 +806,12 @@ class TelegramManagementBot:
 
     def _welcome(self, user_id: int, chat_id: int) -> str:
         if self.management.is_bound(user_id, chat_id):
-            available = {item["command"] for item in self.command_configs() if item["enabled"]}
+            role = self.management.binding_role(user_id, chat_id) or "anonymous"
+            available = {
+                item["command"]
+                for item in self.command_configs()
+                if item["enabled"] and role in item.get("allowedRoles", [])
+            }
             actions = []
             if "tasks" in available:
                 actions.append("发送 /tasks 查看任务")
@@ -755,10 +822,15 @@ class TelegramManagementBot:
             return f"👋 你已绑定{role_label}身份。{suffix}"
         return "👋 欢迎使用 tg-bot 管理 Bot。\n\n请使用后台生成的绑定码发送：\n<code>/bind ABCD-EFGH-IJKL</code>"
 
-    def _help(self) -> str:
+    def _help(self, user_id: int | None = None, chat_id: int | None = None) -> str:
         lines = ["<b>tg-bot 管理 Bot</b>"]
+        role = (
+            self.management.binding_role(user_id, chat_id) or "anonymous"
+            if user_id is not None and chat_id is not None
+            else None
+        )
         for item in self.command_configs():
-            if item["enabled"]:
+            if item["enabled"] and (role is None or role in item.get("allowedRoles", [])):
                 lines.append(f"/{item['command']} {html.escape(item['description'])}")
         return "\n\n".join(lines)
 
