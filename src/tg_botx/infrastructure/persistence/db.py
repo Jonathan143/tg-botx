@@ -25,6 +25,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from tg_botx.core.time import utc_isoformat
 
+PERMANENT_EXPIRY = datetime.max.replace(tzinfo=timezone.utc)
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -68,6 +70,12 @@ class UTCDateTime(TypeDecorator[datetime]):
 
 class Base(DeclarativeBase):
     pass
+
+
+class SchemaVersion(Base):
+    __tablename__ = "schema_version"
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class Account(Base):
@@ -209,8 +217,9 @@ class BotBindingCode(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     code_hint: Mapped[str] = mapped_column(String(8))
+    role: Mapped[str] = mapped_column(String(20), default="user", server_default="user")
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
-    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True, nullable=True)
     used_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
@@ -225,12 +234,28 @@ class BotBinding(Base):
     # the active row is selected by ``is_active`` in the data-access methods.
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    role: Mapped[str] = mapped_column(String(20), default="user", server_default="user")
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     bound_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
     unbound_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class BotBindingBatch(Base):
+    """Persistent idempotency record for generated binding-code batches."""
+
+    __tablename__ = "bot_binding_batches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    role: Mapped[str] = mapped_column(String(20), default="user", server_default="user")
+    quantity: Mapped[int] = mapped_column(Integer)
+    ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    code_ids_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class BotCommandConfig(Base):
@@ -291,6 +316,15 @@ class Database:
 
     def create_all(self) -> None:
         Base.metadata.create_all(self.engine)
+        # Binding role/idempotency schema migration for existing databases.
+        for table, column, ddl in (
+            ("bot_binding_codes", "role", "VARCHAR(20) DEFAULT 'user'"),
+            ("bot_bindings", "role", "VARCHAR(20) DEFAULT 'user'"),
+        ):
+            columns = {item["name"] for item in inspect(self.engine).get_columns(table)}
+            if column not in columns:
+                with self.engine.begin() as connection:
+                    connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         # Keep the local development database usable after the destructive
         # version-model change.  New installations are created from metadata;
         # existing tables receive only the new nullable columns.
@@ -326,6 +360,10 @@ class Database:
                 connection.exec_driver_sql(
                     "ALTER TABLE tasks ADD COLUMN published_schedule_json TEXT"
                 )
+        with self.session() as session:
+            if session.get(SchemaVersion, 2) is None:
+                session.add(SchemaVersion(version=2))
+                session.commit()
 
     def session(self) -> Session:
         return self.Session()
@@ -584,20 +622,62 @@ class Database:
             session.commit()
 
     def create_bot_binding_code(
-        self, code_hash: str, code_hint: str, expires_at: datetime
+        self, code_hash: str, code_hint: str, expires_at: datetime | None, role: str = "user"
     ) -> BotBindingCode:
-        now = utc_now()
         with self.session() as session:
-            session.query(BotBindingCode).filter(
-                BotBindingCode.used_at.is_(None),
-                BotBindingCode.revoked_at.is_(None),
-                BotBindingCode.expires_at > now,
-            ).update({BotBindingCode.revoked_at: now}, synchronize_session=False)
-            item = BotBindingCode(code_hash=code_hash, code_hint=code_hint, expires_at=expires_at)
+            stored_expiry = expires_at
+            if stored_expiry is None and session.bind is not None and session.bind.dialect.name == "sqlite":
+                stored_expiry = PERMANENT_EXPIRY
+            item = BotBindingCode(code_hash=code_hash, code_hint=code_hint, expires_at=stored_expiry, role=role)
             session.add(item)
             session.commit()
             session.refresh(item)
             return item
+
+    def create_bot_binding_codes(
+        self, items: list[tuple[str, str, datetime | None, str]], *,
+        idempotency_key: str | None = None, request_hash: str | None = None,
+        ttl_days: int | None = None,
+    ) -> tuple[BotBindingBatch | None, list[BotBindingCode]]:
+        with self.session() as session:
+            if idempotency_key:
+                existing = session.scalar(select(BotBindingBatch).where(BotBindingBatch.idempotency_key == idempotency_key))
+                if existing:
+                    if existing.request_hash != request_hash:
+                        raise ValueError("IDEMPOTENCY_CONFLICT")
+                    ids = json.loads(existing.code_ids_json)
+                    codes = list(session.scalars(select(BotBindingCode).where(BotBindingCode.id.in_(ids))))
+                    return existing, sorted(codes, key=lambda item: ids.index(item.id))
+            codes = []
+            for code_hash, hint, expires_at, role in items:
+                # Legacy SQLite schemas declared expires_at NOT NULL; use a
+                # far-future sentinel there while exposing permanent as null
+                # at the API boundary.
+                stored_expiry = expires_at
+                if stored_expiry is None and session.bind is not None and session.bind.dialect.name == "sqlite":
+                    stored_expiry = PERMANENT_EXPIRY
+                item = BotBindingCode(code_hash=code_hash, code_hint=hint, expires_at=stored_expiry, role=role)
+                session.add(item)
+                codes.append(item)
+            session.flush()
+            batch = None
+            if idempotency_key:
+                batch = BotBindingBatch(
+                    idempotency_key=idempotency_key, request_hash=request_hash or "",
+                    role=items[0][3] if items else "user", quantity=len(items), ttl_days=ttl_days,
+                    code_ids_json=json.dumps([item.id for item in codes]),
+                )
+                session.add(batch)
+            session.commit()
+            for item in codes:
+                session.refresh(item)
+            if batch:
+                session.refresh(batch)
+            return batch, codes
+
+    def get_bot_binding_batch(self, idempotency_key: str) -> BotBindingBatch | None:
+        with self.session() as session:
+            return session.scalar(select(BotBindingBatch).where(BotBindingBatch.idempotency_key == idempotency_key))
 
     def get_bot_binding_code(self, code_id: str) -> BotBindingCode | None:
         with self.session() as session:
@@ -608,6 +688,13 @@ class Database:
             return list(
                 session.scalars(select(BotBindingCode).order_by(BotBindingCode.created_at.desc()))
             )
+
+    def list_bot_binding_codes_page(self, *, page: int, page_size: int) -> tuple[list[BotBindingCode], int]:
+        with self.session() as session:
+            base = select(BotBindingCode).order_by(BotBindingCode.created_at.desc())
+            items = list(session.scalars(base.offset((page - 1) * page_size).limit(page_size)))
+            total = session.scalar(select(func.count()).select_from(BotBindingCode)) or 0
+            return items, total
 
     def revoke_bot_binding_code(self, code_id: str) -> bool:
         with self.session() as session:
@@ -635,22 +722,22 @@ class Database:
                     BotBindingCode.code_hash == code_hash,
                     BotBindingCode.used_at.is_(None),
                     BotBindingCode.revoked_at.is_(None),
-                    BotBindingCode.expires_at > now,
+                    or_(BotBindingCode.expires_at.is_(None), BotBindingCode.expires_at > now),
                 )
             )
             if item is None:
                 return None
-            item.used_at = now
-            previous = session.scalar(select(BotBinding).where(BotBinding.user_id == user_id))
+            previous = session.scalar(select(BotBinding).where(BotBinding.user_id == user_id, BotBinding.is_active.is_(True)))
             if previous is not None:
-                previous.is_active = False
-                previous.unbound_at = now
+                return None
+            item.used_at = now
             binding = BotBinding(
                 user_id=user_id,
                 chat_id=chat_id,
                 username=username,
                 first_name=first_name,
                 last_name=last_name,
+                role=item.role or "user",
                 bound_at=now,
                 is_active=True,
             )
@@ -672,6 +759,18 @@ class Database:
             if active_only:
                 query = query.where(BotBinding.is_active.is_(True))
             return list(session.scalars(query))
+
+    def list_bot_bindings_page(self, *, page: int, page_size: int, active_only: bool = True) -> tuple[list[BotBinding], int]:
+        with self.session() as session:
+            query = select(BotBinding)
+            count_query = select(func.count()).select_from(BotBinding)
+            if active_only:
+                query = query.where(BotBinding.is_active.is_(True))
+                count_query = count_query.where(BotBinding.is_active.is_(True))
+            query = query.order_by(BotBinding.bound_at.desc())
+            items = list(session.scalars(query.offset((page - 1) * page_size).limit(page_size)))
+            total = session.scalar(count_query) or 0
+            return items, total
 
     def revoke_bot_binding(self, binding_id: str) -> bool:
         with self.session() as session:

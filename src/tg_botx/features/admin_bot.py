@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import json
 import logging
 import re
 import secrets
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -69,17 +71,18 @@ class BindingCodeView:
     id: str
     hint: str
     created_at: datetime
-    expires_at: datetime
+    expires_at: datetime | None
+    role: str
     used_at: datetime | None
     revoked_at: datetime | None
 
     @property
     def status(self) -> str:
-        if self.used_at is not None:
-            return "used"
         if self.revoked_at is not None:
             return "revoked"
-        if self.expires_at <= utc_now():
+        if self.used_at is not None:
+            return "used"
+        if self.expires_at is not None and self.expires_at <= utc_now():
             return "expired"
         return "active"
 
@@ -91,7 +94,7 @@ class BotManagementService:
         self.database = database
         self.checkin = checkin
 
-    def create_binding_code(self) -> tuple[str, BotBindingCode]:
+    def _generate_code(self, role: str, expires_at: datetime | None) -> tuple[str, BotBindingCode]:
         raw = "".join(
             secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_GROUP_LENGTH * _CODE_GROUPS)
         )
@@ -102,9 +105,39 @@ class BotManagementService:
         item = self.database.create_bot_binding_code(
             hash_binding_code(raw),
             formatted[-4:],
-            utc_now() + _BINDING_CODE_TTL,
+            expires_at,
+            role,
         )
         return formatted, item
+
+    def create_binding_code(self) -> tuple[str, BotBindingCode]:
+        return self._generate_code("user", utc_now() + _BINDING_CODE_TTL)
+
+    def create_binding_codes(
+        self, quantity: int, ttl_days: int | None, *, role: str = "user", idempotency_key: str | None = None
+    ) -> tuple[str, list[tuple[str, BotBindingCode]]]:
+        if role not in {"user", "admin"}:
+            raise BotBindingError("不支持的绑定身份")
+        if quantity < 1 or quantity > 100:
+            raise BotBindingError("一次最多生成 100 个绑定码")
+        if ttl_days not in {1, 7, 30, None}:
+            raise BotBindingError("绑定码有效期无效")
+        now = utc_now()
+        expires_at = None if ttl_days is None else now + timedelta(days=ttl_days)
+        generated: list[tuple[str, str, datetime | None, str]] = []
+        plain: list[str] = []
+        for _ in range(quantity):
+            raw = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_GROUP_LENGTH * _CODE_GROUPS))
+            formatted = "-".join(raw[index:index + _CODE_GROUP_LENGTH] for index in range(0, len(raw), _CODE_GROUP_LENGTH))
+            plain.append(formatted)
+            generated.append((hash_binding_code(raw), formatted[-4:], expires_at, role))
+        request_hash = hashlib.sha256(json.dumps({"role": role, "quantity": quantity, "ttlDays": ttl_days}, sort_keys=True).encode()).hexdigest()
+        replay = bool(idempotency_key and self.database.get_bot_binding_batch(idempotency_key))
+        batch, items = self.database.create_bot_binding_codes(generated, idempotency_key=idempotency_key, request_hash=request_hash, ttl_days=ttl_days)
+        if replay:
+            # Idempotent replay cannot recover plaintext; return masked values rather than secrets.
+            plain = [f"****-****-****" for _ in items]
+        return batch.id if batch else str(uuid.uuid4()), list(zip(plain, items))
 
     def binding_codes(self) -> list[BindingCodeView]:
         return [
@@ -113,6 +146,7 @@ class BotManagementService:
                 item.code_hint,
                 item.created_at,
                 item.expires_at,
+                item.role or "user",
                 item.used_at,
                 item.revoked_at,
             )
@@ -121,6 +155,16 @@ class BotManagementService:
 
     def bindings(self) -> list[BotBinding]:
         return self.database.list_bot_bindings()
+
+    def binding_codes_page(self, *, page: int, page_size: int) -> tuple[list[BindingCodeView], int]:
+        items, total = self.database.list_bot_binding_codes_page(page=page, page_size=page_size)
+        return [
+            BindingCodeView(item.id, item.code_hint, item.created_at, item.expires_at, item.role or "user", item.used_at, item.revoked_at)
+            for item in items
+        ], total
+
+    def bindings_page(self, *, page: int, page_size: int) -> tuple[list[BotBinding], int]:
+        return self.database.list_bot_bindings_page(page=page, page_size=page_size)
 
     def revoke_code(self, code_id: str) -> bool:
         return self.database.revoke_bot_binding_code(code_id)
@@ -186,6 +230,8 @@ class BotManagementService:
         normalized = normalize_binding_code(code)
         if len(normalized) != _CODE_GROUP_LENGTH * _CODE_GROUPS:
             raise BotBindingError("绑定码格式无效")
+        if self.database.get_bot_binding(user_id) is not None:
+            raise BotBindingError("该用户已绑定，请先解除现有绑定")
         binding = self.database.consume_bot_binding_code(
             hash_binding_code(normalized),
             user_id=user_id,
@@ -210,6 +256,15 @@ class BotManagementService:
     def is_bound(self, user_id: int, chat_id: int) -> bool:
         binding = self.database.get_bot_binding(user_id)
         return binding is not None and binding.chat_id == chat_id
+
+    def binding_role(self, user_id: int, chat_id: int) -> str | None:
+        binding = self.database.get_bot_binding(user_id)
+        if binding is None or binding.chat_id != chat_id:
+            return None
+        return binding.role or "user"
+
+    def is_admin(self, user_id: int, chat_id: int) -> bool:
+        return self.binding_role(user_id, chat_id) == "admin"
 
     def audit(
         self,
@@ -636,6 +691,8 @@ class TelegramManagementBot:
         update_id: int | None,
     ) -> None:
         try:
+            if not self.management.is_admin(user_id, chat_id):
+                raise BotBindingError("需要管理员权限才能执行此操作")
             if int(expires) < int(time.time()):
                 raise BotBindingError("确认按钮已过期，请重新点击操作")
             task = self.database.get_task_any(task_id)
@@ -694,7 +751,8 @@ class TelegramManagementBot:
             if "status" in available:
                 actions.append("发送 /status 查看系统状态")
             suffix = "\n\n" + "，".join(actions) + "。" if actions else ""
-            return f"👋 你已绑定管理权限。{suffix}"
+            role_label = "管理员" if self.management.is_admin(user_id, chat_id) else "普通用户"
+            return f"👋 你已绑定{role_label}身份。{suffix}"
         return "👋 欢迎使用 tg-bot 管理 Bot。\n\n请使用后台生成的绑定码发送：\n<code>/bind ABCD-EFGH-IJKL</code>"
 
     def _help(self) -> str:

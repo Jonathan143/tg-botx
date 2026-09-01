@@ -144,6 +144,18 @@ class EmptyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class BotBindingBatchBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["user"] = "user"
+    quantity: int = Field(default=1, ge=1, le=100)
+    ttl_days: int | None = Field(default=1, alias="ttlDays")
+
+
+class BotAdminBindingBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ttl_days: int | None = Field(default=1, alias="ttlDays")
+
+
 class BotCommandBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     description: str | None = Field(default=None, max_length=256)
@@ -1420,15 +1432,57 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     @app.post("/api/bot/bindings", status_code=201)
     async def create_bot_binding(_: EmptyBody) -> dict[str, Any]:
         code, item = admin_bot.management.create_binding_code()
+        admin_bot.management.audit(None, None, "binding_code_create", "success", details=json.dumps({"role": "user", "quantity": 1, "ttlDays": 0}, ensure_ascii=False))
         return {
             "id": item.id,
             "code": code,
             "createdAt": _iso(item.created_at),
-            "expiresAt": _iso(item.expires_at),
+            "expiresAt": None if item.expires_at is not None and item.expires_at.year >= 9999 else _iso(item.expires_at),
+            "role": item.role or "user",
         }
 
+    @app.post("/api/bot/binding-codes/batch", status_code=201)
+    async def create_bot_binding_batch(request: Request, body: BotBindingBatchBody) -> dict[str, Any]:
+        key = request.headers.get("Idempotency-Key")
+        try:
+            batch_id, generated = admin_bot.management.create_binding_codes(
+                body.quantity, body.ttl_days, role=body.role, idempotency_key=key
+            )
+        except ValueError as exc:
+            if str(exc) == "IDEMPOTENCY_CONFLICT":
+                raise APIError("IDEMPOTENCY_CONFLICT", "幂等键已用于其他请求", 409) from exc
+            raise APIError("VALIDATION_FAILED", "绑定码参数无效", 400) from exc
+        except BotBindingError as exc:
+            raise APIError("VALIDATION_FAILED", str(exc), 400) from exc
+        admin_bot.management.audit(None, None, "binding_code_batch_create", "success", details=json.dumps({"role": body.role, "batchId": batch_id, "quantity": body.quantity, "ttlDays": body.ttl_days}, ensure_ascii=False))
+        return {
+            "batchId": batch_id,
+            "codes": [
+                {"id": item.id, "code": code, "hint": item.code_hint, "role": item.role or body.role,
+                 "createdAt": _iso(item.created_at), "expiresAt": None if item.expires_at is not None and item.expires_at.year >= 9999 else _iso(item.expires_at)}
+                for code, item in generated
+            ],
+        }
+
+    @app.post("/api/bot/binding-codes/admin", status_code=201)
+    async def create_admin_bot_binding(request: Request, body: BotAdminBindingBody) -> dict[str, Any]:
+        try:
+            batch_id, generated = admin_bot.management.create_binding_codes(1, body.ttl_days, role="admin", idempotency_key=request.headers.get("Idempotency-Key"))
+        except (BotBindingError, ValueError) as exc:
+            code = "IDEMPOTENCY_CONFLICT" if str(exc) == "IDEMPOTENCY_CONFLICT" else "VALIDATION_FAILED"
+            raise APIError(code, "管理员绑定码请求无效", 409 if code == "IDEMPOTENCY_CONFLICT" else 400) from exc
+        code_value, item = generated[0]
+        admin_bot.management.audit(None, None, "binding_code_create", "success", details=json.dumps({"role": "admin", "quantity": 1, "ttlDays": body.ttl_days}, ensure_ascii=False))
+        return {"batchId": batch_id, "id": item.id, "code": code_value, "role": "admin", "createdAt": _iso(item.created_at), "expiresAt": None if item.expires_at is not None and item.expires_at.year >= 9999 else _iso(item.expires_at)}
+
     @app.get("/api/bot/bindings")
-    async def list_bot_bindings() -> dict[str, Any]:
+    async def list_bot_bindings(
+        codes_page: int = Query(1, alias="codesPage", ge=1),
+        bindings_page: int = Query(1, alias="bindingsPage", ge=1),
+        page_size: int = Query(20, alias="pageSize", ge=1, le=100),
+    ) -> dict[str, Any]:
+        codes, codes_total = admin_bot.management.binding_codes_page(page=codes_page, page_size=page_size)
+        bindings, bindings_total = admin_bot.management.bindings_page(page=bindings_page, page_size=page_size)
         return {
             "enabled": settings.bot_enabled,
             "configured": admin_bot.status.configured,
@@ -1437,14 +1491,16 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 {
                     "id": item.id,
                     "hint": item.hint,
+                    "role": item.role,
                     "status": item.status,
                     "createdAt": _iso(item.created_at),
-                    "expiresAt": _iso(item.expires_at),
+                    "expiresAt": None if item.expires_at is not None and item.expires_at.year >= 9999 else _iso(item.expires_at),
                     "usedAt": _iso(item.used_at),
                     "revokedAt": _iso(item.revoked_at),
                 }
-                for item in admin_bot.management.binding_codes()
+                for item in codes
             ],
+            "codesPagination": {"page": codes_page, "pageSize": page_size, "total": codes_total},
             "bindings": [
                 {
                     "id": item.id,
@@ -1454,9 +1510,11 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                     "firstName": item.first_name,
                     "lastName": item.last_name,
                     "boundAt": _iso(item.bound_at),
+                    "role": item.role or "user",
                 }
-                for item in admin_bot.management.bindings()
+                for item in bindings
             ],
+            "bindingsPagination": {"page": bindings_page, "pageSize": page_size, "total": bindings_total},
         }
 
     @app.delete("/api/bot/binding-codes/{code_id}", status_code=204)
