@@ -131,7 +131,18 @@ def next_run_for(
 
 
 def schedule_from_task(task: Task) -> ScheduleConfig:
-    payload = task.config.get("schedule")
+    # ``config_json`` is the editable draft.  Once a workflow has been
+    # published, formal scheduling must continue to use the published
+    # schedule until the next publish operation.
+    payload: object = task.config.get("schedule")
+    published_schedule_json = getattr(task, "published_schedule_json", None)
+    if published_schedule_json:
+        try:
+            published = json.loads(published_schedule_json)
+        except (TypeError, json.JSONDecodeError):
+            published = None
+        if isinstance(published, dict):
+            payload = published
     if not isinstance(payload, dict):
         payload = {}
     values = {

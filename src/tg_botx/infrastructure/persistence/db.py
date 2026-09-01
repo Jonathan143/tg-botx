@@ -125,6 +125,10 @@ class Task(Base):
     random_start: Mapped[str | None] = mapped_column(String(8), nullable=True)
     random_end: Mapped[str | None] = mapped_column(String(8), nullable=True)
     config_json: Mapped[str] = mapped_column(Text)
+    # The editable configuration is kept in ``config_json``.  This snapshot
+    # is the schedule currently published for formal runs; it must not move
+    # when an enabled task is edited until that draft is published.
+    published_schedule_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -314,6 +318,13 @@ class Database:
             with self.engine.begin() as connection:
                 connection.exec_driver_sql(
                     "ALTER TABLE account_chats ADD COLUMN avatar_photo_id BIGINT"
+                )
+
+        task_columns = {item["name"] for item in inspect(self.engine).get_columns("tasks")}
+        if "published_schedule_json" not in task_columns:
+            with self.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "ALTER TABLE tasks ADD COLUMN published_schedule_json TEXT"
                 )
 
     def session(self) -> Session:

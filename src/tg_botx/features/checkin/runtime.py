@@ -755,6 +755,7 @@ class CheckinService:
             random_start=schedule.start,
             random_end=schedule.end,
             config_json=json.dumps(definition.model_dump(mode="json"), ensure_ascii=False),
+            published_schedule_json=None,
             enabled=False,
             next_run_at=None,
         )
@@ -787,28 +788,35 @@ class CheckinService:
             local_today = utc_now().astimezone(ZoneInfo(schedule.timezone)).date()
             schedule = schedule.model_copy(update={"start_date": local_today})
             definition = definition.model_copy(update={"schedule": schedule})
+        next_run = None
+        values: dict[str, object] = {
+            "account_id": account.id,
+            "name": definition.name,
+            "target": definition.target,
+            "config_json": json.dumps(definition.model_dump(mode="json"), ensure_ascii=False),
+        }
+        # An enabled task keeps its currently published schedule and pending
+        # occurrence while this edit remains a draft.  Disabled tasks have no
+        # active scheduler job, so their denormalized fields may follow the
+        # draft; the published snapshot still becomes authoritative on
+        # publish.
         if task.enabled:
-            try:
-                next_run = next_run_for(schedule, now=utc_now())
-            except ValueError as exc:
-                raise TaskStateError("调度规则没有可执行的未来时间") from exc
+            values["next_run_at"] = task.next_run_at
         else:
-            next_run = None
-        updated = self.database.update_task(
-            task.id,
-            account_id=account.id,
-            name=definition.name,
-            target=definition.target,
-            timezone=schedule.timezone,
-            schedule_type=schedule.type,
-            fixed_time=schedule.time,
-            random_start=schedule.start,
-            random_end=schedule.end,
-            config_json=json.dumps(definition.model_dump(mode="json"), ensure_ascii=False),
-            next_run_at=next_run,
-        )
+            values.update(
+                {
+                    "timezone": schedule.timezone,
+                    "schedule_type": schedule.type,
+                    "fixed_time": schedule.time,
+                    "random_start": schedule.start,
+                    "random_end": schedule.end,
+                    "next_run_at": next_run,
+                }
+            )
+        updated = self.database.update_task(task.id, **values)
         self._bump_task_revision(task.id)
-        self._sync_schedule(updated)
+        if not task.enabled:
+            self._sync_schedule(updated)
         self._publish_task_updated(task.id)
         return updated
 
@@ -816,9 +824,9 @@ class CheckinService:
     def _execution_definition(definition: TaskDefinition) -> dict[str, object]:
         """Return the immutable portion of a published workflow.
 
-        Scheduling and task-management metadata remain on ``Task`` so they can
-        be adjusted without forcing a workflow release.  All values consumed
-        while executing steps or sending notifications are frozen here.
+        Scheduling metadata is persisted separately as the task's published
+        schedule.  All values consumed while executing steps or sending
+        notifications are frozen here.
         """
 
         payload = definition.model_dump(mode="json")
@@ -836,11 +844,33 @@ class CheckinService:
             definition = TaskDefinition.model_validate(task.config)
         except Exception as exc:
             raise TaskStateError("当前任务配置无效，无法发布") from exc
+        schedule = definition.schedule
+        if task.enabled:
+            try:
+                next_run = next_run_for(schedule, now=utc_now())
+            except ValueError as exc:
+                raise TaskStateError("调度规则没有可执行的未来时间") from exc
+        else:
+            next_run = None
         version = self.database.publish_workflow(
             task.id,
             self._execution_definition(definition),
             release_note=release_note,
         )
+        updated = self.database.update_task(
+            task.id,
+            timezone=schedule.timezone,
+            schedule_type=schedule.type,
+            fixed_time=schedule.time,
+            random_start=schedule.start,
+            random_end=schedule.end,
+            published_schedule_json=json.dumps(
+                schedule.model_dump(mode="json"), ensure_ascii=False
+            ),
+            next_run_at=next_run,
+        )
+        self._bump_task_revision(task.id)
+        self._sync_schedule(updated)
         self._publish_task_updated(task.id)
         return version
 
@@ -935,7 +965,10 @@ class CheckinService:
         merged.update(execution_definition)
         # Schedule is intentionally task-level.  It controls when a run is
         # created, not the behavior of an already-created workflow version.
-        merged["schedule"] = task.config.get("schedule")
+        # Published runs receive the active task schedule.  Test runs pass a
+        # complete unsaved definition and must retain that draft schedule.
+        if not isinstance(execution_definition.get("schedule"), dict):
+            merged["schedule"] = schedule_from_task(task).model_dump(mode="json")
         merged["name"] = task_name or task.name
         snapshot = copy.copy(task)
         snapshot.account_id = account.id

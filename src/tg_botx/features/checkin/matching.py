@@ -51,6 +51,7 @@ def _callback_text(value: Any) -> str:
 def match_button(message: Any, selector: dict[str, Any]) -> Any:
     unsupported = set(selector) - {
         "type",
+        "node_id",
         "text",
         "text_contains",
         "callback_data",
