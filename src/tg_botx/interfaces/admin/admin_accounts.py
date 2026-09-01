@@ -103,6 +103,7 @@ class ChatView:
     title: str
     username: str | None
     has_avatar: bool
+    avatar_photo_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +200,8 @@ class LoginFlowManager:
         self._client_pool = client_pool
         self._flows_by_id: dict[str, _LoginFlow] = {}
         self._flow_ids_by_account: dict[str, str] = {}
+        self._avatar_prefetch_tasks: set[asyncio.Task[None]] = set()
+        self._avatar_download_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
 
     async def start(self, account_name: str, method: LoginMethod) -> LoginFlowView:
@@ -354,6 +357,11 @@ class LoginFlowManager:
         await self._disconnect(flow)
 
     async def close(self) -> None:
+        prefetch_tasks = tuple(self._avatar_prefetch_tasks)
+        for task in prefetch_tasks:
+            task.cancel()
+        if prefetch_tasks:
+            await asyncio.gather(*prefetch_tasks, return_exceptions=True)
         async with self._lock:
             flow_ids = tuple(self._flows_by_id)
         for flow_id in flow_ids:
@@ -410,6 +418,7 @@ class LoginFlowManager:
                 title=row.title,
                 username=row.username,
                 has_avatar=row.has_avatar,
+                avatar_photo_id=row.avatar_photo_id,
             )
             for row in rows
         ]
@@ -429,6 +438,7 @@ class LoginFlowManager:
             raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
         telegram_client = client or await self._get_pooled_client(account)
         chats: list[dict[str, Any]] = []
+        avatar_jobs: list[tuple[str, Any, int]] = []
         try:
             async for dialog in telegram_client.iter_dialogs():
                 entity = dialog.entity
@@ -448,6 +458,8 @@ class LoginFlowManager:
                         "avatar_photo_id": avatar_photo_id,
                     }
                 )
+                if avatar_photo_id is not None:
+                    avatar_jobs.append((str(entity.id), entity, avatar_photo_id))
         except Exception:
             raise AdminAccountError("CHAT_PULL_FAILED", "无法拉取账号对话") from None
 
@@ -455,6 +467,12 @@ class LoginFlowManager:
             result = self.database.upsert_account_chats(account.id, chats)
         except Exception:
             raise AdminAccountError("CHAT_PULL_FAILED", "无法保存账号对话") from None
+        # The API should return as soon as the dialog snapshot is persisted.
+        # Avatar downloads are independent and run in the background.  Only a
+        # pooled client is safe to use after this method returns; login-flow
+        # clients are disconnected immediately after the initial pull.
+        if avatar_jobs and client is None:
+            self._schedule_avatar_prefetch(account.id, telegram_client, avatar_jobs)
         return ChatPullView(
             account_id=account.id,
             added=result["added"],
@@ -465,7 +483,13 @@ class LoginFlowManager:
         )
 
     async def download_chat_avatar(self, account_id_or_name: str, chat_id: str) -> Path | None:
-        """Return a locally cached avatar, downloading it only when needed."""
+        """Return a locally cached avatar without contacting Telegram.
+
+        Avatar files are populated asynchronously while chats are pulled.  A
+        request for an avatar must remain a cheap, read-only cache lookup: a
+        missing file is represented by ``None`` and the API turns that into a
+        404 response.
+        """
 
         account = self._find_account(account_id_or_name)
         if account is None:
@@ -475,7 +499,7 @@ class LoginFlowManager:
         if not re.fullmatch(r"-?\d+", chat_id):
             raise AdminAccountError("CHAT_ID_INVALID", "聊天 ID 无效")
 
-        cache_dir = self.settings.data_dir / "cache" / "avatars" / account.id
+        cache_dir = self._avatar_cache_dir()
         try:
             get_account_chat = getattr(self.database, "get_account_chat", None)
             chat = get_account_chat(account.id, chat_id) if get_account_chat else None
@@ -484,78 +508,105 @@ class LoginFlowManager:
         except Exception:
             raise AdminAccountError("CHAT_AVATAR_FAILED", "无法读取聊天头像缓存") from None
 
-        # A pulled chat carries the Telegram photo id, so a cache hit can be
-        # served without acquiring a Telegram client.  The glob fallback keeps
-        # avatars cached by older versions usable until the next chat pull.
         photo_id = getattr(chat, "avatar_photo_id", None) if chat is not None else None
         if photo_id is not None:
             cache_path = cache_dir / f"{chat_id}-{photo_id}.jpg"
             if self._valid_avatar_file(cache_path):
                 return cache_path
-        elif chat is None or getattr(chat, "has_avatar", False):
-            cached_path = self._find_legacy_avatar(cache_dir, chat_id)
-            if cached_path is not None:
-                return cached_path
+            # A known photo version with no matching file is a cache miss.
+            # Do not serve an older version under the same chat id.
+            return None
 
-        client = await self._get_pooled_client(account)
-        try:
-            entity = await client.get_entity(int(chat_id))
-            photo_id = self._chat_photo_id(entity)
-            if photo_id is None:
-                return None
-            cache_path = cache_dir / f"{chat_id}-{photo_id}.jpg"
-            if self._valid_avatar_file(cache_path):
-                # A pull may not have run since Telegram changed the photo;
-                # still return the newly observed local version immediately.
+        # Keep avatars cached by older versions (or rows created before the
+        # photo id column existed) usable.  A row explicitly marked as having
+        # no avatar must not resurrect a stale file.  This still performs no
+        # network or database mutation and simply returns None when no file is
+        # present.
+        if chat is not None and not getattr(chat, "has_avatar", False):
+            return None
+        return self._find_legacy_avatar(cache_dir, chat_id)
+
+    def _schedule_avatar_prefetch(
+        self,
+        account_id: str,
+        client: Any,
+        jobs: list[tuple[str, Any, int]],
+    ) -> None:
+        task = asyncio.create_task(self._prefetch_chat_avatars(account_id, client, jobs))
+        self._avatar_prefetch_tasks.add(task)
+
+        def on_done(completed: asyncio.Task[None]) -> None:
+            self._avatar_prefetch_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except Exception:
+                logger.exception("后台预下载聊天头像失败 account_id=%s", account_id)
+
+        task.add_done_callback(on_done)
+
+    async def _prefetch_chat_avatars(
+        self,
+        account_id: str,
+        client: Any,
+        jobs: list[tuple[str, Any, int]],
+    ) -> None:
+        semaphore = asyncio.Semaphore(4)
+
+        async def download(job: tuple[str, Any, int]) -> None:
+            chat_id, entity, photo_id = job
+            async with semaphore:
                 try:
-                    update_avatar = getattr(self.database, "update_account_chat_avatar", None)
-                    if update_avatar:
-                        update_avatar(account.id, chat_id, photo_id)
+                    await self._download_avatar_file(client, entity, chat_id, photo_id)
                 except Exception:
                     logger.warning(
-                        "保存聊天头像版本失败 account_id=%s chat_id=%s",
-                        account.id,
+                        "后台下载聊天头像失败 account_id=%s chat_id=%s",
+                        account_id,
                         chat_id,
+                        exc_info=True,
                     )
+
+        await asyncio.gather(*(download(job) for job in jobs))
+
+    async def _download_avatar_file(
+        self,
+        client: Any,
+        entity: Any,
+        chat_id: str,
+        photo_id: int,
+    ) -> Path | None:
+        cache_dir = self._avatar_cache_dir()
+        cache_path = cache_dir / f"{chat_id}-{photo_id}.jpg"
+        lock = self._avatar_download_locks.setdefault(str(cache_path), asyncio.Lock())
+        async with lock:
+            # A pull prefetch and a browser request can arrive at the same
+            # time. Re-check after acquiring the lock to avoid duplicate
+            # Telegram downloads for the same avatar.
+            if self._valid_avatar_file(cache_path):
                 return cache_path
+
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            temporary_path = cache_dir / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
             try:
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                temporary_path = cache_dir / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
-                try:
-                    downloaded = await client.download_profile_photo(
-                        entity, file=str(temporary_path)
-                    )
-                    if downloaded is None or not temporary_path.is_file():
-                        return None
-                    if temporary_path.stat().st_size <= 0:
-                        return None
-                    temporary_path.replace(cache_path)
-                finally:
-                    temporary_path.unlink(missing_ok=True)
-                # Keep only the current photo for this chat.  Old versions are
-                # never needed after the photo id has changed.
-                for stale_path in cache_dir.glob(f"{chat_id}-*.jpg"):
-                    if stale_path != cache_path:
-                        stale_path.unlink(missing_ok=True)
-            except OSError:
-                raise AdminAccountError("CHAT_AVATAR_FAILED", "无法保存聊天头像") from None
-            try:
-                update_avatar = getattr(self.database, "update_account_chat_avatar", None)
-                if update_avatar:
-                    update_avatar(account.id, chat_id, photo_id)
-            except Exception:
-                # The file is valid and can be served even if metadata
-                # persistence is temporarily unavailable.
-                logger.warning(
-                    "保存聊天头像版本失败 account_id=%s chat_id=%s",
-                    account.id,
-                    chat_id,
-                )
-            return cache_path
-        except AdminAccountError:
-            raise
-        except Exception:
-            raise AdminAccountError("CHAT_AVATAR_FAILED", "无法加载聊天头像") from None
+                downloaded = await client.download_profile_photo(entity, file=str(temporary_path))
+                if downloaded is None or not temporary_path.is_file():
+                    return None
+                if temporary_path.stat().st_size <= 0:
+                    return None
+                temporary_path.replace(cache_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
+            # Keep only the current photo for this chat.  Old versions are
+            # never needed after the photo id has changed.
+            for stale_path in cache_dir.glob(f"{chat_id}-*.jpg"):
+                if stale_path != cache_path:
+                    stale_path.unlink(missing_ok=True)
+        return cache_path
+
+    def _avatar_cache_dir(self) -> Path:
+        return self.settings.data_dir / "cache" / "avatars"
 
     @staticmethod
     def _valid_avatar_file(path: Path) -> bool:

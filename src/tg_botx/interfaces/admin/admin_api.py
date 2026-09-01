@@ -1198,8 +1198,8 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                     "username": item.username,
                     "hasAvatar": item.has_avatar,
                     "avatarUrl": (
-                        f"/api/accounts/{account_id}/chats/avatar?chatId={item.chat_id}"
-                        if item.has_avatar
+                        f"/api/avatar/{item.chat_id}/{item.avatar_photo_id}"
+                        if item.has_avatar and item.avatar_photo_id is not None
                         else None
                     ),
                 }
@@ -1237,13 +1237,13 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             "buttons": list(result.buttons),
         }
 
-    @app.get("/api/accounts/{account_id}/chats/avatar")
-    async def account_chat_avatar(
-        account_id: str,
-        chat_id: str = Query(..., alias="chatId", min_length=1, max_length=40),
-    ) -> Response:
-        path = await accounts.download_chat_avatar(account_id, chat_id)
-        if path is None:
+    @app.get("/api/avatar/{chat_id}/{avatar_photo_id}")
+    async def chat_avatar(chat_id: int, avatar_photo_id: int) -> Response:
+        path = settings.data_dir / "cache" / "avatars" / f"{chat_id}-{avatar_photo_id}.jpg"
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                return Response(status_code=404)
+        except OSError:
             return Response(status_code=404)
         return FileResponse(
             path,

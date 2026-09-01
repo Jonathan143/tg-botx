@@ -13,7 +13,14 @@ from starlette.requests import Request
 
 from tg_botx.config import Settings
 from tg_botx.features.checkin.runtime import CheckinService
-from tg_botx.infrastructure.persistence.db import Account, Database, Task, TaskRun, utc_now
+from tg_botx.infrastructure.persistence.db import (
+    Account,
+    AccountChat,
+    Database,
+    Task,
+    TaskRun,
+    utc_now,
+)
 from tg_botx.interfaces.admin.admin_accounts import LogoutImpact
 from tg_botx.interfaces.admin.admin_api import create_admin_app
 
@@ -562,3 +569,38 @@ def test_logout_account_invokes_telegram_logout_once(tmp_path, monkeypatch):
         assert response.status_code == 200
         assert response.json()["loggedOut"] is True
         logout.assert_awaited_once_with(account.id)
+
+
+def test_chat_avatar_url_uses_cache_only_avatar_endpoint(tmp_path):
+    app = app_for(tmp_path)
+    database = app.state.database
+    account = database.get_account("default")
+    with database.session() as session:
+        session.add(
+            AccountChat(
+                account_id=account.id,
+                chat_id="123",
+                chat_type="private",
+                title="Cached avatar",
+                has_avatar=True,
+                avatar_photo_id=456,
+            )
+        )
+        session.commit()
+
+    cache_path = tmp_path / "cache" / "avatars" / "123-456.jpg"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(b"cached-avatar")
+
+    with TestClient(app, base_url=ORIGIN) as client:
+        assert authenticate(client).status_code == 200
+        chats = client.get(f"/api/accounts/{account.id}/chats")
+        assert chats.status_code == 200
+        assert chats.json()["items"][0]["avatarUrl"] == "/api/avatar/123/456"
+
+        avatar = client.get("/api/avatar/123/456")
+        assert avatar.status_code == 200
+        assert avatar.content == b"cached-avatar"
+
+        cache_path.unlink()
+        assert client.get("/api/avatar/123/456").status_code == 404

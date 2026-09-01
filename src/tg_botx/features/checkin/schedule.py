@@ -58,7 +58,9 @@ def random_local_datetime(
     return day.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(seconds=selected)
 
 
-def _candidate_time(day: date, schedule: ScheduleConfig, zone: ZoneInfo, *, seed: str | None, cutoff: datetime) -> datetime | None:
+def _candidate_time(
+    day: date, schedule: ScheduleConfig, zone: ZoneInfo, *, seed: str | None, cutoff: datetime
+) -> datetime | None:
     if schedule.type == "fixed":
         assert schedule.time is not None
         return _localize(datetime.combine(day, parse_clock(schedule.time)), zone)
@@ -69,7 +71,9 @@ def _candidate_time(day: date, schedule: ScheduleConfig, zone: ZoneInfo, *, seed
         minimum = cutoff.time().replace(microsecond=0)
     if minimum > parse_clock(schedule.end):
         return None
-    naive = random_local_datetime(datetime.combine(day, time.min), schedule, seed=seed, minimum=minimum)
+    naive = random_local_datetime(
+        datetime.combine(day, time.min), schedule, seed=seed, minimum=minimum
+    )
     return _localize(naive, zone)
 
 

@@ -8,9 +8,9 @@ from types import SimpleNamespace
 import pytest
 from telethon.errors import SessionPasswordNeededError
 
-from tg_botx.interfaces.admin.admin_accounts import AdminAccountError, LoginFlowManager
 from tg_botx.config import Settings
-from tg_botx.infrastructure.persistence.db import Account, Database, Task, utc_now
+from tg_botx.infrastructure.persistence.db import Account, AccountChat, Database, Task, utc_now
+from tg_botx.interfaces.admin.admin_accounts import AdminAccountError, LoginFlowManager
 
 
 class FakeQrLogin:
@@ -247,3 +247,101 @@ def test_account_list_masks_phone(manager_parts):
     [account] = manager.list_accounts()
     assert account.phone_masked == "155******78"
     assert "123456" not in repr(account)
+
+
+def test_download_chat_avatar_uses_global_cache_path(manager_parts):
+    async def scenario():
+        settings, database = manager_parts
+        account = database.save_account(
+            Account(name="avatar-account", session_name="avatar-account", is_active=True)
+        )
+        with database.session() as session:
+            session.add(
+                AccountChat(
+                    account_id=account.id,
+                    chat_id="123",
+                    chat_type="private",
+                    title="Avatar",
+                    has_avatar=True,
+                    avatar_photo_id=456,
+                )
+            )
+            session.commit()
+        cache_path = settings.data_dir / "cache" / "avatars" / "123-456.jpg"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(b"cached-avatar")
+
+        class Pool:
+            async def get(self, _account):
+                raise AssertionError("命中缓存时不应连接 Telegram")
+
+        manager = LoginFlowManager(settings, database, client_pool=Pool())
+        assert await manager.download_chat_avatar(account.id, "123") == cache_path
+
+    asyncio.run(scenario())
+
+
+def test_download_chat_avatar_returns_none_without_cache(manager_parts):
+    async def scenario():
+        settings, database = manager_parts
+        account = database.save_account(
+            Account(
+                name="missing-avatar-account",
+                session_name="missing-avatar-account",
+                is_active=True,
+            )
+        )
+
+        class Pool:
+            async def get(self, _account):
+                raise AssertionError("缓存未命中时不应连接 Telegram")
+
+        manager = LoginFlowManager(settings, database, client_pool=Pool())
+        assert await manager.download_chat_avatar(account.id, "123") is None
+
+    asyncio.run(scenario())
+
+
+def test_pull_chats_starts_background_avatar_prefetch(manager_parts):
+    async def scenario():
+        settings, database = manager_parts
+        account = database.save_account(
+            Account(name="prefetch-account", session_name="prefetch-account", is_active=True)
+        )
+        entity = SimpleNamespace(
+            id=789,
+            username="prefetch",
+            title="Prefetch",
+            photo=SimpleNamespace(photo_id=987),
+        )
+
+        class Client:
+            async def iter_dialogs(self):
+                yield SimpleNamespace(entity=entity, title="Prefetch")
+
+            async def download_profile_photo(self, _entity, *, file):
+                from pathlib import Path
+
+                Path(file).write_bytes(b"prefetched-avatar")
+                return file
+
+        class Pool:
+            def __init__(self):
+                self.client = Client()
+
+            async def get(self, _account):
+                return self.client
+
+        manager = LoginFlowManager(settings, database, client_pool=Pool())
+        manager._chat_type = lambda _entity: "private"
+        result = await manager.pull_chats(account.id)
+        assert result.total == 1
+
+        for _ in range(10):
+            path = settings.data_dir / "cache" / "avatars" / "789-987.jpg"
+            if path.is_file():
+                break
+            await asyncio.sleep(0)
+        assert path.read_bytes() == b"prefetched-avatar"
+
+    asyncio.run(scenario())

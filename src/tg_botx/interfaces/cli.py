@@ -162,7 +162,9 @@ def create_task(config: Path = typer.Option(..., "--config", exists=True, readab
         raise typer.BadParameter(f"任务已存在：{definition.name}")
     schedule = definition.schedule
     if schedule.start_date is None:
-        schedule = schedule.model_copy(update={"start_date": datetime.now(ZoneInfo(schedule.timezone)).date()})
+        schedule = schedule.model_copy(
+            update={"start_date": datetime.now(ZoneInfo(schedule.timezone)).date()}
+        )
         definition = definition.model_copy(update={"schedule": schedule})
     task = Task(
         account_id=account.id,
@@ -198,7 +200,9 @@ def list_tasks():
         elif frequency == "weekly":
             frequency_label = "每周" + "/".join(str(day) for day in (schedule.weekdays or []))
         elif frequency == "monthly_dates":
-            frequency_label = "每月" + "/".join(str(day) for day in (schedule.month_days or [])) + "号"
+            frequency_label = (
+                "每月" + "/".join(str(day) for day in (schedule.month_days or [])) + "号"
+            )
         else:
             frequency_label = "每天"
         typer.echo(

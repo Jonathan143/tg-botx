@@ -23,7 +23,9 @@ def test_command_configs_ignore_unsupported_remote_history() -> None:
         "tasks",
         "status",
     ]
-    assert next(item for item in configs if item["command"] == "help")["description"] == "自定义帮助"
+    assert (
+        next(item for item in configs if item["command"] == "help")["description"] == "自定义帮助"
+    )
 
 
 async def test_refresh_commands_replaces_private_menu_and_clears_group_history() -> None:
