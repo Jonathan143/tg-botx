@@ -1454,10 +1454,28 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
 
     @app.get("/api/bot/commands")
     async def list_bot_commands() -> dict[str, Any]:
+        return {"commands": admin_bot.command_configs()}
+
+    @app.post("/api/bot/commands/pull")
+    async def pull_bot_commands(_: EmptyBody) -> dict[str, Any]:
+        if admin_bot.client is None:
+            raise APIError("BOT_NOT_CONFIGURED", "Telegram 管理 Bot 未配置", 503)
         try:
-            await admin_bot.sync_remote_commands()
+            commands = await admin_bot.pull_remote_commands()
         except Exception as exc:
-            logger.warning("管理 Bot 读取 Telegram 命令菜单失败 type=%s", type(exc).__name__)
+            logger.warning("手动拉取管理 Bot 指令失败 type=%s", type(exc).__name__)
+            raise APIError("COMMAND_PULL_FAILED", "从 Telegram 拉取指令失败", 502) from exc
+        return {"commands": commands}
+
+    @app.post("/api/bot/commands/sync")
+    async def sync_bot_commands(_: EmptyBody) -> dict[str, Any]:
+        if admin_bot.client is None:
+            raise APIError("BOT_NOT_CONFIGURED", "Telegram 管理 Bot 未配置", 503)
+        try:
+            await admin_bot.refresh_commands()
+        except Exception as exc:
+            logger.warning("手动同步管理 Bot 指令失败 type=%s", type(exc).__name__)
+            raise APIError("COMMAND_SYNC_FAILED", "向 Telegram 同步指令失败", 502) from exc
         return {"commands": admin_bot.command_configs()}
 
     @app.patch("/api/bot/commands/{command}")
@@ -1486,14 +1504,26 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             raise APIError("VALIDATION_FAILED", str(exc), 422) from exc
         except BotBindingError as exc:
             raise APIError("COMMAND_NOT_FOUND", str(exc), 404) from exc
-        try:
-            await admin_bot.refresh_commands()
-        except Exception as exc:
-            # Telegram outages must not turn a successfully persisted local
-            # configuration into an opaque 500 response.
-            logger.warning("管理 Bot 指令菜单同步失败 type=%s", type(exc).__name__)
-            return {**item, "syncWarning": "Telegram 菜单同步失败，服务恢复后会自动重试"}
         return item
+
+    @app.delete("/api/bot/commands/{command}", status_code=204)
+    async def delete_bot_command(command: str) -> Response:
+        normalized = command.casefold().removeprefix("/")
+        current = next(
+            (
+                item
+                for item in admin_bot.management.command_configs()
+                if item["command"] == normalized
+            ),
+            None,
+        )
+        if current is None:
+            raise APIError("COMMAND_NOT_FOUND", "不支持该管理 Bot 指令", 404)
+        try:
+            admin_bot.management.delete_command_config(normalized)
+        except BotBindingError as exc:
+            raise APIError("COMMAND_NOT_FOUND", str(exc), 404) from exc
+        return Response(status_code=204)
 
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:

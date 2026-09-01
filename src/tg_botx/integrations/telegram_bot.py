@@ -95,11 +95,45 @@ class TelegramBotApiClient:
             payload["text"] = text[:200]
         return await self.call("answerCallbackQuery", payload)
 
-    async def set_commands(self, commands: list[dict[str, str]]) -> object:
-        return await self.call("setMyCommands", {"commands": commands})
+    async def set_commands(
+        self,
+        commands: list[dict[str, str]],
+        *,
+        scope: dict[str, object] | None = None,
+        language_code: str | None = None,
+    ) -> object:
+        payload: dict[str, object] = {"commands": commands}
+        if scope is not None:
+            payload["scope"] = scope
+        if language_code is not None:
+            payload["language_code"] = language_code
+        return await self.call("setMyCommands", payload)
 
-    async def get_commands(self) -> list[dict[str, str]]:
-        result = await self.call("getMyCommands")
+    async def delete_commands(
+        self,
+        *,
+        scope: dict[str, object] | None = None,
+        language_code: str | None = None,
+    ) -> object:
+        payload: dict[str, object] = {}
+        if scope is not None:
+            payload["scope"] = scope
+        if language_code is not None:
+            payload["language_code"] = language_code
+        return await self.call("deleteMyCommands", payload)
+
+    async def get_commands(
+        self,
+        *,
+        scope: dict[str, object] | None = None,
+        language_code: str | None = None,
+    ) -> list[dict[str, str]]:
+        payload: dict[str, object] = {}
+        if scope is not None:
+            payload["scope"] = scope
+        if language_code is not None:
+            payload["language_code"] = language_code
+        result = await self.call("getMyCommands", payload)
         return (
             [
                 item

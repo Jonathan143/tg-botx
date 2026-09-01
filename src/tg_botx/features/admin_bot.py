@@ -130,18 +130,18 @@ class BotManagementService:
 
     def command_configs(self) -> list[dict[str, Any]]:
         stored = {item.command: item for item in self.database.list_bot_command_configs()}
-        defaults = [
-            {
-                "command": command,
-                "description": (
-                    stored.get(command).description if command in stored else description
-                ),
-                "enabled": stored.get(command).enabled if command in stored else True,
-            }
-            for command, description in DEFAULT_BOT_COMMANDS
-        ]
-        default_names = {item["command"] for item in defaults}
-        extras = [
+        configs: list[dict[str, Any]] = []
+        for command, default_description in DEFAULT_BOT_COMMANDS:
+            item = stored.get(command)
+            configs.append(
+                {
+                    "command": command,
+                    "description": item.description if item is not None else default_description,
+                    "enabled": item.enabled if item is not None else True,
+                }
+            )
+        default_names = {command for command, _ in DEFAULT_BOT_COMMANDS}
+        configs.extend(
             {
                 "command": item.command,
                 "description": item.description,
@@ -149,8 +149,8 @@ class BotManagementService:
             }
             for item in stored.values()
             if item.command not in default_names and _COMMAND_NAME_PATTERN.fullmatch(item.command)
-        ]
-        return defaults + sorted(extras, key=lambda item: item["command"])
+        )
+        return configs
 
     def update_command_config(
         self, command: str, description: str, enabled: bool
@@ -159,6 +159,28 @@ class BotManagementService:
             raise BotBindingError("不支持该管理 Bot 指令")
         item = self.database.upsert_bot_command_config(command, description, enabled)
         return {"command": item.command, "description": item.description, "enabled": item.enabled}
+
+    def delete_command_config(self, command: str) -> bool:
+        """Delete a command from the persisted menu.
+
+        Built-in commands are represented by defaults when no row exists, so
+        deleting one must persist it as disabled instead of removing the row.
+        The next explicit pull can re-enable it when Telegram contains it.
+        """
+        if not _COMMAND_NAME_PATTERN.fullmatch(command):
+            raise BotBindingError("不支持该管理 Bot 指令")
+        default = next(
+            (description for name, description in DEFAULT_BOT_COMMANDS if name == command), None
+        )
+        if default is None:
+            return self.database.delete_bot_command_config(command)
+        current = next(
+            (item for item in self.database.list_bot_command_configs() if item.command == command),
+            None,
+        )
+        description = current.description if current is not None else default
+        self.database.upsert_bot_command_config(command, description, False)
+        return True
 
     def bind(self, code: str, *, user_id: int, chat_id: int, user: dict[str, Any]) -> BotBinding:
         normalized = normalize_binding_code(code)
@@ -262,32 +284,76 @@ class TelegramManagementBot:
     def command_configs(self) -> list[dict[str, Any]]:
         return self.management.command_configs()
 
-    async def sync_remote_commands(self) -> None:
-        """Import commands already configured in Telegram without overwriting local edits."""
+    async def pull_remote_commands(self) -> list[dict[str, Any]]:
+        """Pull Telegram's default command menu into the local database."""
         if self.client is None:
-            return
-        remote = await self.client.get_commands()
-        stored = {item["command"] for item in self.command_configs()}
+            return self.command_configs()
+        remote = await self.client.get_commands(scope={"type": "default"})
+        remote_by_name: dict[str, str] = {}
         for item in remote:
             command = item["command"].casefold().removeprefix("/")
             description = item["description"].strip()
-            if not _COMMAND_NAME_PATTERN.fullmatch(command) or not description:
-                continue
-            if command not in stored:
+            if _COMMAND_NAME_PATTERN.fullmatch(command) and description:
+                remote_by_name[command] = description
+        default_names = {name for name, _ in DEFAULT_BOT_COMMANDS}
+        current_configs = {item["command"]: item for item in self.command_configs()}
+        for command, default_description in DEFAULT_BOT_COMMANDS:
+            description = remote_by_name.get(command)
+            if description is None:
+                current = current_configs.get(command)
+                description = current["description"] if current is not None else default_description
+                enabled = False
+            else:
+                enabled = True
+            self.management.update_command_config(command, description, enabled)
+        for command, description in remote_by_name.items():
+            if command not in default_names:
                 self.management.update_command_config(command, description, True)
-                stored.add(command)
+        remote_names = set(remote_by_name)
+        for item in self.database.list_bot_command_configs():
+            if (
+                item.command not in remote_names
+                and item.command not in default_names
+                and _COMMAND_NAME_PATTERN.fullmatch(item.command)
+            ):
+                self.management.delete_command_config(item.command)
+        return self.command_configs()
+
+    async def sync_remote_commands(self) -> list[dict[str, Any]]:
+        """Backward-compatible alias for the explicit pull operation."""
+        return await self.pull_remote_commands()
 
     async def refresh_commands(self) -> None:
         """Push the configured command menu to Telegram immediately."""
         if self.client is None:
             return
-        await self.client.set_commands(
-            [
-                {"command": item["command"], "description": item["description"]}
-                for item in self.command_configs()
-                if item["enabled"]
-            ]
+        commands = [
+            {"command": item["command"], "description": item["description"]}
+            for item in self.command_configs()
+            if item["enabled"]
+        ]
+        # Telegram resolves a private-chat scope before the default scope. A
+        # stale private-chat menu therefore masks a newly configured default
+        # menu. Keep both managed scopes identical so omitted commands are
+        # replaced in either location.
+        managed_scopes: tuple[dict[str, object], ...] = (
+            {"type": "default"},
+            {"type": "all_private_chats"},
         )
+        for scope in managed_scopes:
+            if commands:
+                await self.client.set_commands(commands, scope=scope)
+            else:
+                await self.client.delete_commands(scope=scope)
+
+        # This bot ignores non-private messages. Remove historical menus from
+        # group scopes instead of advertising commands that cannot run there.
+        unused_scopes: tuple[dict[str, object], ...] = (
+            {"type": "all_group_chats"},
+            {"type": "all_chat_administrators"},
+        )
+        for scope in unused_scopes:
+            await self.client.delete_commands(scope=scope)
 
     async def close(self) -> None:
         self._stop.set()
@@ -315,16 +381,6 @@ class TelegramManagementBot:
         assert self.client is not None
         self.status.running = True
         try:
-            try:
-                await self.sync_remote_commands()
-            except Exception as exc:
-                self.status.last_error = type(exc).__name__
-                logger.warning("管理 Bot 读取 Telegram 命令菜单失败 type=%s", type(exc).__name__)
-            try:
-                await self.refresh_commands()
-            except Exception as exc:
-                self.status.last_error = type(exc).__name__
-                logger.warning("管理 Bot 设置命令菜单失败 type=%s", type(exc).__name__)
             while not self._stop.is_set():
                 try:
                     updates = await self.client.get_updates(self._offset)

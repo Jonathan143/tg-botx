@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from tg_botx.config import Settings
-from tg_botx.infrastructure.persistence.db import Account, Database, TaskRun, utc_now
 from tg_botx.features.checkin.runtime import CheckinService, ManualRunConflict
+from tg_botx.infrastructure.persistence.db import Account, Database, TaskRun, utc_now
 from tg_botx.schemas import TaskDefinition
 
 
@@ -30,7 +30,14 @@ def definition(
 
 
 def resources(tmp_path):
-    settings = Settings(data_dir=tmp_path)
+    settings = Settings(
+        data_dir=tmp_path,
+        notification_bot_token=None,
+        admin_chat_ids="",
+        admin_bot_token=None,
+        bot_enabled=False,
+        service_lifecycle_notifications_enabled=False,
+    )
     database = Database(f"sqlite:///{tmp_path / 'database.sqlite3'}")
     database.create_all()
     database.save_account(Account(name="default", session_name="default"))

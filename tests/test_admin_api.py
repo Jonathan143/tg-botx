@@ -11,12 +11,11 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from tg_botx.interfaces.admin.admin_api import create_admin_app
-from tg_botx.interfaces.admin.admin_accounts import LogoutImpact
 from tg_botx.config import Settings
-from tg_botx.infrastructure.persistence.db import Account, Database, Task, TaskRun, utc_now
 from tg_botx.features.checkin.runtime import CheckinService
-
+from tg_botx.infrastructure.persistence.db import Account, Database, Task, TaskRun, utc_now
+from tg_botx.interfaces.admin.admin_accounts import LogoutImpact
+from tg_botx.interfaces.admin.admin_api import create_admin_app
 
 ADMIN_KEY = "db3BvR9P8y6F0HcXe5i7qL2sNu4mKa1ZpT8wJfGx"
 ORIGIN = "https://admin.example.test"
@@ -49,6 +48,11 @@ def app_for(tmp_path):
         admin_key=ADMIN_KEY,
         admin_origin=ORIGIN,
         log_file="admin-test.log",
+        notification_bot_token=None,
+        admin_chat_ids="",
+        admin_bot_token=None,
+        bot_enabled=False,
+        service_lifecycle_notifications_enabled=False,
     )
     settings.ensure_directories()
     database = Database(f"sqlite:///{tmp_path / 'admin-test.sqlite3'}")

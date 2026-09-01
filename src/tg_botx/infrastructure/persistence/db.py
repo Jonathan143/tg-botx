@@ -693,6 +693,16 @@ class Database:
             session.refresh(item)
             return item
 
+    def delete_bot_command_config(self, command: str) -> bool:
+        """Remove a persisted management-bot command configuration."""
+        with self.session() as session:
+            item = session.get(BotCommandConfig, command)
+            if item is None:
+                return False
+            session.delete(item)
+            session.commit()
+            return True
+
     def add_bot_audit_log(self, item: BotAuditLog) -> BotAuditLog:
         with self.session() as session:
             session.add(item)
