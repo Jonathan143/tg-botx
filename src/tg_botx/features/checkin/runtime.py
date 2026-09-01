@@ -1023,7 +1023,16 @@ class CheckinService:
             and self._definition_unchanged(snapshot, current)
         ):
             try:
-                values["next_run_at"] = next_run_for(schedule_from_task(current), now=finished)
+                # The run may finish before its planned wall-clock time (for
+                # example after a clock adjustment or a delayed scheduler
+                # callback).  Exclude the occurrence that was just consumed,
+                # not only the completion timestamp, so a daily task cannot
+                # be scheduled again later on the same day.
+                values["next_run_at"] = next_run_for(
+                    schedule_from_task(current),
+                    now=finished,
+                    after=current.next_run_at,
+                )
             except ValueError:
                 values["next_run_at"] = None
         updated = self.database.update_task(current.id, **values)

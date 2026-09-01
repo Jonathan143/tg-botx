@@ -65,15 +65,14 @@ def _candidate_time(
         assert schedule.time is not None
         return _localize(datetime.combine(day, parse_clock(schedule.time)), zone)
     assert schedule.start is not None and schedule.end is not None
-    start = parse_clock(schedule.start)
-    minimum = start
-    if day == cutoff.date() and cutoff.time() > minimum:
-        minimum = cutoff.time().replace(microsecond=0)
-    if minimum > parse_clock(schedule.end):
-        return None
     naive = random_local_datetime(
-        datetime.combine(day, time.min), schedule, seed=seed, minimum=minimum
+        datetime.combine(day, time.min), schedule, seed=seed
     )
+    # A random schedule has one stable occurrence per eligible day.  If that
+    # occurrence has already passed, skip the day instead of re-randomizing a
+    # second time within the same window.
+    if day == cutoff.date() and naive.time() <= cutoff.time().replace(microsecond=0):
+        return None
     return _localize(naive, zone)
 
 
