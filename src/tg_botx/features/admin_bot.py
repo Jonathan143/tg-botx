@@ -549,6 +549,10 @@ class TelegramManagementBot:
             logger.error("未配置 TG_BOT_ADMIN_BOT_TOKEN，Telegram 管理 Bot 已禁用")
             return
         self._stop.clear()
+        # The offset is intentionally session-scoped.  Each process/session
+        # starts by discarding Telegram updates that accumulated before it
+        # began polling.
+        self._offset = None
         self._task = asyncio.create_task(self._poll_loop(), name="telegram-management-bot")
 
     def command_configs(self) -> list[dict[str, Any]]:
@@ -656,6 +660,26 @@ class TelegramManagementBot:
         assert self.client is not None
         self.status.running = True
         try:
+            # Telegram keeps updates received while the service is stopped in
+            # its pending queue.  Management commands are interactive and can
+            # be stale (especially mutating actions such as /run), so discard
+            # the backlog before entering the normal polling loop.  We only
+            # advance the offset here; no update is passed to the command
+            # handlers.  Retry transient API failures without falling through
+            # to normal polling, otherwise the stale backlog could be handled.
+            while not self._stop.is_set():
+                try:
+                    await self._discard_pending_updates()
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except TelegramBotApiError as exc:
+                    self.status.last_error = type(exc).__name__
+                    await asyncio.sleep(min(exc.retry_after or 5, 30))
+                except Exception as exc:
+                    self.status.last_error = type(exc).__name__
+                    logger.warning("管理 Bot 启动清理失败 type=%s", type(exc).__name__)
+                    await asyncio.sleep(5)
             while not self._stop.is_set():
                 try:
                     updates = await self.client.get_updates(self._offset)
@@ -683,6 +707,39 @@ class TelegramManagementBot:
                     await asyncio.sleep(5)
         finally:
             self.status.running = False
+
+    async def _discard_pending_updates(self) -> None:
+        """Acknowledge all updates that were pending when polling starts.
+
+        ``getUpdates`` returns at most Telegram's per-request limit, so keep
+        polling with a short timeout until the queue is empty.  New updates
+        that arrive after the final empty response are handled by the normal
+        polling loop.
+        """
+
+        assert self.client is not None
+        discarded = 0
+        while not self._stop.is_set():
+            updates = await self.client.get_updates(self._offset, timeout=0)
+            self.status.last_poll_at = utc_now()
+            self.status.last_error = None
+            if not updates:
+                if discarded:
+                    logger.info("管理 Bot 启动时丢弃积压更新 count=%s", discarded)
+                return
+
+            update_ids: list[int] = []
+            for update in updates:
+                update_id = update.get("update_id")
+                if isinstance(update_id, int):
+                    update_ids.append(update_id)
+            if not update_ids:
+                # Telegram updates always contain update_id.  Avoid spinning
+                # forever if a malformed response is ever returned.
+                logger.warning("管理 Bot 收到不含 update_id 的更新，停止启动清理")
+                return
+            self._offset = max(update_ids) + 1
+            discarded += len(updates)
 
     async def _handle_update(self, update: dict[str, object]) -> None:
         message = update.get("message")
