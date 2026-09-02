@@ -210,6 +210,9 @@ class BotManagementService:
                     "allowedRoles": self._item_roles(command, item),
                     "executorType": "none",
                     "executorConfig": {},
+                    "updatedAt": getattr(item, "updated_at", None).isoformat()
+                    if getattr(item, "updated_at", None) is not None
+                    else None,
                 }
             )
         default_names = {command for command, _ in DEFAULT_BOT_COMMANDS}
@@ -226,6 +229,9 @@ class BotManagementService:
                 if getattr(item, "executor_type", "none") in _EXECUTOR_TYPES
                 else "none",
                 "executorConfig": self._item_executor_config(item),
+                "updatedAt": getattr(item, "updated_at", None).isoformat()
+                if getattr(item, "updated_at", None) is not None
+                else None,
             }
             for item in stored.values()
             if item.command not in default_names and _COMMAND_NAME_PATTERN.fullmatch(item.command)
@@ -342,6 +348,9 @@ class BotManagementService:
             if getattr(item, "executor_type", "none") in _EXECUTOR_TYPES
             else "none",
             "executorConfig": cls._item_executor_config(item),
+            "updatedAt": getattr(item, "updated_at", None).isoformat()
+            if getattr(item, "updated_at", None) is not None
+            else None,
         }
 
     @staticmethod
