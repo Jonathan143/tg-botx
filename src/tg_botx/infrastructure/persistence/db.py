@@ -266,6 +266,8 @@ class BotCommandConfig(Base):
     command: Mapped[str] = mapped_column(String(32), primary_key=True)
     description: Mapped[str] = mapped_column(String(256))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    menu_visible: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    sort_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
     command_type: Mapped[str] = mapped_column(
         String(20), default="custom", server_default="custom", nullable=False
     )
@@ -376,6 +378,8 @@ class Database:
             item["name"] for item in inspect(self.engine).get_columns("bot_command_configs")
         }
         command_additions = {
+            "menu_visible": "BOOLEAN DEFAULT TRUE",
+            "sort_order": "INTEGER",
             "allowed_roles_json": "TEXT",
             "command_type": "VARCHAR(20) DEFAULT 'custom'",
             "executor_type": "VARCHAR(30) DEFAULT 'none'",
@@ -384,6 +388,7 @@ class Database:
         missing_command_columns = {
             name: ddl for name, ddl in command_additions.items() if name not in command_columns
         }
+        menu_visible_migrated = "menu_visible" in missing_command_columns
         if missing_command_columns:
             with self.engine.begin() as connection:
                 for name, ddl in missing_command_columns.items():
@@ -395,6 +400,13 @@ class Database:
         # Re-assert the protected type on every startup so databases migrated
         # by an earlier build cannot accidentally downgrade built-ins.
         with self.engine.begin() as connection:
+            if menu_visible_migrated:
+                connection.exec_driver_sql("UPDATE bot_command_configs SET menu_visible = enabled")
+            else:
+                connection.exec_driver_sql(
+                    "UPDATE bot_command_configs SET menu_visible = enabled "
+                    "WHERE menu_visible IS NULL"
+                )
             connection.exec_driver_sql(
                 "UPDATE bot_command_configs SET command_type = 'system' "
                 "WHERE command IN ('start','help','bind','unbind','tasks','status')"
@@ -834,6 +846,7 @@ class Database:
         enabled: bool,
         allowed_roles_json: str | None = None,
         *,
+        menu_visible: bool | None = None,
         command_type: str | None = None,
         executor_type: str | None = None,
         executor_config_json: str | None = None,
@@ -845,6 +858,8 @@ class Database:
                 session.add(item)
             item.description = description
             item.enabled = enabled
+            if menu_visible is not None:
+                item.menu_visible = menu_visible
             if allowed_roles_json is not None:
                 item.allowed_roles_json = allowed_roles_json
             if command_type is not None:
@@ -857,6 +872,27 @@ class Database:
             session.commit()
             session.refresh(item)
             return item
+
+    def rename_bot_command_config(self, command: str, new_command: str) -> BotCommandConfig | None:
+        with self.session() as session:
+            item = session.get(BotCommandConfig, command)
+            if item is None:
+                return None
+            item.command = new_command
+            item.updated_at = utc_now()
+            session.commit()
+            session.refresh(item)
+            return item
+
+    def set_bot_command_order(self, command: str, sort_order: int) -> bool:
+        with self.session() as session:
+            item = session.get(BotCommandConfig, command)
+            if item is None:
+                return False
+            item.sort_order = sort_order
+            item.updated_at = utc_now()
+            session.commit()
+            return True
 
     def delete_bot_command_config(self, command: str) -> bool:
         """Remove a persisted management-bot command configuration."""

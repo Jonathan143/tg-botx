@@ -165,7 +165,9 @@ class BotAdminBindingBody(BaseModel):
 class BotCommandBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     description: str | None = Field(default=None, max_length=256)
+    command: str | None = Field(default=None, min_length=1, max_length=32)
     enabled: bool | None = None
+    menu_visible: bool | None = Field(default=None, alias="menuVisible")
     allowed_roles: list[Literal["anonymous", "user", "admin"]] | None = Field(
         default=None, alias="allowedRoles", max_length=3
     )
@@ -176,6 +178,7 @@ class BotCommandCreateBody(BaseModel):
     command: str = Field(min_length=1, max_length=32)
     description: str = Field(min_length=1, max_length=256)
     enabled: bool = False
+    menu_visible: bool = Field(default=False, alias="menuVisible")
     allowed_roles: list[Literal["anonymous", "user", "admin"]] = Field(
         default_factory=list, alias="allowedRoles", max_length=3
     )
@@ -183,6 +186,11 @@ class BotCommandCreateBody(BaseModel):
         default="none", alias="executorType"
     )
     executor_config: dict[str, Any] = Field(default_factory=dict, alias="executorConfig")
+
+
+class BotCommandOrderBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    commands: list[str] = Field(min_length=1, max_length=500)
 
 
 class MessageProbeBody(BaseModel):
@@ -1577,6 +1585,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 description,
                 body.enabled,
                 body.allowed_roles,
+                body.menu_visible,
                 body.executor_type,
                 body.executor_config,
             )
@@ -1595,6 +1604,13 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             logger.warning("手动拉取管理 Bot 指令失败 type=%s", type(exc).__name__)
             raise APIError("COMMAND_PULL_FAILED", "从 Telegram 拉取指令失败", 502) from exc
         return {"commands": commands}
+
+    @app.put("/api/bot/commands/order")
+    async def reorder_bot_commands(body: BotCommandOrderBody) -> dict[str, Any]:
+        try:
+            return {"commands": admin_bot.management.reorder_command_configs(body.commands)}
+        except (BotCommandValidationError, ValueError) as exc:
+            raise APIError("VALIDATION_FAILED", str(exc), 422) from exc
 
     @app.post("/api/bot/commands/sync")
     async def sync_bot_commands(_: EmptyBody) -> dict[str, Any]:
@@ -1629,10 +1645,24 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         if not description:
             raise APIError("VALIDATION_FAILED", "指令说明不能为空", 422)
         enabled = body.enabled if body.enabled is not None else current["enabled"]
+        menu_visible = (
+            body.menu_visible
+            if body.menu_visible is not None
+            else current.get("menuVisible", current["enabled"])
+        )
         try:
             item = admin_bot.management.update_command_config(
-                normalized, description, enabled, body.allowed_roles
+                normalized,
+                description,
+                enabled,
+                body.allowed_roles,
+                menu_visible,
+                body.command,
             )
+        except BotCommandConflictError as exc:
+            raise APIError("COMMAND_CONFLICT", str(exc), 409) from exc
+        except BotCommandForbiddenError as exc:
+            raise APIError("COMMAND_FORBIDDEN", str(exc), 403) from exc
         except (BotCommandValidationError, ValueError) as exc:
             raise APIError("VALIDATION_FAILED", str(exc), 422) from exc
         except BotBindingError as exc:

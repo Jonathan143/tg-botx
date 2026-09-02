@@ -199,7 +199,7 @@ class BotManagementService:
     def command_configs(self) -> list[dict[str, Any]]:
         stored = {item.command: item for item in self.database.list_bot_command_configs()}
         configs: list[dict[str, Any]] = []
-        for command, default_description in DEFAULT_BOT_COMMANDS:
+        for default_index, (command, default_description) in enumerate(DEFAULT_BOT_COMMANDS):
             item = stored.get(command)
             configs.append(
                 {
@@ -207,9 +207,15 @@ class BotManagementService:
                     "type": "system",
                     "description": item.description if item is not None else default_description,
                     "enabled": item.enabled if item is not None else True,
+                    "menuVisible": getattr(item, "menu_visible", item.enabled if item is not None else True),
                     "allowedRoles": self._item_roles(command, item),
                     "executorType": "none",
                     "executorConfig": {},
+                    "sortOrder": (
+                        getattr(item, "sort_order", None)
+                        if item is not None and getattr(item, "sort_order", None) is not None
+                        else default_index
+                    ),
                     "updatedAt": getattr(item, "updated_at", None).isoformat()
                     if getattr(item, "updated_at", None) is not None
                     else None,
@@ -224,11 +230,13 @@ class BotManagementService:
                 else "custom",
                 "description": item.description,
                 "enabled": item.enabled,
+                "menuVisible": getattr(item, "menu_visible", item.enabled),
                 "allowedRoles": self._item_roles(item.command, item),
                 "executorType": getattr(item, "executor_type", "none")
                 if getattr(item, "executor_type", "none") in _EXECUTOR_TYPES
                 else "none",
                 "executorConfig": self._item_executor_config(item),
+                "sortOrder": getattr(item, "sort_order", None),
                 "updatedAt": getattr(item, "updated_at", None).isoformat()
                 if getattr(item, "updated_at", None) is not None
                 else None,
@@ -236,7 +244,14 @@ class BotManagementService:
             for item in stored.values()
             if item.command not in default_names and _COMMAND_NAME_PATTERN.fullmatch(item.command)
         )
-        return configs
+        fallback_custom_order = len(DEFAULT_BOT_COMMANDS)
+        return sorted(
+            configs,
+            key=lambda item: (
+                item["sortOrder"] if item["sortOrder"] is not None else fallback_custom_order,
+                item["command"],
+            ),
+        )
 
     def update_command_config(
         self,
@@ -244,6 +259,8 @@ class BotManagementService:
         description: str,
         enabled: bool,
         allowed_roles: list[str] | tuple[str, ...] | None = None,
+        menu_visible: bool | None = None,
+        new_command: str | None = None,
     ) -> dict[str, Any]:
         if not _COMMAND_NAME_PATTERN.fullmatch(command):
             raise BotCommandValidationError("不支持该管理 Bot 指令")
@@ -254,6 +271,20 @@ class BotManagementService:
             (item for item in self.database.list_bot_command_configs() if item.command == command),
             None,
         )
+        target_command = (new_command or command).casefold().removeprefix("/")
+        if not _COMMAND_NAME_PATTERN.fullmatch(target_command):
+            raise BotCommandValidationError("不支持该管理 Bot 指令")
+        if target_command != command:
+            if command in {name for name, _ in DEFAULT_BOT_COMMANDS}:
+                raise BotCommandForbiddenError("系统指令不可修改指令名")
+            if target_command in {name for name, _ in DEFAULT_BOT_COMMANDS}:
+                raise BotCommandConflictError("该管理 Bot 指令已存在")
+            if any(item.command == target_command for item in self.database.list_bot_command_configs()):
+                raise BotCommandConflictError("该管理 Bot 指令已存在")
+            renamed = self.database.rename_bot_command_config(command, target_command)
+            if renamed is None:
+                raise ValueError("指令不存在")
+            command = target_command
         roles = self._normalize_roles(
             allowed_roles if allowed_roles is not None else self._item_roles(command, current)
         )
@@ -262,6 +293,7 @@ class BotManagementService:
             description,
             enabled,
             json.dumps(roles, ensure_ascii=False),
+            menu_visible=menu_visible,
             command_type="system"
             if command in {name for name, _ in DEFAULT_BOT_COMMANDS}
             else None,
@@ -274,6 +306,7 @@ class BotManagementService:
         description: str,
         enabled: bool = False,
         allowed_roles: list[str] | tuple[str, ...] | None = None,
+        menu_visible: bool = False,
         executor_type: str = "none",
         executor_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -305,11 +338,34 @@ class BotManagementService:
             description,
             enabled,
             json.dumps(roles, ensure_ascii=False),
+            menu_visible=menu_visible,
             command_type="custom",
             executor_type=executor_type,
             executor_config_json=encoded_config,
         )
         return self._command_item(item, roles=roles)
+
+    def reorder_command_configs(self, commands: list[str]) -> list[dict[str, Any]]:
+        current = self.command_configs()
+        current_names = {item["command"] for item in current}
+        normalized = [name.casefold().removeprefix("/") for name in commands]
+        if len(normalized) != len(set(normalized)) or set(normalized) != current_names:
+            raise BotCommandValidationError("指令排序列表与当前指令不一致")
+        by_name = {item["command"]: item for item in current}
+        stored_names = {stored.command for stored in self.database.list_bot_command_configs()}
+        for index, command in enumerate(normalized):
+            item = by_name[command]
+            if command not in stored_names:
+                self.update_command_config(
+                    command,
+                    item["description"],
+                    item["enabled"],
+                    item["allowedRoles"],
+                    item.get("menuVisible", True),
+                )
+            if not self.database.set_bot_command_order(command, index):
+                raise ValueError("指令排序保存失败")
+        return self.command_configs()
 
     @staticmethod
     def _normalize_roles(value: object) -> list[str]:
@@ -343,11 +399,13 @@ class BotManagementService:
             else "custom",
             "description": item.description,
             "enabled": item.enabled,
+            "menuVisible": getattr(item, "menu_visible", item.enabled),
             "allowedRoles": roles if roles is not None else cls._item_roles(item.command, item),
             "executorType": getattr(item, "executor_type", "none")
             if getattr(item, "executor_type", "none") in _EXECUTOR_TYPES
             else "none",
             "executorConfig": cls._item_executor_config(item),
+            "sortOrder": getattr(item, "sort_order", None),
             "updatedAt": getattr(item, "updated_at", None).isoformat()
             if getattr(item, "updated_at", None) is not None
             else None,
@@ -355,13 +413,7 @@ class BotManagementService:
 
     @staticmethod
     def _menu_visible(item: dict[str, Any]) -> bool:
-        return bool(
-            item.get("enabled")
-            and (
-                item.get("type", "system") == "system"
-                or item.get("executorType") not in {None, "none"}
-            )
-        )
+        return bool(item.get("menuVisible", item.get("enabled", False)))
 
     @classmethod
     def _item_roles(cls, command: str, item: Any) -> list[str]:
@@ -520,15 +572,26 @@ class TelegramManagementBot:
             if description is None:
                 current = current_configs.get(command)
                 description = current["description"] if current is not None else default_description
-                enabled = False
+                menu_visible = False
             else:
-                enabled = True
-            self.management.update_command_config(command, description, enabled)
+                menu_visible = True
+            self.management.update_command_config(
+                command,
+                description,
+                current_configs.get(command, {}).get("enabled", True),
+                menu_visible=menu_visible,
+            )
         for command, description in remote_by_name.items():
             # Telegram synchronization only owns the built-in command set;
             # custom commands are managed exclusively from the admin UI.
             if command in default_names:
-                self.management.update_command_config(command, description, True)
+                current = current_configs.get(command, {})
+                self.management.update_command_config(
+                    command,
+                    description,
+                    current.get("enabled", True),
+                    menu_visible=True,
+                )
         return self.command_configs()
 
     async def sync_remote_commands(self) -> list[dict[str, Any]]:
