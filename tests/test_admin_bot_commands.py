@@ -1,11 +1,17 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from tg_botx.features.admin_bot import BotManagementService, TelegramManagementBot
+import pytest
+
+from tg_botx.features.admin_bot import (
+    BotCommandForbiddenError,
+    BotManagementService,
+    TelegramManagementBot,
+)
 from tg_botx.integrations.telegram_bot import TelegramBotApiClient
 
 
-def test_command_configs_ignore_unsupported_remote_history() -> None:
+def test_command_configs_include_historical_custom_commands() -> None:
     database = SimpleNamespace(
         list_bot_command_configs=lambda: [
             SimpleNamespace(command="help", description="自定义帮助", enabled=True),
@@ -22,7 +28,9 @@ def test_command_configs_ignore_unsupported_remote_history() -> None:
         "unbind",
         "tasks",
         "status",
+        "new",
     ]
+    assert configs[-1]["type"] == "custom"
     assert (
         next(item for item in configs if item["command"] == "help")["description"] == "自定义帮助"
     )
@@ -101,3 +109,38 @@ async def test_telegram_command_api_sends_scope_and_language() -> None:
         (("getMyCommands", {"scope": scope, "language_code": "en"}), {}),
         (("deleteMyCommands", {"scope": scope, "language_code": "en"}), {}),
     ]
+
+
+def test_create_custom_command_persists_reserved_executor_shape() -> None:
+    rows: list[SimpleNamespace] = []
+
+    def upsert(command, description, enabled, allowed_roles_json, **kwargs):
+        item = SimpleNamespace(
+            command=command,
+            description=description,
+            enabled=enabled,
+            allowed_roles_json=allowed_roles_json,
+            command_type=kwargs["command_type"],
+            executor_type=kwargs["executor_type"],
+            executor_config_json=kwargs["executor_config_json"],
+        )
+        rows.append(item)
+        return item
+
+    database = SimpleNamespace(list_bot_command_configs=lambda: rows, upsert_bot_command_config=upsert)
+    item = BotManagementService(database, SimpleNamespace()).create_command_config(
+        "/report", "生成报告"
+    )
+
+    assert item["type"] == "custom"
+    assert item["executorType"] == "none"
+    assert item["executorConfig"] == {}
+    assert rows[0].enabled is False
+
+
+def test_system_command_cannot_be_deleted() -> None:
+    database = SimpleNamespace(list_bot_command_configs=lambda: [])
+    service = BotManagementService(database, SimpleNamespace())
+
+    with pytest.raises(BotCommandForbiddenError):
+        service.delete_command_config("help")

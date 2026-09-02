@@ -61,9 +61,24 @@ _DEFAULT_COMMAND_ROLES: dict[str, tuple[str, ...]] = {
     "status": ("user", "admin"),
 }
 _COMMAND_NAME_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
+_COMMAND_TYPES = {"system", "custom"}
+_EXECUTOR_TYPES = {"none", "http", "builtin_function", "python", "javascript"}
+_MAX_EXECUTOR_CONFIG_BYTES = 32 * 1024
 
 
 class BotBindingError(RuntimeError):
+    pass
+
+
+class BotCommandValidationError(BotBindingError):
+    pass
+
+
+class BotCommandConflictError(BotBindingError):
+    pass
+
+
+class BotCommandForbiddenError(BotBindingError):
     pass
 
 
@@ -189,18 +204,28 @@ class BotManagementService:
             configs.append(
                 {
                     "command": command,
+                    "type": "system",
                     "description": item.description if item is not None else default_description,
                     "enabled": item.enabled if item is not None else True,
                     "allowedRoles": self._item_roles(command, item),
+                    "executorType": "none",
+                    "executorConfig": {},
                 }
             )
         default_names = {command for command, _ in DEFAULT_BOT_COMMANDS}
         configs.extend(
             {
                 "command": item.command,
+                "type": getattr(item, "command_type", "custom")
+                if getattr(item, "command_type", "custom") in _COMMAND_TYPES
+                else "custom",
                 "description": item.description,
                 "enabled": item.enabled,
                 "allowedRoles": self._item_roles(item.command, item),
+                "executorType": getattr(item, "executor_type", "none")
+                if getattr(item, "executor_type", "none") in _EXECUTOR_TYPES
+                else "none",
+                "executorConfig": self._item_executor_config(item),
             }
             for item in stored.values()
             if item.command not in default_names and _COMMAND_NAME_PATTERN.fullmatch(item.command)
@@ -215,7 +240,10 @@ class BotManagementService:
         allowed_roles: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         if not _COMMAND_NAME_PATTERN.fullmatch(command):
-            raise BotBindingError("不支持该管理 Bot 指令")
+            raise BotCommandValidationError("不支持该管理 Bot 指令")
+        description = description.strip()
+        if not description or len(description) > 256:
+            raise BotCommandValidationError("指令说明不能为空且不能超过 256 个字符")
         current = next(
             (item for item in self.database.list_bot_command_configs() if item.command == command),
             None,
@@ -224,23 +252,107 @@ class BotManagementService:
             allowed_roles if allowed_roles is not None else self._item_roles(command, current)
         )
         item = self.database.upsert_bot_command_config(
-            command, description, enabled, json.dumps(roles, ensure_ascii=False)
+            command,
+            description,
+            enabled,
+            json.dumps(roles, ensure_ascii=False),
+            command_type="system"
+            if command in {name for name, _ in DEFAULT_BOT_COMMANDS}
+            else None,
         )
-        return {
-            "command": item.command,
-            "description": item.description,
-            "enabled": item.enabled,
-            "allowedRoles": roles,
-        }
+        return self._command_item(item, roles=roles)
+
+    def create_command_config(
+        self,
+        command: str,
+        description: str,
+        enabled: bool = False,
+        allowed_roles: list[str] | tuple[str, ...] | None = None,
+        executor_type: str = "none",
+        executor_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        command = command.casefold().removeprefix("/")
+        if not _COMMAND_NAME_PATTERN.fullmatch(command):
+            raise BotCommandValidationError("不支持该管理 Bot 指令")
+        description = description.strip()
+        if not description or len(description) > 256:
+            raise BotCommandValidationError("指令说明不能为空且不能超过 256 个字符")
+        if command in {name for name, _ in DEFAULT_BOT_COMMANDS}:
+            raise BotCommandConflictError("系统指令不可重复创建")
+        if executor_type not in _EXECUTOR_TYPES:
+            raise BotCommandValidationError("不支持的指令执行器")
+        config = executor_config if executor_config is not None else {}
+        if not isinstance(config, dict):
+            raise BotCommandValidationError("执行器配置必须是 JSON 对象")
+        try:
+            encoded_config = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise BotCommandValidationError("执行器配置必须是合法 JSON") from exc
+        if len(encoded_config.encode("utf-8")) > _MAX_EXECUTOR_CONFIG_BYTES:
+            raise BotCommandValidationError("执行器配置不能超过 32KB")
+        roles = self._normalize_roles(allowed_roles or [])
+        existing = {item.command.casefold() for item in self.database.list_bot_command_configs()}
+        if command in existing:
+            raise BotCommandConflictError("该管理 Bot 指令已存在")
+        item = self.database.upsert_bot_command_config(
+            command,
+            description,
+            enabled,
+            json.dumps(roles, ensure_ascii=False),
+            command_type="custom",
+            executor_type=executor_type,
+            executor_config_json=encoded_config,
+        )
+        return self._command_item(item, roles=roles)
 
     @staticmethod
     def _normalize_roles(value: object) -> list[str]:
         if not isinstance(value, (list, tuple, set)):
-            raise BotBindingError("可调用身份配置无效")
+            raise BotCommandValidationError("可调用身份配置无效")
         roles = list(dict.fromkeys(value))
-        if not roles or any(role not in _ALL_COMMAND_ROLES for role in roles):
-            raise BotBindingError("可调用身份至少选择一项，且只能选择未绑定用户、普通用户或管理员")
+        if any(role not in _ALL_COMMAND_ROLES for role in roles):
+            raise BotCommandValidationError("可调用身份只能选择未绑定用户、普通用户或管理员")
+        if not roles:
+            return list(_ALL_COMMAND_ROLES)
         return [str(role) for role in _ALL_COMMAND_ROLES if role in roles]
+
+    @staticmethod
+    def _item_executor_config(item: Any) -> dict[str, Any]:
+        raw = getattr(item, "executor_config_json", None)
+        if isinstance(raw, str):
+            try:
+                value = json.loads(raw)
+                if isinstance(value, dict):
+                    return value
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return {}
+
+    @classmethod
+    def _command_item(cls, item: Any, *, roles: list[str] | None = None) -> dict[str, Any]:
+        return {
+            "command": item.command,
+            "type": getattr(item, "command_type", "custom")
+            if getattr(item, "command_type", "custom") in _COMMAND_TYPES
+            else "custom",
+            "description": item.description,
+            "enabled": item.enabled,
+            "allowedRoles": roles if roles is not None else cls._item_roles(item.command, item),
+            "executorType": getattr(item, "executor_type", "none")
+            if getattr(item, "executor_type", "none") in _EXECUTOR_TYPES
+            else "none",
+            "executorConfig": cls._item_executor_config(item),
+        }
+
+    @staticmethod
+    def _menu_visible(item: dict[str, Any]) -> bool:
+        return bool(
+            item.get("enabled")
+            and (
+                item.get("type", "system") == "system"
+                or item.get("executorType") not in {None, "none"}
+            )
+        )
 
     @classmethod
     def _item_roles(cls, command: str, item: Any) -> list[str]:
@@ -250,14 +362,14 @@ class BotManagementService:
                 return cls._normalize_roles(json.loads(raw))
             except (ValueError, TypeError, json.JSONDecodeError, BotBindingError):
                 pass
+        if item is not None and raw is None:
+            return list(_ALL_COMMAND_ROLES)
         return list(_DEFAULT_COMMAND_ROLES.get(command, ("user", "admin")))
 
     def delete_command_config(self, command: str) -> bool:
         """Delete a command from the persisted menu.
 
-        Built-in commands are represented by defaults when no row exists, so
-        deleting one must persist it as disabled instead of removing the row.
-        The next explicit pull can re-enable it when Telegram contains it.
+        Built-in commands are protected and cannot be deleted.
         """
         if not _COMMAND_NAME_PATTERN.fullmatch(command):
             raise BotBindingError("不支持该管理 Bot 指令")
@@ -266,13 +378,7 @@ class BotManagementService:
         )
         if default is None:
             return self.database.delete_bot_command_config(command)
-        current = next(
-            (item for item in self.database.list_bot_command_configs() if item.command == command),
-            None,
-        )
-        description = current.description if current is not None else default
-        self.database.upsert_bot_command_config(command, description, False)
-        return True
+        raise BotCommandForbiddenError("系统指令不可删除")
 
     def bind(self, code: str, *, user_id: int, chat_id: int, user: dict[str, Any]) -> BotBinding:
         normalized = normalize_binding_code(code)
@@ -410,16 +516,10 @@ class TelegramManagementBot:
                 enabled = True
             self.management.update_command_config(command, description, enabled)
         for command, description in remote_by_name.items():
-            if command not in default_names:
+            # Telegram synchronization only owns the built-in command set;
+            # custom commands are managed exclusively from the admin UI.
+            if command in default_names:
                 self.management.update_command_config(command, description, True)
-        remote_names = set(remote_by_name)
-        for item in self.database.list_bot_command_configs():
-            if (
-                item.command not in remote_names
-                and item.command not in default_names
-                and _COMMAND_NAME_PATTERN.fullmatch(item.command)
-            ):
-                self.management.delete_command_config(item.command)
         return self.command_configs()
 
     async def sync_remote_commands(self) -> list[dict[str, Any]]:
@@ -433,7 +533,7 @@ class TelegramManagementBot:
         commands = [
             {"command": item["command"], "description": item["description"]}
             for item in self.command_configs()
-            if item["enabled"]
+            if BotManagementService._menu_visible(item)
         ]
         # Telegram resolves a private-chat scope before the default scope. A
         # stale private-chat menu therefore masks a newly configured default
@@ -541,17 +641,21 @@ class TelegramManagementBot:
         canonical_command = "tasks" if command == "task" else command
         argument = parsed[1].strip() if len(parsed) > 1 else ""
         update_number = update_id if isinstance(update_id, int) else None
-        if canonical_command not in {item[0] for item in DEFAULT_BOT_COMMANDS}:
+        config = next(
+            (item for item in self.command_configs() if item["command"] == canonical_command),
+            None,
+        )
+        if config is None:
             await self._send(chat_id, "无法识别该命令，请发送 /help 查看可用命令。")
             return
-        if not any(
-            item["command"] == canonical_command and item["enabled"]
-            for item in self.command_configs()
-        ):
+        if not config["enabled"]:
             await self._send(chat_id, "该命令当前已停用，请联系管理员。")
             return
         if not self._command_allowed(user_id, chat_id, canonical_command, update_number):
             await self._send(chat_id, "你没有权限调用该命令。")
+            return
+        if config.get("type") == "custom":
+            await self._send(chat_id, "该自定义指令的执行器尚未实现，请联系管理员。")
             return
         if command == "start":
             await self._send(chat_id, self._welcome(user_id, chat_id))
@@ -810,7 +914,8 @@ class TelegramManagementBot:
             available = {
                 item["command"]
                 for item in self.command_configs()
-                if item["enabled"] and role in item.get("allowedRoles", [])
+                if BotManagementService._menu_visible(item)
+                and role in item.get("allowedRoles", [])
             }
             actions = []
             if "tasks" in available:
@@ -830,7 +935,9 @@ class TelegramManagementBot:
             else None
         )
         for item in self.command_configs():
-            if item["enabled"] and (role is None or role in item.get("allowedRoles", [])):
+            if BotManagementService._menu_visible(item) and (
+                role is None or role in item.get("allowedRoles", [])
+            ):
                 lines.append(f"/{item['command']} {html.escape(item['description'])}")
         return "\n\n".join(lines)
 

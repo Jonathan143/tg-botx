@@ -266,6 +266,13 @@ class BotCommandConfig(Base):
     command: Mapped[str] = mapped_column(String(32), primary_key=True)
     description: Mapped[str] = mapped_column(String(256))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    command_type: Mapped[str] = mapped_column(
+        String(20), default="custom", server_default="custom", nullable=False
+    )
+    executor_type: Mapped[str] = mapped_column(
+        String(30), default="none", server_default="none", nullable=False
+    )
+    executor_config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # JSON array of identities allowed to invoke this command.  ``NULL`` is
     # retained for rows created before command-level authorization existed;
     # the management service supplies the appropriate default in that case.
@@ -368,11 +375,30 @@ class Database:
         command_columns = {
             item["name"] for item in inspect(self.engine).get_columns("bot_command_configs")
         }
-        if "allowed_roles_json" not in command_columns:
+        command_additions = {
+            "allowed_roles_json": "TEXT",
+            "command_type": "VARCHAR(20) DEFAULT 'custom'",
+            "executor_type": "VARCHAR(30) DEFAULT 'none'",
+            "executor_config_json": "TEXT",
+        }
+        missing_command_columns = {
+            name: ddl for name, ddl in command_additions.items() if name not in command_columns
+        }
+        if missing_command_columns:
             with self.engine.begin() as connection:
-                connection.exec_driver_sql(
-                    "ALTER TABLE bot_command_configs ADD COLUMN allowed_roles_json TEXT"
-                )
+                for name, ddl in missing_command_columns.items():
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE bot_command_configs ADD COLUMN {name} {ddl}"
+                    )
+                # Existing built-in rows are protected system commands. Any
+                # historical rows outside this allow-list remain custom.
+        # Re-assert the protected type on every startup so databases migrated
+        # by an earlier build cannot accidentally downgrade built-ins.
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "UPDATE bot_command_configs SET command_type = 'system' "
+                "WHERE command IN ('start','help','bind','unbind','tasks','status')"
+            )
         with self.session() as session:
             if session.get(SchemaVersion, 2) is None:
                 session.add(SchemaVersion(version=2))
@@ -807,6 +833,10 @@ class Database:
         description: str,
         enabled: bool,
         allowed_roles_json: str | None = None,
+        *,
+        command_type: str | None = None,
+        executor_type: str | None = None,
+        executor_config_json: str | None = None,
     ) -> BotCommandConfig:
         with self.session() as session:
             item = session.get(BotCommandConfig, command)
@@ -817,6 +847,12 @@ class Database:
             item.enabled = enabled
             if allowed_roles_json is not None:
                 item.allowed_roles_json = allowed_roles_json
+            if command_type is not None:
+                item.command_type = command_type
+            if executor_type is not None:
+                item.executor_type = executor_type
+            if executor_config_json is not None:
+                item.executor_config_json = executor_config_json
             item.updated_at = utc_now()
             session.commit()
             session.refresh(item)

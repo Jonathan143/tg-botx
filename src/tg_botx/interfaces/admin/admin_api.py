@@ -27,7 +27,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import OperationalError
 
 from tg_botx.config import Settings
-from tg_botx.features.admin_bot import BotBindingError, TelegramManagementBot
+from tg_botx.features.admin_bot import (
+    BotBindingError,
+    BotCommandConflictError,
+    BotCommandForbiddenError,
+    BotCommandValidationError,
+    TelegramManagementBot,
+)
 from tg_botx.features.checkin.runtime import (
     CheckinService,
     ManualRunConflict,
@@ -161,8 +167,22 @@ class BotCommandBody(BaseModel):
     description: str | None = Field(default=None, max_length=256)
     enabled: bool | None = None
     allowed_roles: list[Literal["anonymous", "user", "admin"]] | None = Field(
-        default=None, alias="allowedRoles", min_length=1, max_length=3
+        default=None, alias="allowedRoles", max_length=3
     )
+
+
+class BotCommandCreateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    command: str = Field(min_length=1, max_length=32)
+    description: str = Field(min_length=1, max_length=256)
+    enabled: bool = False
+    allowed_roles: list[Literal["anonymous", "user", "admin"]] = Field(
+        default_factory=list, alias="allowedRoles", max_length=3
+    )
+    executor_type: Literal["none", "http", "builtin_function", "python", "javascript"] = Field(
+        default="none", alias="executorType"
+    )
+    executor_config: dict[str, Any] = Field(default_factory=dict, alias="executorConfig")
 
 
 class MessageProbeBody(BaseModel):
@@ -1546,6 +1566,25 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     async def list_bot_commands() -> dict[str, Any]:
         return {"commands": admin_bot.command_configs()}
 
+    @app.post("/api/bot/commands", status_code=201)
+    async def create_bot_command(body: BotCommandCreateBody) -> dict[str, Any]:
+        description = body.description.strip()
+        if not description:
+            raise APIError("VALIDATION_FAILED", "指令说明不能为空", 422)
+        try:
+            return admin_bot.management.create_command_config(
+                body.command,
+                description,
+                body.enabled,
+                body.allowed_roles,
+                body.executor_type,
+                body.executor_config,
+            )
+        except BotCommandConflictError as exc:
+            raise APIError("COMMAND_CONFLICT", str(exc), 409) from exc
+        except (BotCommandValidationError, ValueError) as exc:
+            raise APIError("VALIDATION_FAILED", str(exc), 422) from exc
+
     @app.post("/api/bot/commands/pull")
     async def pull_bot_commands(_: EmptyBody) -> dict[str, Any]:
         if admin_bot.client is None:
@@ -1572,6 +1611,8 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     @app.put("/api/bot/commands/{command}")
     async def update_bot_command(command: str, body: BotCommandBody) -> dict[str, Any]:
         normalized = command.casefold().removeprefix("/")
+        if not re.fullmatch(r"^[a-z0-9_]{1,32}$", normalized):
+            raise APIError("VALIDATION_FAILED", "不支持该管理 Bot 指令", 422)
         current = next(
             (
                 item
@@ -1592,15 +1633,17 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             item = admin_bot.management.update_command_config(
                 normalized, description, enabled, body.allowed_roles
             )
-        except ValueError as exc:
+        except (BotCommandValidationError, ValueError) as exc:
             raise APIError("VALIDATION_FAILED", str(exc), 422) from exc
         except BotBindingError as exc:
-            raise APIError("COMMAND_NOT_FOUND", str(exc), 404) from exc
+            raise APIError("VALIDATION_FAILED", str(exc), 422) from exc
         return item
 
     @app.delete("/api/bot/commands/{command}", status_code=204)
     async def delete_bot_command(command: str) -> Response:
         normalized = command.casefold().removeprefix("/")
+        if not re.fullmatch(r"^[a-z0-9_]{1,32}$", normalized):
+            raise APIError("VALIDATION_FAILED", "不支持该管理 Bot 指令", 422)
         current = next(
             (
                 item
@@ -1613,8 +1656,10 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             raise APIError("COMMAND_NOT_FOUND", "不支持该管理 Bot 指令", 404)
         try:
             admin_bot.management.delete_command_config(normalized)
+        except BotCommandForbiddenError as exc:
+            raise APIError("COMMAND_FORBIDDEN", str(exc), 403) from exc
         except BotBindingError as exc:
-            raise APIError("COMMAND_NOT_FOUND", str(exc), 404) from exc
+            raise APIError("VALIDATION_FAILED", str(exc), 422) from exc
         return Response(status_code=204)
 
     @app.get("/api/settings")
