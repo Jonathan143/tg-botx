@@ -718,10 +718,23 @@ class CheckinService:
         self.scheduler.add_job(
             self._scheduled_run,
             trigger=DateTrigger(run_date=task.next_run_at),
-            args=[task.id],
+            # Carry the occurrence that created this one-shot job.  A stale
+            # callback can still fire after an administrator advances the
+            # schedule (for example via ``skip_next_task``); it must not run
+            # the newly scheduled occurrence immediately.
+            args=[task.id, task.next_run_at],
             id=f"task:{task.id}",
+            # Use the configured task name instead of the callback name in
+            # APScheduler's own "Added job" log entry.
+            name=task.name,
             replace_existing=True,
             misfire_grace_time=None,
+        )
+        logger.info(
+            "已安排任务 task_id=%s name=%s next_run_at=%s",
+            task.id,
+            task.name,
+            utc_isoformat(task.next_run_at),
         )
 
     def _remove_scheduled_task(self, task_id: str) -> None:
@@ -905,6 +918,77 @@ class CheckinService:
         self._publish_task_updated(task.id)
         return updated
 
+    def skip_next_task(self, task_id: str) -> Task:
+        """Skip the currently scheduled occurrence and advance the schedule.
+
+        Skipping is an administrator action on the future schedule only; it
+        does not affect an execution that is already running.  The consumed
+        occurrence is recorded as a skipped run so task history and dashboard
+        counters retain an auditable record of the action.
+        """
+
+        task = self.database.get_task_any(task_id)
+        if task is None:
+            raise TaskNotFound("任务不存在")
+        if task.archived:
+            raise TaskStateError("归档任务不能跳过下次运行")
+        if not task.enabled:
+            raise TaskStateError("任务未启用，无法跳过下次运行")
+        planned_at = task.next_run_at
+        if planned_at is None:
+            raise TaskStateError("任务当前没有安排中的下次运行")
+
+        finished = utc_now()
+        # A scheduled callback keeps the consumed occurrence in
+        # ``next_run_at`` until it finishes.  Do not create a second skipped
+        # history row if that occurrence has already started.
+        if planned_at <= finished and (
+            task.id in self.running or self.database.has_running_run(task.id)
+        ):
+            raise TaskStateError("任务当前正在执行，无法跳过已开始的运行")
+        try:
+            next_run = next_run_for(
+                schedule_from_task(task),
+                now=finished,
+                after=planned_at,
+            )
+        except ValueError:
+            next_run = None
+
+        version = self.database.get_latest_workflow_version(task.id)
+        skipped_run = self.database.add_run(
+            TaskRun(
+                task_id=task.id,
+                planned_at=planned_at,
+                started_at=finished,
+                finished_at=finished,
+                status="skipped",
+                attempts=0,
+                error="管理员跳过本次运行",
+                run_kind="published",
+                workflow_version=str(version.version_number) if version else None,
+                workflow_version_id=version.id if version else None,
+            )
+        )
+        updated = self.database.update_task(
+            task.id,
+            next_run_at=next_run,
+            last_run_at=finished,
+            last_status="skipped",
+        )
+        self._bump_task_revision(task.id)
+        self._sync_schedule(updated)
+        self._publish_task_updated(task.id)
+        logger.info(
+            "跳过任务下次运行 task_id=%s name=%s planned_at=%s next_run_at=%s run_id=%s",
+            task.id,
+            task.name,
+            utc_isoformat(planned_at),
+            utc_isoformat(next_run),
+            skipped_run.id,
+        )
+        return updated
+
     def archive_task(self, task_id: str) -> Task:
         task = self.database.get_task_any(task_id)
         if task is None:
@@ -929,7 +1013,14 @@ class CheckinService:
         self._publish_task_updated(task.id)
         return updated
 
-    async def _scheduled_run(self, task_id: str) -> None:
+    async def _scheduled_run(
+        self, task_id: str, planned_at: datetime | None = None
+    ) -> None:
+        if planned_at is not None:
+            current = self.database.get_task(task_id)
+            if current is None or current.next_run_at != planned_at:
+                logger.info("忽略过期调度回调 task_id=%s", task_id)
+                return
         await self.run_task(task_id)
 
     async def _watch_cancellation(self, task_id: str, running: asyncio.Task[bool]) -> None:

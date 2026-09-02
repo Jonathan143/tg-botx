@@ -1062,6 +1062,10 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     async def disable_task(task_id: str, _: EmptyBody):
         return await task_action(task_id, "disable")
 
+    @app.post("/api/tasks/{task_id}/skip-next")
+    async def skip_next_task(task_id: str, _: EmptyBody):
+        return await task_action(task_id, "skip_next")
+
     @app.post("/api/tasks/{task_id}/archive")
     async def archive_task(task_id: str, _: EmptyBody):
         return await task_action(task_id, "archive")
