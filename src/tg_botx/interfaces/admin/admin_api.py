@@ -193,6 +193,12 @@ class BotCommandOrderBody(BaseModel):
     commands: list[str] = Field(min_length=1, max_length=500)
 
 
+class BotCheckinConfigBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    min_points: int = Field(alias="minPoints", ge=1, le=1_000_000)
+    max_points: int = Field(alias="maxPoints", ge=1, le=1_000_000)
+
+
 class MessageProbeBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target: str = Field(min_length=1, max_length=200)
@@ -1542,11 +1548,10 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         page_size: int = Query(20, alias="pageSize", ge=1, le=100),
     ) -> dict[str, Any]:
         bindings, total = admin_bot.management.bindings_page(page=page, page_size=page_size)
-        return {
-            "enabled": settings.bot_enabled,
-            "configured": admin_bot.status.configured,
-            "status": admin_bot.public_status(),
-            "bindings": [
+        serialized_bindings = []
+        for item in bindings:
+            points = database.get_bot_user_points(item.user_id)
+            serialized_bindings.append(
                 {
                     "id": item.id,
                     "userId": item.user_id,
@@ -1556,9 +1561,14 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                     "lastName": item.last_name,
                     "boundAt": _iso(item.bound_at),
                     "role": item.role or "user",
+                    "points": points.points if points is not None else 0,
                 }
-                for item in bindings
-            ],
+            )
+        return {
+            "enabled": settings.bot_enabled,
+            "configured": admin_bot.status.configured,
+            "status": admin_bot.public_status(),
+            "bindings": serialized_bindings,
             "bindingsPagination": {"page": page, "pageSize": page_size, "total": total},
         }
 
@@ -1577,6 +1587,18 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
     @app.get("/api/bot/commands")
     async def list_bot_commands() -> dict[str, Any]:
         return {"commands": admin_bot.command_configs()}
+
+    @app.get("/api/bot/checkin-config")
+    async def get_bot_checkin_config() -> dict[str, int]:
+        return admin_bot.management.checkin_config()
+
+    @app.patch("/api/bot/checkin-config")
+    @app.put("/api/bot/checkin-config")
+    async def update_bot_checkin_config(body: BotCheckinConfigBody) -> dict[str, int]:
+        try:
+            return admin_bot.management.update_checkin_config(body.min_points, body.max_points)
+        except BotBindingError as exc:
+            raise APIError("VALIDATION_FAILED", str(exc), 422) from exc
 
     @app.post("/api/bot/commands", status_code=201)
     async def create_bot_command(body: BotCommandCreateBody) -> dict[str, Any]:

@@ -50,6 +50,7 @@ DEFAULT_BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("unbind", "解除绑定"),
     ("tasks", "查看任务列表"),
     ("status", "查看系统状态"),
+    ("checkin", "每日签到领取积分"),
 )
 _ALL_COMMAND_ROLES = ("anonymous", "user", "admin")
 _DEFAULT_COMMAND_ROLES: dict[str, tuple[str, ...]] = {
@@ -59,11 +60,16 @@ _DEFAULT_COMMAND_ROLES: dict[str, tuple[str, ...]] = {
     "unbind": ("user", "admin"),
     "tasks": ("user", "admin"),
     "status": ("user", "admin"),
+    "checkin": ("user", "admin"),
 }
 _COMMAND_NAME_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 _COMMAND_TYPES = {"system", "custom"}
 _EXECUTOR_TYPES = {"none", "http", "builtin_function", "python", "javascript"}
 _MAX_EXECUTOR_CONFIG_BYTES = 32 * 1024
+_CHECKIN_MIN_KEY = "checkin.points_min"
+_CHECKIN_MAX_KEY = "checkin.points_max"
+_DEFAULT_CHECKIN_MIN = 1
+_DEFAULT_CHECKIN_MAX = 10
 
 
 class BotBindingError(RuntimeError):
@@ -116,7 +122,7 @@ class BotManagementService:
 
     def __init__(self, database: Database, checkin: CheckinService):
         self.database = database
-        self.checkin = checkin
+        self.checkin_service = checkin
 
     def _generate_code(self, role: str, expires_at: datetime | None) -> tuple[str, BotBindingCode]:
         raw = "".join(
@@ -196,10 +202,48 @@ class BotManagementService:
     def revoke_binding(self, binding_id: str) -> bool:
         return self.database.revoke_bot_binding(binding_id)
 
+    def checkin_config(self) -> dict[str, int]:
+        getter = getattr(self.database, "get_bot_setting", None)
+
+        def read(key: str, fallback: int) -> int:
+            if not callable(getter):
+                return fallback
+            try:
+                value = int(getter(key) or fallback)
+            except (TypeError, ValueError):
+                return fallback
+            return value if value >= 1 else fallback
+
+        minimum = read(_CHECKIN_MIN_KEY, _DEFAULT_CHECKIN_MIN)
+        maximum = read(_CHECKIN_MAX_KEY, _DEFAULT_CHECKIN_MAX)
+        if maximum < minimum:
+            maximum = minimum
+        return {"minPoints": minimum, "maxPoints": maximum}
+
+    def update_checkin_config(self, minimum: int, maximum: int) -> dict[str, int]:
+        if minimum < 1 or maximum < 1 or minimum > maximum:
+            raise BotBindingError("积分随机范围无效，需满足 1 ≤ 最小值 ≤ 最大值")
+        if maximum > 1_000_000:
+            raise BotBindingError("积分随机范围不能超过 1000000")
+        self.database.set_bot_setting(_CHECKIN_MIN_KEY, str(minimum))
+        self.database.set_bot_setting(_CHECKIN_MAX_KEY, str(maximum))
+        return {"minPoints": minimum, "maxPoints": maximum}
+
+    def checkin(self, user_id: int, chat_id: int) -> tuple[str, int, int]:
+        config = self.checkin_config()
+        return self.database.checkin_bot_user(
+            user_id, chat_id, config["minPoints"], config["maxPoints"]
+        )
+
     def command_configs(self) -> list[dict[str, Any]]:
         stored = {item.command: item for item in self.database.list_bot_command_configs()}
         configs: list[dict[str, Any]] = []
         for default_index, (command, default_description) in enumerate(DEFAULT_BOT_COMMANDS):
+            # Keep adapters created before the points feature usable: a
+            # storage implementation that does not expose point persistence
+            # cannot execute /checkin and should not advertise it.
+            if command == "checkin" and not hasattr(self.database, "checkin_bot_user"):
+                continue
             item = stored.get(command)
             configs.append(
                 {
@@ -801,6 +845,16 @@ class TelegramManagementBot:
             await self._send_tasks(chat_id, 1)
         elif command == "status":
             await self._send(chat_id, self._system_status())
+        elif command == "checkin":
+            status, amount, total = self.management.checkin(user_id, chat_id)
+            if status == "success":
+                self.management.audit(user_id, chat_id, "checkin", "success", update_id=update_number)
+                await self._send(chat_id, f"✅ 签到成功，获得 {amount} 积分！\n当前积分：{total}")
+            elif status == "already":
+                await self._send(chat_id, f"你今天已经签到过了。\n当前积分：{total}")
+            else:
+                self.management.audit(user_id, chat_id, "checkin", "denied", update_id=update_number)
+                await self._send(chat_id, "请先绑定用户后再签到。")
         else:
             await self._send(chat_id, "无法识别该命令，请发送 /help 查看可用命令。")
 
@@ -818,7 +872,7 @@ class TelegramManagementBot:
             )
             await self._send(chat_id, f"❌ {html.escape(str(exc))}")
             return
-        await self._send(chat_id, "✅ 绑定成功。现在可以使用 /tasks 和 /status。")
+        await self._send(chat_id, "✅ 绑定成功。现在可以使用 /tasks、/status 和 /checkin。")
 
     async def _handle_callback(self, callback: dict[str, object], update_id: object) -> None:
         callback_id = callback.get("id")
@@ -1051,6 +1105,8 @@ class TelegramManagementBot:
                 actions.append("发送 /tasks 查看任务")
             if "status" in available:
                 actions.append("发送 /status 查看系统状态")
+            if "checkin" in available:
+                actions.append("发送 /checkin 领取每日积分")
             suffix = "\n\n" + "，".join(actions) + "。" if actions else ""
             role_label = "管理员" if self.management.is_admin(user_id, chat_id) else "普通用户"
             return f"👋 你已绑定{role_label}身份。{suffix}"

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Integer,
     String,
@@ -256,6 +257,32 @@ class BotBindingBatch(Base):
     ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     code_ids_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+
+
+class BotUserPoint(Base):
+    """Points and daily check-in state for a Telegram user.
+
+    Rows are retained after unbinding so a later re-bind does not erase a
+    user's accumulated points.  ``last_checkin_date`` is stored as a UTC
+    calendar date, matching the database's UTC persistence convention.
+    """
+
+    __tablename__ = "bot_user_points"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    points: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_checkin_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
+
+
+class BotSetting(Base):
+    """Small persisted settings owned by the management Bot."""
+
+    __tablename__ = "bot_settings"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
 
 
 class BotCommandConfig(Base):
@@ -832,6 +859,73 @@ class Database:
             item.unbound_at = utc_now()
             session.commit()
             return True
+
+    def get_bot_user_points(self, user_id: int) -> BotUserPoint | None:
+        with self.session() as session:
+            return session.get(BotUserPoint, user_id)
+
+    def checkin_bot_user(
+        self,
+        user_id: int,
+        chat_id: int,
+        amount_min: int,
+        amount_max: int,
+    ) -> tuple[str, int, int]:
+        """Award one random daily check-in amount to an active binding.
+
+        The returned status is ``not_bound``, ``already`` or ``success``;
+        callers can turn it into user-facing text without exposing database
+        details.  The binding check and point update happen in one transaction.
+        """
+
+        if amount_min < 1 or amount_max < amount_min:
+            raise ValueError("积分随机范围无效")
+
+        import secrets
+
+        now = utc_now()
+        today = now.date()
+        with self.session() as session:
+            binding = session.scalar(
+                select(BotBinding).where(
+                    BotBinding.user_id == user_id,
+                    BotBinding.chat_id == chat_id,
+                    BotBinding.is_active.is_(True),
+                )
+            )
+            if binding is None:
+                return "not_bound", 0, 0
+            row = session.get(BotUserPoint, user_id)
+            if row is None:
+                row = BotUserPoint(user_id=user_id, points=0)
+                session.add(row)
+                session.flush()
+            if row.last_checkin_date == today:
+                return "already", 0, row.points
+            amount = secrets.randbelow(amount_max - amount_min + 1) + amount_min
+            row.points += amount
+            row.last_checkin_date = today
+            row.updated_at = now
+            session.commit()
+            return "success", amount, row.points
+
+    def get_bot_setting(self, key: str) -> str | None:
+        with self.session() as session:
+            item = session.get(BotSetting, key)
+            return item.value if item is not None else None
+
+    def set_bot_setting(self, key: str, value: str) -> BotSetting:
+        with self.session() as session:
+            item = session.get(BotSetting, key)
+            if item is None:
+                item = BotSetting(key=key, value=value)
+                session.add(item)
+            else:
+                item.value = value
+            item.updated_at = utc_now()
+            session.commit()
+            session.refresh(item)
+            return item
 
     def list_bot_command_configs(self) -> list[BotCommandConfig]:
         with self.session() as session:
