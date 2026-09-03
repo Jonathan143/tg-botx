@@ -219,6 +219,7 @@ class LoginFlowManager:
                 self._flows_by_id.pop(previous.flow_id, None)
             existing_account = self.database.get_account(account_name)
             if existing_account is not None:
+                self._ensure_pooled_client_idle(existing_account)
                 await self._disconnect_pooled_client(existing_account)
             try:
                 client = self._client_factory(
@@ -436,7 +437,8 @@ class LoginFlowManager:
             raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
         if not account.is_active:
             raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
-        telegram_client = client or await self._get_pooled_client(account)
+        pooled_lease = client is None
+        telegram_client = client or await self._acquire_pooled_client(account)
         chats: list[dict[str, Any]] = []
         avatar_jobs: list[tuple[str, Any, int]] = []
         try:
@@ -460,19 +462,38 @@ class LoginFlowManager:
                 )
                 if avatar_photo_id is not None:
                     avatar_jobs.append((str(entity.id), entity, avatar_photo_id))
+        except asyncio.CancelledError:
+            if pooled_lease:
+                await self._release_pooled_client(account)
+            raise
         except Exception:
+            if pooled_lease:
+                await self._release_pooled_client(account)
             raise AdminAccountError("CHAT_PULL_FAILED", "无法拉取账号对话") from None
 
         try:
             result = self.database.upsert_account_chats(account.id, chats)
+        except asyncio.CancelledError:
+            if pooled_lease:
+                await self._release_pooled_client(account)
+            raise
         except Exception:
+            if pooled_lease:
+                await self._release_pooled_client(account)
             raise AdminAccountError("CHAT_PULL_FAILED", "无法保存账号对话") from None
         # The API should return as soon as the dialog snapshot is persisted.
         # Avatar downloads are independent and run in the background.  Only a
         # pooled client is safe to use after this method returns; login-flow
         # clients are disconnected immediately after the initial pull.
-        if avatar_jobs and client is None:
-            self._schedule_avatar_prefetch(account.id, telegram_client, avatar_jobs)
+        if avatar_jobs and pooled_lease:
+            # Transfer the lease to the background downloader; otherwise the
+            # client would be disconnected while avatar requests are running.
+            self._schedule_avatar_prefetch(
+                account.id, telegram_client, avatar_jobs, account=account
+            )
+            pooled_lease = False
+        if pooled_lease:
+            await self._release_pooled_client(account)
         return ChatPullView(
             account_id=account.id,
             added=result["added"],
@@ -531,8 +552,12 @@ class LoginFlowManager:
         account_id: str,
         client: Any,
         jobs: list[tuple[str, Any, int]],
+        *,
+        account: Account | None = None,
     ) -> None:
-        task = asyncio.create_task(self._prefetch_chat_avatars(account_id, client, jobs))
+        task = asyncio.create_task(
+            self._prefetch_chat_avatars(account_id, client, jobs, account=account)
+        )
         self._avatar_prefetch_tasks.add(task)
 
         def on_done(completed: asyncio.Task[None]) -> None:
@@ -551,6 +576,8 @@ class LoginFlowManager:
         account_id: str,
         client: Any,
         jobs: list[tuple[str, Any, int]],
+        *,
+        account: Account | None = None,
     ) -> None:
         semaphore = asyncio.Semaphore(4)
 
@@ -567,7 +594,11 @@ class LoginFlowManager:
                         exc_info=True,
                     )
 
-        await asyncio.gather(*(download(job) for job in jobs))
+        try:
+            await asyncio.gather(*(download(job) for job in jobs))
+        finally:
+            if account is not None:
+                await self._release_pooled_client(account)
 
     async def _download_avatar_file(
         self,
@@ -654,7 +685,7 @@ class LoginFlowManager:
         if timeout_seconds < 1 or timeout_seconds > 120:
             raise AdminAccountError("MESSAGE_TIMEOUT_INVALID", "等待时间必须在 1–120 秒之间")
 
-        client = await self._get_pooled_client(account)
+        client = await self._acquire_pooled_client(account)
         try:
             entity = await client.get_entity(target.strip())
             sent = await client.send_message(entity, text)
@@ -692,8 +723,13 @@ class LoginFlowManager:
             finally:
                 client.remove_event_handler(handler, events.NewMessage(chats=entity))
         except AdminAccountError:
+            await self._release_pooled_client(account)
+            raise
+        except asyncio.CancelledError:
+            await self._release_pooled_client(account)
             raise
         except Exception:
+            await self._release_pooled_client(account)
             raise AdminAccountError("MESSAGE_PROBE_FAILED", "发送指令或读取回复失败") from None
 
         try:
@@ -702,8 +738,12 @@ class LoginFlowManager:
                 refreshed = refreshed[0] if refreshed else None
             if refreshed is not None:
                 received = refreshed
+        except asyncio.CancelledError:
+            await self._release_pooled_client(account)
+            raise
         except Exception:
             pass
+        await self._release_pooled_client(account)
 
         buttons = getattr(received, "buttons", None) or []
         if not buttons:
@@ -740,6 +780,28 @@ class LoginFlowManager:
             return await self._client_pool.get(account)
         except Exception:
             raise AdminAccountError("TELEGRAM_UNAVAILABLE", "无法连接 Telegram 账号") from None
+
+    async def _acquire_pooled_client(self, account: Account) -> Any:
+        if self._client_pool is None:
+            raise AdminAccountError("TELEGRAM_UNAVAILABLE", "Telegram 服务暂不可用")
+        try:
+            acquire = getattr(self._client_pool, "acquire", None)
+            return await (
+                acquire(account) if acquire is not None else self._client_pool.get(account)
+            )
+        except Exception:
+            raise AdminAccountError("TELEGRAM_UNAVAILABLE", "无法连接 Telegram 账号") from None
+
+    async def _release_pooled_client(self, account: Account) -> None:
+        if self._client_pool is None:
+            return
+        release = getattr(self._client_pool, "release", None)
+        if release is None:
+            return
+        try:
+            await release(account)
+        except Exception:
+            logger.warning("释放 Telegram 账号连接失败 account_id=%s", account.id, exc_info=True)
 
     @staticmethod
     def _chat_type(entity: Any) -> Literal["bot", "group", "private"] | None:
@@ -792,6 +854,7 @@ class LoginFlowManager:
         account = self.database.get_account_by_id(impact.account_id)
         if account is None:
             raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
+        self._ensure_pooled_client_idle(account)
 
         try:
             await self._disconnect_pooled_client(account)
@@ -940,7 +1003,9 @@ class LoginFlowManager:
         if remover is not None:
             result = remover(account)
             if inspect.isawaitable(result):
-                await result
+                result = await result
+            if result is False:
+                raise AdminAccountError("ACCOUNT_BUSY", "账号当前正在执行任务，请稍后再试")
             return
         clients = getattr(self._client_pool, "clients", None)
         if isinstance(clients, dict):
@@ -949,6 +1014,13 @@ class LoginFlowManager:
                 result = client.disconnect()
                 if inspect.isawaitable(result):
                     await result
+
+    def _ensure_pooled_client_idle(self, account: Account) -> None:
+        if self._client_pool is None:
+            return
+        checker = getattr(self._client_pool, "has_active_leases", None)
+        if checker is not None and checker(account):
+            raise AdminAccountError("ACCOUNT_BUSY", "账号当前正在执行任务，请稍后再试")
 
     async def _require_flow(self, flow_id: str) -> _LoginFlow:
         async with self._lock:
