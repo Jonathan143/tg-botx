@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -8,7 +9,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="TG_BOT_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="TG_BOT_",
+        env_file=".env",
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 
     api_id: int | None = Field(default=None)
     api_hash: str | None = Field(default=None)
@@ -37,6 +43,11 @@ class Settings(BaseSettings):
     # Separate Telegram Bot API credential for the interactive management bot.
     # ``admin_key`` remains exclusively the web/API administrator secret.
     admin_bot_token: SecretStr | None = Field(default=None)
+    # The management bot can receive updates through Telegram long polling or
+    # through the FastAPI webhook endpoint exposed by this service.
+    bot_transport: Literal["long_polling", "webhook"] = Field(default="long_polling")
+    bot_webhook_url: str | None = Field(default=None)
+    bot_webhook_secret: SecretStr | None = Field(default=None)
     admin_origin: str | None = Field(default=None)
     admin_session_days: int = Field(default=30, ge=1, le=365)
     api_host: str = Field(default="0.0.0.0")
@@ -70,6 +81,62 @@ class Settings(BaseSettings):
         if normalized in {"sqlite", "sqlite3"}:
             return "sqlite"
         raise ValueError("TG_BOT_DATABASE 仅支持 sqlite 或 postgresql")
+
+    @field_validator("bot_transport", mode="before")
+    @classmethod
+    def normalize_bot_transport(cls, value: str) -> str:
+        normalized = str(value).strip().lower().replace("-", "_")
+        if normalized in {"polling", "long_polling"}:
+            return "long_polling"
+        if normalized == "webhook":
+            return "webhook"
+        raise ValueError("TG_BOT_BOT_TRANSPORT 仅支持 long_polling 或 webhook")
+
+    @field_validator("bot_webhook_url", mode="before")
+    @classmethod
+    def validate_bot_webhook_url(cls, value: str | None) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        url = str(value).strip()
+        if any(
+            character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+            for character in url
+        ):
+            raise ValueError("TG_BOT_BOT_WEBHOOK_URL 不能包含空白或控制字符")
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+            hostname = parsed.hostname
+        except ValueError as exc:
+            raise ValueError("TG_BOT_BOT_WEBHOOK_URL 格式无效") from exc
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or "#" in url
+            or authority.endswith(":")
+            or (port is not None and port not in {80, 88, 443, 8443})
+        ):
+            raise ValueError(
+                "TG_BOT_BOT_WEBHOOK_URL 必须是 Telegram 支持端口上的 HTTPS URL，"
+                "且不能包含用户信息或 fragment"
+            )
+        return url
+
+    @field_validator("bot_webhook_secret")
+    @classmethod
+    def validate_bot_webhook_secret(cls, value: SecretStr | str | None) -> SecretStr | None:
+        if value is None:
+            return None
+        secret = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
+        secret = secret.strip()
+        if not secret:
+            return None
+        if len(secret) > 256 or re.fullmatch(r"[A-Za-z0-9_-]+", secret) is None:
+            raise ValueError("TG_BOT_BOT_WEBHOOK_SECRET 仅支持 1-256 位字母、数字、下划线或连字符")
+        return SecretStr(secret)
 
     @field_validator("notification_timezone")
     @classmethod

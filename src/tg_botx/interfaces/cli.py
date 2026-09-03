@@ -50,6 +50,12 @@ def configure_logging(settings: Settings) -> None:
         sensitive_values.append(settings.notification_bot_token.get_secret_value())
     if settings.admin_bot_token:
         sensitive_values.append(settings.admin_bot_token.get_secret_value())
+    webhook_secret = getattr(settings, "bot_webhook_secret", None)
+    if webhook_secret:
+        get_secret_value = getattr(webhook_secret, "get_secret_value", None)
+        raw_secret = get_secret_value() if callable(get_secret_value) else webhook_secret
+        if isinstance(raw_secret, str):
+            sensitive_values.append(raw_secret)
     sensitive_filter = SensitiveDataFilter(sensitive_values)
     file_handler.addFilter(sensitive_filter)
     console_handler = logging.StreamHandler()

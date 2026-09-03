@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -11,6 +12,7 @@ import re
 import secrets
 import time
 import uuid
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -70,6 +72,7 @@ _CHECKIN_MIN_KEY = "checkin.points_min"
 _CHECKIN_MAX_KEY = "checkin.points_max"
 _DEFAULT_CHECKIN_MIN = 1
 _DEFAULT_CHECKIN_MAX = 10
+_WEBHOOK_UPDATE_DEDUPE_LIMIT = 2048
 
 
 class BotBindingError(RuntimeError):
@@ -580,10 +583,27 @@ class TelegramManagementBot:
         self.checkin = checkin
         self.management = BotManagementService(database, checkin)
         self.client = TelegramBotApiClient(token) if token else None
-        self.status = BotRuntimeStatus(settings.bot_enabled, bool(token))
+        # Keep the adapter tolerant of older injected settings objects.  The
+        # concrete ``Settings`` model always exposes these fields, while
+        # lightweight callers may still only provide the long-polling config.
+        self.transport = getattr(settings, "bot_transport", "long_polling")
+        self.webhook_url = getattr(settings, "bot_webhook_url", None)
+        webhook_secret = getattr(settings, "bot_webhook_secret", None)
+        if webhook_secret:
+            get_secret_value = getattr(webhook_secret, "get_secret_value", None)
+            raw_secret = get_secret_value() if callable(get_secret_value) else webhook_secret
+            self._webhook_secret = raw_secret.strip() if isinstance(raw_secret, str) else ""
+        else:
+            self._webhook_secret = ""
+        webhook_configured = bool(self.webhook_url and self._webhook_secret)
+        configured = bool(token) and (self.transport != "webhook" or webhook_configured)
+        self.status = BotRuntimeStatus(settings.bot_enabled, configured)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._offset: int | None = None
+        self._webhook_update_lock = asyncio.Lock()
+        self._webhook_seen_update_ids: set[int] = set()
+        self._webhook_seen_update_order: deque[int] = deque()
 
     async def start(self) -> None:
         if not self.status.enabled:
@@ -592,12 +612,32 @@ class TelegramManagementBot:
         if self.client is None:
             logger.error("未配置 TG_BOT_ADMIN_BOT_TOKEN，Telegram 管理 Bot 已禁用")
             return
+        if self.transport == "webhook" and not self.status.configured:
+            logger.error(
+                "Webhook 模式需要配置 TG_BOT_BOT_WEBHOOK_URL 和 "
+                "TG_BOT_BOT_WEBHOOK_SECRET，Telegram 管理 Bot 已禁用"
+            )
+            return
+        if self._task is not None and not self._task.done():
+            return
+        # ``setWebhook``/``deleteWebhook`` both discard updates accumulated
+        # before this session.  A new session therefore must not inherit the
+        # previous in-memory duplicate window.
+        self._webhook_seen_update_ids.clear()
+        self._webhook_seen_update_order.clear()
+        self.status.running = False
         self._stop.clear()
-        # The offset is intentionally session-scoped.  Each process/session
-        # starts by discarding Telegram updates that accumulated before it
-        # began polling.
+        # Polling offsets are intentionally session-scoped. Both transports
+        # ask Telegram to discard updates accumulated before startup.
         self._offset = None
-        self._task = asyncio.create_task(self._poll_loop(), name="telegram-management-bot")
+        if self.transport == "webhook":
+            self._task = asyncio.create_task(
+                self._webhook_registration_loop(), name="telegram-management-bot-webhook"
+            )
+        else:
+            self._task = asyncio.create_task(
+                self._poll_loop(), name="telegram-management-bot-polling"
+            )
 
     def command_configs(self) -> list[dict[str, Any]]:
         return self.management.command_configs()
@@ -694,26 +734,148 @@ class TelegramManagementBot:
             "configured": self.status.configured,
             "running": self.status.running,
             "health": self.status.health,
+            "transport": self.transport,
             "lastPollAt": self.status.last_poll_at.isoformat()
             if self.status.last_poll_at
             else None,
             "lastError": self.status.last_error,
         }
 
+    def webhook_secret_matches(self, secret: str | None) -> bool:
+        """Return whether a request carries this bot's configured secret."""
+
+        configured_secret = getattr(self, "_webhook_secret", "")
+        if (
+            getattr(self, "transport", None) != "webhook"
+            or not isinstance(configured_secret, str)
+            or not configured_secret
+        ):
+            return False
+        if not isinstance(secret, str) or not secret or len(secret) > 256:
+            return False
+        try:
+            candidate = secret.encode("ascii")
+        except UnicodeEncodeError:
+            # ``hmac.compare_digest(str, str)`` raises for non-ASCII input;
+            # an invalid header should be a normal authentication failure.
+            return False
+        try:
+            expected = configured_secret.encode("ascii")
+        except UnicodeEncodeError:
+            return False
+        return hmac.compare_digest(candidate, expected)
+
+    def accepts_webhook(self, secret: str | None) -> bool:
+        """Authenticate and authorize an update for normal processing."""
+
+        stop_event = getattr(self, "_stop", None)
+        if stop_event is not None and stop_event.is_set():
+            return False
+        return (
+            self.status.enabled
+            and self.status.configured
+            # Do not accept Telegram retries until setWebhook has completed
+            # with drop_pending_updates=True. This keeps commands sent while
+            # the service was offline from slipping through during startup.
+            and self.status.running
+            and self.webhook_secret_matches(secret)
+        )
+
+    def _claim_webhook_update(self, update: dict[str, object]) -> bool:
+        """Claim an update id once, retaining only a bounded recent window."""
+
+        update_id = update.get("update_id")
+        if type(update_id) is not int:
+            return True
+        seen = getattr(self, "_webhook_seen_update_ids", None)
+        if seen is None:
+            seen = set()
+            self._webhook_seen_update_ids = seen
+        if update_id in seen:
+            return False
+        seen.add(update_id)
+        order = getattr(self, "_webhook_seen_update_order", None)
+        if order is None:
+            order = deque()
+            self._webhook_seen_update_order = order
+        order.append(update_id)
+        while len(order) > _WEBHOOK_UPDATE_DEDUPE_LIMIT:
+            seen.discard(order.popleft())
+        return True
+
+    def _webhook_update_guard(self) -> asyncio.Lock:
+        lock = getattr(self, "_webhook_update_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._webhook_update_lock = lock
+        return lock
+
+    async def discard_webhook_update(self, update: dict[str, object]) -> None:
+        """Acknowledge an authenticated update without executing it."""
+
+        async with self._webhook_update_guard():
+            self._claim_webhook_update(update)
+
+    async def handle_webhook_update(self, update: dict[str, object]) -> None:
+        """Process one authenticated Telegram webhook update."""
+
+        async with self._webhook_update_guard():
+            # The route performs the normal readiness check before parsing the
+            # body, but shutdown can begin while a request is waiting for this
+            # lock.  Re-check the stop gate here so queued requests are
+            # acknowledged and discarded instead of starting during teardown.
+            stop_event = getattr(self, "_stop", None)
+            if stop_event is not None and stop_event.is_set():
+                self._claim_webhook_update(update)
+                return
+            if not self._claim_webhook_update(update):
+                return
+            self.status.last_poll_at = utc_now()
+            try:
+                await self._handle_update(update)
+                self.status.last_error = None
+            except Exception as exc:
+                self.status.last_error = type(exc).__name__
+                logger.exception("管理 Bot 处理 Webhook update 失败 type=%s", type(exc).__name__)
+
+    async def _webhook_registration_loop(self) -> None:
+        assert self.client is not None
+        assert self.webhook_url is not None
+        try:
+            while not self._stop.is_set():
+                try:
+                    await self.client.set_webhook(self.webhook_url, self._webhook_secret)
+                    if self._stop.is_set():
+                        break
+                    self.status.running = True
+                    self.status.last_error = None
+                    logger.info("Telegram 管理 Bot 已使用 Webhook 模式启动")
+                    await self._stop.wait()
+                except asyncio.CancelledError:
+                    raise
+                except TelegramBotApiError as exc:
+                    self.status.running = False
+                    self.status.last_error = type(exc).__name__
+                    logger.warning("管理 Bot 注册 Webhook 失败")
+                    await asyncio.sleep(min(exc.retry_after or 5, 30))
+                except Exception as exc:
+                    self.status.running = False
+                    self.status.last_error = type(exc).__name__
+                    logger.warning("管理 Bot 注册 Webhook 失败 type=%s", type(exc).__name__)
+                    await asyncio.sleep(5)
+        finally:
+            self.status.running = False
+
     async def _poll_loop(self) -> None:
         assert self.client is not None
         self.status.running = True
         try:
-            # Telegram keeps updates received while the service is stopped in
-            # its pending queue.  Management commands are interactive and can
-            # be stale (especially mutating actions such as /run), so discard
-            # the backlog before entering the normal polling loop.  We only
-            # advance the offset here; no update is passed to the command
-            # handlers.  Retry transient API failures without falling through
-            # to normal polling, otherwise the stale backlog could be handled.
+            # getUpdates and Webhook are mutually exclusive. Remove any
+            # previously registered Webhook and discard stale interactive
+            # commands before entering the polling loop.
             while not self._stop.is_set():
                 try:
-                    await self._discard_pending_updates()
+                    await self.client.delete_webhook(drop_pending_updates=True)
                     break
                 except asyncio.CancelledError:
                     raise
@@ -751,39 +913,6 @@ class TelegramManagementBot:
                     await asyncio.sleep(5)
         finally:
             self.status.running = False
-
-    async def _discard_pending_updates(self) -> None:
-        """Acknowledge all updates that were pending when polling starts.
-
-        ``getUpdates`` returns at most Telegram's per-request limit, so keep
-        polling with a short timeout until the queue is empty.  New updates
-        that arrive after the final empty response are handled by the normal
-        polling loop.
-        """
-
-        assert self.client is not None
-        discarded = 0
-        while not self._stop.is_set():
-            updates = await self.client.get_updates(self._offset, timeout=0)
-            self.status.last_poll_at = utc_now()
-            self.status.last_error = None
-            if not updates:
-                if discarded:
-                    logger.info("管理 Bot 启动时丢弃积压更新 count=%s", discarded)
-                return
-
-            update_ids: list[int] = []
-            for update in updates:
-                update_id = update.get("update_id")
-                if isinstance(update_id, int):
-                    update_ids.append(update_id)
-            if not update_ids:
-                # Telegram updates always contain update_id.  Avoid spinning
-                # forever if a malformed response is ever returned.
-                logger.warning("管理 Bot 收到不含 update_id 的更新，停止启动清理")
-                return
-            self._offset = max(update_ids) + 1
-            discarded += len(updates)
 
     async def _handle_update(self, update: dict[str, object]) -> None:
         message = update.get("message")

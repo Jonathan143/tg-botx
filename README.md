@@ -71,7 +71,8 @@ TG_BOT_TRUSTED_PROXIES=
 `{value:string,nonce:string,timestamp:string}`，再用 RSA-OAEP/SHA-256 加密。登录成功后使用
 `HttpOnly+Secure+SameSite=Strict` Cookie；会话摘要持久化在数据库中，因此服务重启后浏览器无需
 重新输入管理密钥（直到会话过期或主动退出）。CSRF Token 从会话 Cookie 派生且不会明文落库。
-除公钥获取和验证外，OpenAPI 与全部管理路由均需认证。
+除公钥获取、验证和 Telegram Webhook 入口外，OpenAPI 与全部管理路由均需后台会话认证；
+Webhook 入口改用 Telegram 的 secret 请求头认证，不使用 Cookie 或 CSRF。
 `POST /api/settings/transport-key/rotate` 可立即轮换传输密钥，旧私钥仅保留 5 分钟宽限期。
 
 `POST /api/tasks/:id/run` 成功时返回更新后的完整 Task JSON（HTTP 202），其中
@@ -170,9 +171,23 @@ TG_BOT_SERVICE_LIFECYCLE_NOTIFICATIONS_ENABLED=false
 ```text
 TG_BOT_ADMIN_BOT_TOKEN=replace-with-management-bot-token
 TG_BOT_BOT_ENABLED=true
+TG_BOT_BOT_TRANSPORT=long_polling
 ```
 
-启用后 Bot 通过长轮询运行在 `serve` 进程中，仅接受私聊。管理员在 Web 后台“设置”页生成
+默认通过长轮询运行在 `serve` 进程中。要切换为 Webhook，配置完整的外部 HTTPS 地址和独立 secret：
+
+```text
+TG_BOT_BOT_TRANSPORT=webhook
+TG_BOT_BOT_WEBHOOK_URL=https://bot.example.com/api/telegram/admin-bot/webhook
+TG_BOT_BOT_WEBHOOK_SECRET=<openssl-rand-hex-32>
+```
+
+Webhook 入口固定为 `POST /api/telegram/admin-bot/webhook`，外部反向代理需将配置 URL 转发到该入口，
+并透传 `X-Telegram-Bot-Api-Secret-Token` 请求头。服务会通过该请求头验证 secret，并在启动时
+自动注册 Webhook（Telegram 支持的端口为 443、80、88、8443）。切回 `long_polling` 时会自动删除旧
+Webhook；修改传输方式后需重启服务，两种模式都会在启动时丢弃停机期间积压的旧指令。
+
+Bot 仅接受私聊。管理员在 Web 后台“设置”页生成
 一次性绑定码，也可以使用 `tg-bot bot binding create`，然后在 Bot 中发送
 `/bind ABCD-EFGH-IJKL`。绑定成功后可使用 `/tasks` 分页查看、启用、停用和手动执行任务，
 使用 `/status` 查看脱敏系统状态，以及 `/checkin` 进行每日签到领取积分。未绑定用户不能签到；

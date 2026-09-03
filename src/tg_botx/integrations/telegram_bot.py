@@ -58,6 +58,23 @@ class TelegramBotApiClient:
             [item for item in result if isinstance(item, dict)] if isinstance(result, list) else []
         )
 
+    async def set_webhook(self, url: str, secret_token: str) -> object:
+        return await self.call(
+            "setWebhook",
+            {
+                "url": url,
+                "secret_token": secret_token,
+                "allowed_updates": ["message", "callback_query"],
+                "drop_pending_updates": True,
+            },
+        )
+
+    async def delete_webhook(self, *, drop_pending_updates: bool = False) -> object:
+        return await self.call(
+            "deleteWebhook",
+            {"drop_pending_updates": drop_pending_updates},
+        )
+
     async def send_message(
         self, chat_id: int, text: str, reply_markup: dict[str, object] | None = None
     ) -> object:

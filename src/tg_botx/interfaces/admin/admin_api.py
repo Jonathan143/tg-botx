@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 SESSION_COOKIE = "tg_bot_admin_session"
 CSRF_HEADER = "X-CSRF-Token"
+ADMIN_BOT_WEBHOOK_PATH = "/api/telegram/admin-bot/webhook"
 TASK_EVENT_KEEPALIVE_SECONDS = 15
 LOG_EVENT_POLL_SECONDS = 1
 _LOG_PATTERN = re.compile(
@@ -487,6 +488,8 @@ def _read_log_entries(settings: Settings) -> list[dict[str, Any]]:
         secrets.append(settings.notification_bot_token.get_secret_value())
     if settings.admin_bot_token:
         secrets.append(settings.admin_bot_token.get_secret_value())
+    if settings.bot_webhook_secret:
+        secrets.append(settings.bot_webhook_secret.get_secret_value())
     # Oldest backup first, current log last.
     paths = list(reversed(allowed_log_files(settings.log_path, settings.log_backup_count)))
     for path in paths:
@@ -690,9 +693,10 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         method = request.method.upper()
         is_key = method == "GET" and path == "/api/auth/key"
         is_verify = method == "POST" and path == "/api/auth/verify"
+        is_telegram_webhook = method == "POST" and path == ADMIN_BOT_WEBHOOK_PATH
         mutating = method in {"POST", "PUT", "PATCH", "DELETE"}
         try:
-            if mutating:
+            if mutating and not is_telegram_webhook:
                 if request.headers.get("Origin") != admin_origin:
                     raise APIError("ORIGIN_FORBIDDEN", "请求来源不被允许", 403)
                 content_type = (
@@ -700,7 +704,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                 )
                 if content_type != "application/json":
                     raise APIError("JSON_REQUIRED", "修改请求必须使用 application/json", 415)
-            if not is_key and not is_verify:
+            if not is_key and not is_verify and not is_telegram_webhook:
                 token = request.cookies.get(SESSION_COOKIE)
                 if not token:
                     raise APIError("AUTH_REQUIRED", "需要管理员身份验证", 401)
@@ -716,7 +720,12 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
                     raise
                 request.state.session = credentials
             response = await call_next(request)
-            if not is_key and not is_verify and hasattr(request.state, "session"):
+            if (
+                not is_key
+                and not is_verify
+                and not is_telegram_webhook
+                and hasattr(request.state, "session")
+            ):
                 credentials = request.state.session
                 response.set_cookie(
                     SESSION_COOKIE,
@@ -746,6 +755,28 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         purpose: Literal["admin", "phone", "code", "password"] = "admin",
     ) -> JSONResponse:
         return JSONResponse(keys.issue_challenge(purpose), headers={"Cache-Control": "no-store"})
+
+    @app.post(ADMIN_BOT_WEBHOOK_PATH, include_in_schema=False, status_code=204)
+    async def telegram_admin_bot_webhook(request: Request) -> Response:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if not admin_bot.webhook_secret_matches(secret):
+            raise APIError("WEBHOOK_FORBIDDEN", "Webhook 请求未通过验证", 403)
+        # Snapshot readiness before reading the body. Requests that were
+        # already in flight while setWebhook was being registered must be
+        # acknowledged and discarded; returning a non-2xx response would make
+        # Telegram retry those stale updates after startup completes.
+        ready = admin_bot.accepts_webhook(secret)
+        try:
+            update = await request.json()
+        except ValueError as exc:
+            raise APIError("WEBHOOK_INVALID", "Webhook 请求体不是有效 JSON", 400) from exc
+        if not isinstance(update, dict):
+            raise APIError("WEBHOOK_INVALID", "Webhook 请求体必须是 JSON 对象", 400)
+        if not ready or not admin_bot.accepts_webhook(secret):
+            await admin_bot.discard_webhook_update(update)
+            return Response(status_code=204)
+        await admin_bot.handle_webhook_update(update)
+        return Response(status_code=204)
 
     @app.post("/api/auth/verify")
     async def auth_verify(request: Request, body: AdminVerifyBody) -> JSONResponse:
@@ -1454,6 +1485,8 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             secrets.append(settings.notification_bot_token.get_secret_value())
         if settings.admin_bot_token:
             secrets.append(settings.admin_bot_token.get_secret_value())
+        if settings.bot_webhook_secret:
+            secrets.append(settings.bot_webhook_secret.get_secret_value())
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in files:

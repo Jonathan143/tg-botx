@@ -10,6 +10,8 @@ from typing import Protocol
 from telethon import TelegramClient
 from telethon.sessions import SQLiteSession
 
+from tg_botx import __version__
+
 
 @dataclass(frozen=True, slots=True)
 class TelegramAccountConfig:
@@ -57,4 +59,5 @@ def create_telethon_client(config: TelegramAccountConfig) -> TelegramClient:
         TelegramSQLiteSession(str(config.session_path)),
         config.api_id,
         config.api_hash,
+        app_version=__version__,
     )
