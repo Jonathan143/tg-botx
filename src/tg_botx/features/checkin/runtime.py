@@ -335,7 +335,7 @@ class NotificationService:
     ) -> None:
         if self._is_enabled(task, "success"):
             await self._task_event(
-                task, "INFO", "签到成功", next_run, bot_response=bot_response, icon="✅"
+                task, "INFO", "任务执行成功", next_run, bot_response=bot_response, icon="✅"
             )
 
     async def failure(
@@ -349,7 +349,7 @@ class NotificationService:
             await self._task_event(
                 task,
                 "ERROR",
-                "签到失败",
+                "任务执行失败",
                 next_run,
                 error=error,
                 bot_response=bot_response,

@@ -14,6 +14,7 @@ from tg_botx.features.checkin.condition import (
     RegexBudget,
     callback_data_values,
     evaluate_rule,
+    execute_regex,
     parse_datetime,
     parse_number,
     render_template,
@@ -130,6 +131,58 @@ def test_condition_schema_requires_prior_wait_and_accepts_default_shape():
     payload["steps"] = [condition_step()]
     with pytest.raises(ValueError, match="先成功等待消息"):
         TaskDefinition.model_validate(payload)
+
+
+def test_condition_schema_rejects_invalid_regex_before_persisting():
+    payload = {
+        "name": "invalid-regex",
+        "target": "checkin_bot",
+        "schedule": {"type": "fixed", "timezone": "UTC", "time": "12:00:00"},
+        "steps": [
+            {"type": "wait_message", "node_id": "wait", "timeout_seconds": 60},
+            {
+                "type": "condition",
+                "node_id": "condition",
+                "schema_version": 2,
+                "extracts": [
+                    {
+                        "name": "balance",
+                        "mode": "regex_capture",
+                        "value_type": "number",
+                        "pattern": r"余额：([\d,]+))",
+                        "capture_group": 1,
+                    }
+                ],
+                "branches": [{"kind": "else", "steps": []}],
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="unbalanced parenthesis"):
+        TaskDefinition.model_validate(payload)
+
+
+@pytest.mark.parametrize("name", ["class", "await", "None"])
+def test_condition_schema_rejects_python_javascript_reserved_variable_names(name: str):
+    payload = {
+        "name": "reserved-variable",
+        "target": "checkin_bot",
+        "schedule": {"type": "fixed", "timezone": "UTC", "time": "12:00:00"},
+        "steps": [{"type": "wait_message", "node_id": "wait", "timeout_seconds": 60}],
+    }
+    step = condition_step()
+    step["extracts"][0]["name"] = name  # type: ignore[index]
+    payload["steps"].append(step)  # type: ignore[union-attr]
+
+    with pytest.raises(ValueError, match="保留关键字"):
+        TaskDefinition.model_validate(payload)
+
+
+def test_regex_capture_accepts_balance_pattern():
+    value = "你的余额：2220 积分"
+    assert (
+        execute_regex(r"余额：([\d,]+)", value, {}, RegexBudget(), capture_group=1)
+        == "2220"
+    )
 
 
 def test_click_button_selector_is_exclusive_and_position_requires_both_coordinates():

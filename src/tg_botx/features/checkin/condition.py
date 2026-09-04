@@ -18,6 +18,74 @@ except ImportError:  # pragma: no cover - exercised only in incomplete local env
 ValueType = Literal["text", "number", "datetime"]
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+VARIABLE_RESERVED_WORDS = frozenset(
+    {
+        "False",
+        "None",
+        "True",
+        "and",
+        "as",
+        "assert",
+        "async",
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "def",
+        "default",
+        "delete",
+        "del",
+        "do",
+        "else",
+        "elif",
+        "enum",
+        "except",
+        "export",
+        "extends",
+        "finally",
+        "for",
+        "from",
+        "function",
+        "global",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "interface",
+        "is",
+        "lambda",
+        "let",
+        "new",
+        "nonlocal",
+        "not",
+        "null",
+        "or",
+        "package",
+        "pass",
+        "private",
+        "protected",
+        "public",
+        "raise",
+        "return",
+        "static",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    }
+)
 TEMPLATE_TOKEN = re.compile(r"(?<!\\)\{\{\s*([A-Za-z_][A-Za-z0-9_]{0,63})\s*\}\}")
 NUMBER_CANDIDATE = re.compile(r"[-+]?\d(?:[\d, \u00a0\u202f]*\d)?(?:\.\d+)?")
 
@@ -294,6 +362,21 @@ def _regex_flags(config: dict[str, Any]) -> int:
     return flags
 
 
+def compile_regex_pattern(pattern: str, config: dict[str, Any]) -> Any:
+    """Compile a condition pattern using the same engine as runtime matching.
+
+    Keeping compilation in one helper lets schema validation reject malformed
+    patterns before a task is persisted, while runtime execution still retains
+    its timeout and budget protections around the actual match operation.
+    """
+    if safe_regex is None:  # pragma: no cover - dependency is installed in production
+        raise ConditionEvaluationError("条件正则依赖 regex 未安装")
+    try:
+        return safe_regex.compile(pattern, _regex_flags(config))
+    except safe_regex.error as exc:
+        raise ConditionEvaluationError(f"正则表达式无效：{exc}") from exc
+
+
 def execute_regex(
     pattern: str,
     value: str,
@@ -313,15 +396,13 @@ def execute_regex(
     timeout = min(REGEX_MATCH_TIMEOUT_SECONDS, budget.remaining)
     started = time.perf_counter()
     try:
-        compiled = safe_regex.compile(pattern, _regex_flags(config))
+        compiled = compile_regex_pattern(pattern, config)
         if config.get("match_mode", "search") == "full":
             match = compiled.fullmatch(value, timeout=timeout)
         else:
             match = compiled.search(value, timeout=timeout)
     except TimeoutError as exc:
         raise ConditionEvaluationError("正则执行超时") from exc
-    except safe_regex.error as exc:
-        raise ConditionEvaluationError(f"正则表达式无效：{exc}") from exc
     finally:
         budget.spend(time.perf_counter() - started)
     if capture_group is None:

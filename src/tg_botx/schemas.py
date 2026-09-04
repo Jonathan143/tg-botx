@@ -18,6 +18,9 @@ from tg_botx.features.checkin.condition import (
     TEXT_OPERATORS,
     UNARY_OPERATORS,
     VARIABLE_NAME,
+    VARIABLE_RESERVED_WORDS,
+    ConditionEvaluationError,
+    compile_regex_pattern,
     template_names,
 )
 
@@ -105,6 +108,13 @@ def _validate_regex_config(value: Any, path: str) -> None:
             raise ValueError(f"{path}.{field} 必须是布尔值")
     if value.get("match_mode", "search") not in {"search", "full"}:
         raise ValueError(f"{path}.match_mode 必须是 search 或 full")
+
+
+def _validate_regex_pattern(pattern: str, config: dict[str, Any], path: str) -> None:
+    try:
+        compile_regex_pattern(pattern, config)
+    except ConditionEvaluationError as exc:
+        raise ValueError(f"{path} {exc}") from exc
 
 
 def _validate_template(value: Any, path: str, possible: dict[str, str]) -> None:
@@ -203,6 +213,7 @@ def _validate_rule(rule: Any, path: str, possible: dict[str, str]) -> None:
                 raise ValueError(f"{path} 正则固定值不能为空")
             if len(pattern) > MAX_PATTERN_LENGTH:
                 raise ValueError(f"{path} 正则不能超过 {MAX_PATTERN_LENGTH} 个字符")
+            _validate_regex_pattern(pattern, regex_config or {}, f"{path}.operands[0]")
     elif regex_config is not None:
         raise ValueError(f"{path}.regex 只能用于正则运算符")
 
@@ -218,7 +229,11 @@ def _validate_extract(
     _unsupported(extraction, _EXTRACT_FIELDS, path)
     name = extraction.get("name")
     if not isinstance(name, str) or not VARIABLE_NAME.fullmatch(name) or name.startswith("__"):
-        raise ValueError(f"{path}.name 必须是合法变量名，且不能使用 __ 前缀")
+        raise ValueError(
+            f"{path}.name 必须符合 Python/JavaScript 标识符规范，且不能使用 __ 前缀"
+        )
+    if name in VARIABLE_RESERVED_WORDS:
+        raise ValueError(f"{path}.name 不能使用 Python/JavaScript 保留关键字")
     if name in possible or name in declared:
         raise ValueError(f"{path}.name 与当前执行路径中的变量重复")
     source = extraction.get("source", "message_text")
@@ -253,6 +268,7 @@ def _validate_extract(
         if (isinstance(group, int) and group < 0) or (isinstance(group, str) and not group):
             raise ValueError(f"{path}.capture_group 必须是非负编号或非空名称")
         _validate_regex_config(extraction.get("regex", {}), f"{path}.regex")
+        _validate_regex_pattern(pattern, extraction.get("regex", {}), f"{path}.pattern")
     else:
         for field in ("pattern", "capture_group", "regex"):
             if field in extraction:
