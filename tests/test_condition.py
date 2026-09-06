@@ -179,10 +179,7 @@ def test_condition_schema_rejects_python_javascript_reserved_variable_names(name
 
 def test_regex_capture_accepts_balance_pattern():
     value = "你的余额：2220 积分"
-    assert (
-        execute_regex(r"余额：([\d,]+)", value, {}, RegexBudget(), capture_group=1)
-        == "2220"
-    )
+    assert execute_regex(r"余额：([\d,]+)", value, {}, RegexBudget(), capture_group=1) == "2220"
 
 
 def test_click_button_selector_is_exclusive_and_position_requires_both_coordinates():

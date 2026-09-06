@@ -147,7 +147,12 @@ class BotManagementService:
         return self._generate_code("user", utc_now() + _BINDING_CODE_TTL)
 
     def create_binding_codes(
-        self, quantity: int, ttl_days: int | None, *, role: str = "user", idempotency_key: str | None = None
+        self,
+        quantity: int,
+        ttl_days: int | None,
+        *,
+        role: str = "user",
+        idempotency_key: str | None = None,
     ) -> tuple[str, list[tuple[str, BotBindingCode]]]:
         if role not in {"user", "admin"}:
             raise BotBindingError("不支持的绑定身份")
@@ -160,13 +165,24 @@ class BotManagementService:
         generated: list[tuple[str, str, datetime | None, str]] = []
         plain: list[str] = []
         for _ in range(quantity):
-            raw = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_GROUP_LENGTH * _CODE_GROUPS))
-            formatted = "-".join(raw[index:index + _CODE_GROUP_LENGTH] for index in range(0, len(raw), _CODE_GROUP_LENGTH))
+            raw = "".join(
+                secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_GROUP_LENGTH * _CODE_GROUPS)
+            )
+            formatted = "-".join(
+                raw[index : index + _CODE_GROUP_LENGTH]
+                for index in range(0, len(raw), _CODE_GROUP_LENGTH)
+            )
             plain.append(formatted)
             generated.append((hash_binding_code(raw), formatted[-4:], expires_at, role))
-        request_hash = hashlib.sha256(json.dumps({"role": role, "quantity": quantity, "ttlDays": ttl_days}, sort_keys=True).encode()).hexdigest()
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {"role": role, "quantity": quantity, "ttlDays": ttl_days}, sort_keys=True
+            ).encode()
+        ).hexdigest()
         replay = bool(idempotency_key and self.database.get_bot_binding_batch(idempotency_key))
-        batch, items = self.database.create_bot_binding_codes(generated, idempotency_key=idempotency_key, request_hash=request_hash, ttl_days=ttl_days)
+        batch, items = self.database.create_bot_binding_codes(
+            generated, idempotency_key=idempotency_key, request_hash=request_hash, ttl_days=ttl_days
+        )
         if replay:
             # Idempotent replay cannot recover plaintext; return masked values rather than secrets.
             plain = [f"****-****-****" for _ in items]
@@ -192,7 +208,15 @@ class BotManagementService:
     def binding_codes_page(self, *, page: int, page_size: int) -> tuple[list[BindingCodeView], int]:
         items, total = self.database.list_bot_binding_codes_page(page=page, page_size=page_size)
         return [
-            BindingCodeView(item.id, item.code_hint, item.created_at, item.expires_at, item.role or "user", item.used_at, item.revoked_at)
+            BindingCodeView(
+                item.id,
+                item.code_hint,
+                item.created_at,
+                item.expires_at,
+                item.role or "user",
+                item.used_at,
+                item.revoked_at,
+            )
             for item in items
         ], total
 
@@ -254,7 +278,9 @@ class BotManagementService:
                     "type": "system",
                     "description": item.description if item is not None else default_description,
                     "enabled": item.enabled if item is not None else True,
-                    "menuVisible": getattr(item, "menu_visible", item.enabled if item is not None else True),
+                    "menuVisible": getattr(
+                        item, "menu_visible", item.enabled if item is not None else True
+                    ),
                     "allowedRoles": self._item_roles(command, item),
                     "executorType": "none",
                     "executorConfig": {},
@@ -326,7 +352,9 @@ class BotManagementService:
                 raise BotCommandForbiddenError("系统指令不可修改指令名")
             if target_command in {name for name, _ in DEFAULT_BOT_COMMANDS}:
                 raise BotCommandConflictError("该管理 Bot 指令已存在")
-            if any(item.command == target_command for item in self.database.list_bot_command_configs()):
+            if any(
+                item.command == target_command for item in self.database.list_bot_command_configs()
+            ):
                 raise BotCommandConflictError("该管理 Bot 指令已存在")
             renamed = self.database.rename_bot_command_config(command, target_command)
             if renamed is None:
@@ -977,12 +1005,16 @@ class TelegramManagementBot:
         elif command == "checkin":
             status, amount, total = self.management.checkin(user_id, chat_id)
             if status == "success":
-                self.management.audit(user_id, chat_id, "checkin", "success", update_id=update_number)
+                self.management.audit(
+                    user_id, chat_id, "checkin", "success", update_id=update_number
+                )
                 await self._send(chat_id, f"✅ 签到成功，获得 {amount} 积分！\n当前积分：{total}")
             elif status == "already":
                 await self._send(chat_id, f"你今天已经签到过了。\n当前积分：{total}")
             else:
-                self.management.audit(user_id, chat_id, "checkin", "denied", update_id=update_number)
+                self.management.audit(
+                    user_id, chat_id, "checkin", "denied", update_id=update_number
+                )
                 await self._send(chat_id, "请先绑定用户后再签到。")
         else:
             await self._send(chat_id, "无法识别该命令，请发送 /help 查看可用命令。")
@@ -1030,8 +1062,12 @@ class TelegramManagementBot:
                 return
             update_number = update_id if isinstance(update_id, int) else None
             parts = data.split(":")
-            command = "tasks" if parts and parts[0] in {"tasks", "task", "back", "ask", "do"} else None
-            if command is None or not self._command_allowed(user_id, chat_id, command, update_number):
+            command = (
+                "tasks" if parts and parts[0] in {"tasks", "task", "back", "ask", "do"} else None
+            )
+            if command is None or not self._command_allowed(
+                user_id, chat_id, command, update_number
+            ):
                 if self.client:
                     await self.client.answer_callback(callback_id, "你没有权限调用该命令")
                 return
@@ -1062,9 +1098,7 @@ class TelegramManagementBot:
         self, user_id: int, chat_id: int, command: str, update_id: int | None
     ) -> bool:
         role = self.management.binding_role(user_id, chat_id) or "anonymous"
-        config = next(
-            (item for item in self.command_configs() if item["command"] == command), None
-        )
+        config = next((item for item in self.command_configs() if item["command"] == command), None)
         allowed = bool(config and config.get("enabled") and role in config.get("allowedRoles", []))
         if not allowed:
             self.management.audit(user_id, chat_id, command, "denied", update_id=update_id)
@@ -1226,8 +1260,7 @@ class TelegramManagementBot:
             available = {
                 item["command"]
                 for item in self.command_configs()
-                if BotManagementService._menu_visible(item)
-                and role in item.get("allowedRoles", [])
+                if BotManagementService._menu_visible(item) and role in item.get("allowedRoles", [])
             }
             actions = []
             if "tasks" in available:

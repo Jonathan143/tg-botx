@@ -704,27 +704,42 @@ class Database:
     ) -> BotBindingCode:
         with self.session() as session:
             stored_expiry = expires_at
-            if stored_expiry is None and session.bind is not None and session.bind.dialect.name == "sqlite":
+            if (
+                stored_expiry is None
+                and session.bind is not None
+                and session.bind.dialect.name == "sqlite"
+            ):
                 stored_expiry = PERMANENT_EXPIRY
-            item = BotBindingCode(code_hash=code_hash, code_hint=code_hint, expires_at=stored_expiry, role=role)
+            item = BotBindingCode(
+                code_hash=code_hash, code_hint=code_hint, expires_at=stored_expiry, role=role
+            )
             session.add(item)
             session.commit()
             session.refresh(item)
             return item
 
     def create_bot_binding_codes(
-        self, items: list[tuple[str, str, datetime | None, str]], *,
-        idempotency_key: str | None = None, request_hash: str | None = None,
+        self,
+        items: list[tuple[str, str, datetime | None, str]],
+        *,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
         ttl_days: int | None = None,
     ) -> tuple[BotBindingBatch | None, list[BotBindingCode]]:
         with self.session() as session:
             if idempotency_key:
-                existing = session.scalar(select(BotBindingBatch).where(BotBindingBatch.idempotency_key == idempotency_key))
+                existing = session.scalar(
+                    select(BotBindingBatch).where(
+                        BotBindingBatch.idempotency_key == idempotency_key
+                    )
+                )
                 if existing:
                     if existing.request_hash != request_hash:
                         raise ValueError("IDEMPOTENCY_CONFLICT")
                     ids = json.loads(existing.code_ids_json)
-                    codes = list(session.scalars(select(BotBindingCode).where(BotBindingCode.id.in_(ids))))
+                    codes = list(
+                        session.scalars(select(BotBindingCode).where(BotBindingCode.id.in_(ids)))
+                    )
                     return existing, sorted(codes, key=lambda item: ids.index(item.id))
             codes = []
             for code_hash, hint, expires_at, role in items:
@@ -732,17 +747,26 @@ class Database:
                 # far-future sentinel there while exposing permanent as null
                 # at the API boundary.
                 stored_expiry = expires_at
-                if stored_expiry is None and session.bind is not None and session.bind.dialect.name == "sqlite":
+                if (
+                    stored_expiry is None
+                    and session.bind is not None
+                    and session.bind.dialect.name == "sqlite"
+                ):
                     stored_expiry = PERMANENT_EXPIRY
-                item = BotBindingCode(code_hash=code_hash, code_hint=hint, expires_at=stored_expiry, role=role)
+                item = BotBindingCode(
+                    code_hash=code_hash, code_hint=hint, expires_at=stored_expiry, role=role
+                )
                 session.add(item)
                 codes.append(item)
             session.flush()
             batch = None
             if idempotency_key:
                 batch = BotBindingBatch(
-                    idempotency_key=idempotency_key, request_hash=request_hash or "",
-                    role=items[0][3] if items else "user", quantity=len(items), ttl_days=ttl_days,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash or "",
+                    role=items[0][3] if items else "user",
+                    quantity=len(items),
+                    ttl_days=ttl_days,
                     code_ids_json=json.dumps([item.id for item in codes]),
                 )
                 session.add(batch)
@@ -755,7 +779,9 @@ class Database:
 
     def get_bot_binding_batch(self, idempotency_key: str) -> BotBindingBatch | None:
         with self.session() as session:
-            return session.scalar(select(BotBindingBatch).where(BotBindingBatch.idempotency_key == idempotency_key))
+            return session.scalar(
+                select(BotBindingBatch).where(BotBindingBatch.idempotency_key == idempotency_key)
+            )
 
     def get_bot_binding_code(self, code_id: str) -> BotBindingCode | None:
         with self.session() as session:
@@ -767,7 +793,9 @@ class Database:
                 session.scalars(select(BotBindingCode).order_by(BotBindingCode.created_at.desc()))
             )
 
-    def list_bot_binding_codes_page(self, *, page: int, page_size: int) -> tuple[list[BotBindingCode], int]:
+    def list_bot_binding_codes_page(
+        self, *, page: int, page_size: int
+    ) -> tuple[list[BotBindingCode], int]:
         with self.session() as session:
             base = select(BotBindingCode).order_by(BotBindingCode.created_at.desc())
             items = list(session.scalars(base.offset((page - 1) * page_size).limit(page_size)))
@@ -805,7 +833,11 @@ class Database:
             )
             if item is None:
                 return None
-            previous = session.scalar(select(BotBinding).where(BotBinding.user_id == user_id, BotBinding.is_active.is_(True)))
+            previous = session.scalar(
+                select(BotBinding).where(
+                    BotBinding.user_id == user_id, BotBinding.is_active.is_(True)
+                )
+            )
             if previous is not None:
                 return None
             item.used_at = now
@@ -838,7 +870,9 @@ class Database:
                 query = query.where(BotBinding.is_active.is_(True))
             return list(session.scalars(query))
 
-    def list_bot_bindings_page(self, *, page: int, page_size: int, active_only: bool = True) -> tuple[list[BotBinding], int]:
+    def list_bot_bindings_page(
+        self, *, page: int, page_size: int, active_only: bool = True
+    ) -> tuple[list[BotBinding], int]:
         with self.session() as session:
             query = select(BotBinding)
             count_query = select(func.count()).select_from(BotBinding)

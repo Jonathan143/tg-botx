@@ -127,7 +127,9 @@ def test_create_custom_command_persists_reserved_executor_shape() -> None:
         rows.append(item)
         return item
 
-    database = SimpleNamespace(list_bot_command_configs=lambda: rows, upsert_bot_command_config=upsert)
+    database = SimpleNamespace(
+        list_bot_command_configs=lambda: rows, upsert_bot_command_config=upsert
+    )
     item = BotManagementService(database, SimpleNamespace()).create_command_config(
         "/report", "生成报告"
     )

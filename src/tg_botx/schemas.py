@@ -26,7 +26,14 @@ from tg_botx.features.checkin.condition import (
 
 _MODEL_CONFIG = ConfigDict(extra="forbid")
 
-_VALID_STEP_TYPES = {"send_message", "wait_message", "click_button", "condition"}
+_VALID_STEP_TYPES = {
+    "send_message",
+    "wait_message",
+    "click_button",
+    "http_request",
+    "extract_variable",
+    "condition",
+}
 _STEP_FIELDS = {
     "send_message": {"type", "node_id", "text"},
     "wait_message": {"type", "node_id", "timeout_seconds", "success", "failure"},
@@ -38,6 +45,22 @@ _STEP_FIELDS = {
         "callback_data",
         "row",
         "column",
+    },
+    "http_request": {"type", "node_id", "method", "url", "headers", "body", "timeout_seconds"},
+    "extract_variable": {
+        "type",
+        "node_id",
+        "name",
+        "source",
+        "source_node_id",
+        "path",
+        "value_type",
+        "mode",
+        "pattern",
+        "capture_group",
+        "field",
+        "regex",
+        "extract_source",
     },
     "condition": {
         "type",
@@ -229,9 +252,7 @@ def _validate_extract(
     _unsupported(extraction, _EXTRACT_FIELDS, path)
     name = extraction.get("name")
     if not isinstance(name, str) or not VARIABLE_NAME.fullmatch(name) or name.startswith("__"):
-        raise ValueError(
-            f"{path}.name 必须符合 Python/JavaScript 标识符规范，且不能使用 __ 前缀"
-        )
+        raise ValueError(f"{path}.name 必须符合 Python/JavaScript 标识符规范，且不能使用 __ 前缀")
     if name in VARIABLE_RESERVED_WORDS:
         raise ValueError(f"{path}.name 不能使用 Python/JavaScript 保留关键字")
     if name in possible or name in declared:
@@ -466,6 +487,46 @@ def _validate_step_sequence(
                     or step[field] < 0
                 ):
                     raise ValueError(f"{step_path}.{field} 必须是非负整数")
+        elif kind == "http_request":
+            if step.get("method", "GET") not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+                raise ValueError(f"{step_path}.method 无效")
+            if not isinstance(step.get("url"), str) or not step["url"]:
+                raise ValueError(f"{step_path}.url 必须是非空字符串")
+            _validate_template(step["url"], f"{step_path}.url", possible)
+            for field in ("headers", "body"):
+                if field in step:
+                    if not isinstance(step[field], str):
+                        raise ValueError(f"{step_path}.{field} 必须是字符串")
+                    _validate_template(step[field], f"{step_path}.{field}", possible)
+        elif kind == "extract_variable":
+            if (
+                not isinstance(step.get("name"), str)
+                or not VARIABLE_NAME.fullmatch(step["name"])
+                or step["name"].startswith("__")
+            ):
+                raise ValueError(
+                    f"{step_path}.name 必须是合法变量名（字母/下划线开头，最多 64 个字符）"
+                )
+            if step.get("source") not in {
+                "http_body",
+                "http_status",
+                "http_headers",
+                "wait_message_text",
+            }:
+                raise ValueError(f"{step_path}.source 无效")
+            if step.get("value_type", "text") not in {"text", "number", "datetime"}:
+                raise ValueError(f"{step_path}.value_type 无效")
+            if step.get("mode", "whole_text") not in {
+                "whole_text",
+                "first_number",
+                "regex_capture",
+                "metadata",
+            }:
+                raise ValueError(f"{step_path}.mode 无效")
+            if step.get("mode") == "regex_capture" and not isinstance(step.get("pattern"), str):
+                raise ValueError(f"{step_path}.pattern 必须是字符串")
+            if step.get("extract_source", "message_text") not in {"message_text", "metadata"}:
+                raise ValueError(f"{step_path}.extract_source 无效")
     return definite, possible, has_wait
 
 
