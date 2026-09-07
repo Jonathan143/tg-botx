@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, time
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -289,7 +290,7 @@ def _validate_extract(
         if (isinstance(group, int) and group < 0) or (isinstance(group, str) and not group):
             raise ValueError(f"{path}.capture_group 必须是非负编号或非空名称")
         _validate_regex_config(extraction.get("regex", {}), f"{path}.regex")
-        _validate_regex_pattern(pattern, extraction.get("regex", {}), f"{path}.pattern")
+        _validate_regex_pattern(pattern, extraction.get("regex") or {}, f"{path}.pattern")
     else:
         for field in ("pattern", "capture_group", "regex"):
             if field in extraction:
@@ -498,24 +499,23 @@ def _validate_step_sequence(
                     if not isinstance(step[field], str):
                         raise ValueError(f"{step_path}.{field} 必须是字符串")
                     _validate_template(step[field], f"{step_path}.{field}", possible)
-        elif kind == "extract_variable":
-            if (
-                not isinstance(step.get("name"), str)
-                or not VARIABLE_NAME.fullmatch(step["name"])
-                or step["name"].startswith("__")
+            timeout = step.get("timeout_seconds", 30)
+            if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+                raise ValueError(f"{step_path}.timeout_seconds 必须是正整数")
+            try:
+                headers = json.loads(step.get("headers") or "{}")
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{step_path}.headers 必须是有效 JSON") from exc
+            if not isinstance(headers, dict) or any(
+                not isinstance(value, str) for value in headers.values()
             ):
-                raise ValueError(
-                    f"{step_path}.name 必须是合法变量名（字母/下划线开头，最多 64 个字符）"
-                )
-            if step.get("source") not in {
-                "http_body",
-                "http_status",
-                "http_headers",
-                "wait_message_text",
-            }:
+                raise ValueError(f"{step_path}.headers 必须是值为字符串的 JSON 对象")
+        elif kind == "extract_variable":
+            source = step.get("source")
+            if source not in {"http_body", "http_status", "http_headers", "wait_message_text"}:
                 raise ValueError(f"{step_path}.source 无效")
-            if step.get("value_type", "text") not in {"text", "number", "datetime"}:
-                raise ValueError(f"{step_path}.value_type 无效")
+            if "path" in step and not isinstance(step["path"], str):
+                raise ValueError(f"{step_path}.path 必须是字符串")
             if step.get("mode", "whole_text") not in {
                 "whole_text",
                 "first_number",
@@ -523,11 +523,73 @@ def _validate_step_sequence(
                 "metadata",
             }:
                 raise ValueError(f"{step_path}.mode 无效")
-            if step.get("mode") == "regex_capture" and not isinstance(step.get("pattern"), str):
-                raise ValueError(f"{step_path}.pattern 必须是字符串")
             if step.get("extract_source", "message_text") not in {"message_text", "metadata"}:
                 raise ValueError(f"{step_path}.extract_source 无效")
+            declared: dict[str, str] = {}
+            if source == "wait_message_text":
+                extraction = {key: value for key, value in step.items() if key in _EXTRACT_FIELDS}
+                extraction["source"] = (
+                    "metadata"
+                    if step.get("mode") == "metadata"
+                    else step.get("extract_source", "message_text")
+                )
+            else:
+                # HTTP responses have already selected their text/JSON field;
+                # share the declaration and type checks with message extraction.
+                extraction = {
+                    "name": step.get("name"),
+                    "source": "message_text",
+                    "mode": "whole_text",
+                    "value_type": step.get("value_type", "text"),
+                }
+            _validate_extract(extraction, step_path, declared, possible)
+            definite.update(declared)
+            possible.update(declared)
     return definite, possible, has_wait
+
+
+def _validate_extraction_sources(
+    steps: list[dict[str, Any]],
+    path: str,
+    sources: dict[str, str],
+    available_types: set[str],
+) -> tuple[dict[str, str], set[str]]:
+    """Only expose data sources that have executed on every reaching path."""
+    sources = sources.copy()
+    available_types = available_types.copy()
+    for index, step in enumerate(steps):
+        step_path = f"{path}[{index}]"
+        kind = step["type"]
+        if kind == "condition":
+            results = [
+                _validate_extraction_sources(
+                    branch["steps"],
+                    f"{step_path}.branches[{branch_index}].steps",
+                    sources,
+                    available_types,
+                )
+                for branch_index, branch in enumerate(step["branches"])
+            ]
+            common_ids = set.intersection(*(set(result[0]) for result in results))
+            sources = {node_id: results[0][0][node_id] for node_id in common_ids}
+            available_types = set.intersection(*(result[1] for result in results))
+        elif kind in {"http_request", "wait_message"}:
+            available_types.add(kind)
+            if step.get("node_id"):
+                sources[step["node_id"]] = kind
+        elif kind == "extract_variable":
+            expected = "wait_message" if step["source"] == "wait_message_text" else "http_request"
+            source_id = step.get("source_node_id", "")
+            if not isinstance(source_id, str):
+                raise ValueError(f"{step_path}.source_node_id 必须是字符串")
+            if source_id:
+                if sources.get(source_id) != expected:
+                    raise ValueError(
+                        f"{step_path}.source_node_id 必须引用所有到达路径上的前置 {expected} 节点"
+                    )
+            elif expected not in available_types:
+                raise ValueError(f"{step_path} 的所有到达路径都必须先执行 {expected} 节点")
+    return sources, available_types
 
 
 class RetryConfig(BaseModel):
@@ -640,6 +702,7 @@ class TaskDefinition(BaseModel):
             has_wait=False,
             node_ids=set(),
         )
+        _validate_extraction_sources(self.steps, "steps", {}, set())
         return self
 
     @classmethod
