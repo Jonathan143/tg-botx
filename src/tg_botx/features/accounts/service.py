@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
-import re
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from telethon import TelegramClient, events
 from telethon.errors import (
     FloodWaitError,
     PasswordHashInvalidError,
@@ -22,159 +20,31 @@ from telethon.errors import (
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
 )
-from telethon.tl.types import Channel, Chat, User
 
 from tg_botx.config import Settings
+from tg_botx.features.accounts.access import AccountAccess
+from tg_botx.features.accounts.avatars import AvatarCache
+from tg_botx.features.accounts.chats import ChatDirectory
+from tg_botx.features.accounts.directory import AccountDirectory
+from tg_botx.features.accounts.models import (
+    _ACCOUNT_NAME,
+    _ACTIVE_STAGES,
+    AccountView,
+    AdminAccountError,
+    ChatPullView,
+    ChatView,
+    LoginFlowView,
+    LoginMethod,
+    LoginStage,
+    LogoutImpact,
+    MessageProbeView,
+    _create_telegram_client,
+    _LoginFlow,
+)
+from tg_botx.features.accounts.probe import MessageProbe
 from tg_botx.infrastructure.persistence.db import Account, Database, utc_now
-from tg_botx.integrations.telegram import TelegramAccountConfig, create_telethon_client
 
 logger = logging.getLogger(__name__)
-
-
-def _create_telegram_client(session_path: str, api_id: int, api_hash: str) -> TelegramClient:
-    return create_telethon_client(
-        TelegramAccountConfig(
-            api_id=api_id,
-            api_hash=api_hash,
-            session_path=Path(session_path),
-        )
-    )
-
-
-LoginMethod = Literal["qr", "phone"]
-LoginStage = Literal[
-    "connecting",
-    "phone_required",
-    "qr_pending",
-    "code_pending",
-    "password_pending",
-    "completed",
-    "failed",
-]
-
-_ACTIVE_STAGES = {
-    "connecting",
-    "phone_required",
-    "qr_pending",
-    "code_pending",
-    "password_pending",
-}
-_ACCOUNT_NAME = re.compile(r"^[^/\\\x00]{1,100}$")
-
-
-class AdminAccountError(RuntimeError):
-    """An API-safe account-management error with a stable error code."""
-
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-
-
-@dataclass(frozen=True, slots=True)
-class LoginFlowView:
-    flow_id: str
-    account_name: str
-    method: LoginMethod
-    stage: LoginStage
-    qr_url: str | None = field(repr=False)
-    qr_expires_at: datetime | None
-    account_id: str | None
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class AccountView:
-    account_id: str
-    name: str
-    phone_masked: str | None
-    session_name: str
-    is_active: bool
-    created_at: datetime
-    task_count: int
-    enabled_task_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class ChatView:
-    chat_id: str
-    chat_type: Literal["bot", "group", "private"]
-    title: str
-    username: str | None
-    has_avatar: bool
-    avatar_photo_id: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ChatPullView:
-    account_id: str
-    added: int
-    updated: int
-    removed: int
-    total: int
-    synced_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class MessageProbeView:
-    message_id: int
-    text: str
-    buttons: tuple[dict[str, Any], ...]
-
-
-@dataclass(frozen=True, slots=True)
-class AccountTaskImpact:
-    task_id: str
-    name: str
-    enabled: bool
-    archived: bool
-
-
-@dataclass(frozen=True, slots=True)
-class LogoutImpact:
-    account_id: str
-    account_name: str
-    tasks: tuple[AccountTaskImpact, ...]
-
-    @property
-    def enabled_task_ids(self) -> tuple[str, ...]:
-        return tuple(task.task_id for task in self.tasks if task.enabled)
-
-    @property
-    def enabled_task_count(self) -> int:
-        return len(self.enabled_task_ids)
-
-
-@dataclass(slots=True)
-class _LoginFlow:
-    flow_id: str
-    account_name: str
-    method: LoginMethod
-    stage: LoginStage
-    client: Any = field(repr=False)
-    connected: bool = False
-    qr_url: str | None = field(default=None, repr=False)
-    qr_expires_at: datetime | None = None
-    account_id: str | None = None
-    created_at: datetime = field(default_factory=utc_now)
-    updated_at: datetime = field(default_factory=utc_now)
-    qr_login: Any | None = field(default=None, repr=False)
-    waiter: asyncio.Task[None] | None = field(default=None, repr=False)
-    operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-
-    def view(self) -> LoginFlowView:
-        return LoginFlowView(
-            flow_id=self.flow_id,
-            account_name=self.account_name,
-            method=self.method,
-            stage=self.stage,
-            qr_url=self.qr_url,
-            qr_expires_at=self.qr_expires_at,
-            account_id=self.account_id,
-            created_at=self.created_at,
-            updated_at=self.updated_at,
-        )
 
 
 class LoginFlowManager:
@@ -200,8 +70,11 @@ class LoginFlowManager:
         self._client_pool = client_pool
         self._flows_by_id: dict[str, _LoginFlow] = {}
         self._flow_ids_by_account: dict[str, str] = {}
-        self._avatar_prefetch_tasks: set[asyncio.Task[None]] = set()
-        self._avatar_download_locks: dict[str, asyncio.Lock] = {}
+        self.access = AccountAccess(settings, database, client_factory, client_pool)
+        self.avatars = AvatarCache(settings, database, self.access)
+        self.chats = ChatDirectory(database, self.access, self.avatars)
+        self.probe = MessageProbe(self.access)
+        self.directory = AccountDirectory(settings, database, self.access, client_factory)
         self._lock = asyncio.Lock()
 
     async def start(self, account_name: str, method: LoginMethod) -> LoginFlowView:
@@ -358,32 +231,15 @@ class LoginFlowManager:
         await self._disconnect(flow)
 
     async def close(self) -> None:
-        prefetch_tasks = tuple(self._avatar_prefetch_tasks)
-        for task in prefetch_tasks:
-            task.cancel()
-        if prefetch_tasks:
-            await asyncio.gather(*prefetch_tasks, return_exceptions=True)
+        await self.avatars.close()
         async with self._lock:
             flow_ids = tuple(self._flows_by_id)
         for flow_id in flow_ids:
-            try:
+            with contextlib.suppress(AdminAccountError):
                 await self.cancel(flow_id)
-            except AdminAccountError:
-                pass
 
     def list_accounts(self) -> list[AccountView]:
-        accounts = self.database.list_accounts()
-        tasks = self.database.list_tasks(include_archived=True)
-        return [
-            self._account_view(
-                account,
-                task_count=sum(task.account_id == account.id for task in tasks),
-                enabled_task_count=sum(
-                    task.account_id == account.id and task.enabled for task in tasks
-                ),
-            )
-            for account in accounts
-        ]
+        return self.directory.list_accounts()
 
     async def list_chats(
         self,
@@ -393,156 +249,17 @@ class LoginFlowManager:
         query: str | None = None,
         limit: int = 200,
     ) -> list[ChatView]:
-        account = self._find_account(account_id_or_name)
-        if account is None:
-            raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
-        if not account.is_active:
-            raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
-        if chat_type not in {"all", "bot", "group", "private"}:
-            raise AdminAccountError("CHAT_TYPE_INVALID", "聊天类型无效")
-        try:
-            rows = self.database.list_account_chats(
-                account.id,
-                chat_type=chat_type,
-                query=query,
-                limit=limit,
-            )
-        except Exception:
-            raise AdminAccountError("CHAT_LIST_FAILED", "无法加载账号对话") from None
-        return [
-            ChatView(
-                chat_id=row.chat_id,
-                chat_type=row.chat_type,  # type: ignore[arg-type]
-                title=row.title,
-                username=row.username,
-                has_avatar=row.has_avatar,
-                avatar_photo_id=row.avatar_photo_id,
-            )
-            for row in rows
-        ]
-
-    async def pull_chats(
-        self,
-        account_id_or_name: str,
-        *,
-        client: Any | None = None,
-    ) -> ChatPullView:
-        """Pull all dialogs from Telegram and incrementally cache them."""
-
-        account = self._find_account(account_id_or_name)
-        if account is None:
-            raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
-        if not account.is_active:
-            raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
-        pooled_lease = client is None
-        telegram_client = client or await self._acquire_pooled_client(account)
-        chats: list[dict[str, Any]] = []
-        avatar_jobs: list[tuple[str, Any, int]] = []
-        try:
-            async for dialog in telegram_client.iter_dialogs():
-                entity = dialog.entity
-                kind = self._chat_type(entity)
-                if kind is None:
-                    continue
-                avatar_photo_id = self._chat_photo_id(entity)
-                username = getattr(entity, "username", None)
-                username_value = f"@{username}" if username else None
-                chats.append(
-                    {
-                        "chat_id": str(entity.id),
-                        "chat_type": kind,
-                        "title": self._chat_title(entity, dialog),
-                        "username": username_value,
-                        "has_avatar": avatar_photo_id is not None,
-                        "avatar_photo_id": avatar_photo_id,
-                    }
-                )
-                if avatar_photo_id is not None:
-                    avatar_jobs.append((str(entity.id), entity, avatar_photo_id))
-        except asyncio.CancelledError:
-            if pooled_lease:
-                await self._release_pooled_client(account)
-            raise
-        except Exception:
-            if pooled_lease:
-                await self._release_pooled_client(account)
-            raise AdminAccountError("CHAT_PULL_FAILED", "无法拉取账号对话") from None
-
-        try:
-            result = self.database.upsert_account_chats(account.id, chats)
-        except asyncio.CancelledError:
-            if pooled_lease:
-                await self._release_pooled_client(account)
-            raise
-        except Exception:
-            if pooled_lease:
-                await self._release_pooled_client(account)
-            raise AdminAccountError("CHAT_PULL_FAILED", "无法保存账号对话") from None
-        # The API should return as soon as the dialog snapshot is persisted.
-        # Avatar downloads are independent and run in the background.  Only a
-        # pooled client is safe to use after this method returns; login-flow
-        # clients are disconnected immediately after the initial pull.
-        if avatar_jobs and pooled_lease:
-            # Transfer the lease to the background downloader; otherwise the
-            # client would be disconnected while avatar requests are running.
-            self._schedule_avatar_prefetch(
-                account.id, telegram_client, avatar_jobs, account=account
-            )
-            pooled_lease = False
-        if pooled_lease:
-            await self._release_pooled_client(account)
-        return ChatPullView(
-            account_id=account.id,
-            added=result["added"],
-            updated=result["updated"],
-            removed=result["removed"],
-            total=result["total"],
-            synced_at=utc_now(),
+        return await self.chats.list_chats(
+            account_id_or_name, chat_type=chat_type, query=query, limit=limit
         )
 
+    async def pull_chats(
+        self, account_id_or_name: str, *, client: Any | None = None
+    ) -> ChatPullView:
+        return await self.chats.pull_chats(account_id_or_name, client=client)
+
     async def download_chat_avatar(self, account_id_or_name: str, chat_id: str) -> Path | None:
-        """Return a locally cached avatar without contacting Telegram.
-
-        Avatar files are populated asynchronously while chats are pulled.  A
-        request for an avatar must remain a cheap, read-only cache lookup: a
-        missing file is represented by ``None`` and the API turns that into a
-        404 response.
-        """
-
-        account = self._find_account(account_id_or_name)
-        if account is None:
-            raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
-        if not account.is_active:
-            raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
-        if not re.fullmatch(r"-?\d+", chat_id):
-            raise AdminAccountError("CHAT_ID_INVALID", "聊天 ID 无效")
-
-        cache_dir = self._avatar_cache_dir()
-        try:
-            get_account_chat = getattr(self.database, "get_account_chat", None)
-            chat = get_account_chat(account.id, chat_id) if get_account_chat else None
-        except AdminAccountError:
-            raise
-        except Exception:
-            raise AdminAccountError("CHAT_AVATAR_FAILED", "无法读取聊天头像缓存") from None
-
-        photo_id = getattr(chat, "avatar_photo_id", None) if chat is not None else None
-        if photo_id is not None:
-            cache_path = cache_dir / f"{chat_id}-{photo_id}.jpg"
-            if self._valid_avatar_file(cache_path):
-                return cache_path
-            # A known photo version with no matching file is a cache miss.
-            # Do not serve an older version under the same chat id.
-            return None
-
-        # Keep avatars cached by older versions (or rows created before the
-        # photo id column existed) usable.  A row explicitly marked as having
-        # no avatar must not resurrect a stale file.  This still performs no
-        # network or database mutation and simply returns None when no file is
-        # present.
-        if chat is not None and not getattr(chat, "has_avatar", False):
-            return None
-        return self._find_legacy_avatar(cache_dir, chat_id)
+        return await self.avatars.download_chat_avatar(account_id_or_name, chat_id)
 
     def _schedule_avatar_prefetch(
         self,
@@ -552,21 +269,7 @@ class LoginFlowManager:
         *,
         account: Account | None = None,
     ) -> None:
-        task = asyncio.create_task(
-            self._prefetch_chat_avatars(account_id, client, jobs, account=account)
-        )
-        self._avatar_prefetch_tasks.add(task)
-
-        def on_done(completed: asyncio.Task[None]) -> None:
-            self._avatar_prefetch_tasks.discard(completed)
-            if completed.cancelled():
-                return
-            try:
-                completed.result()
-            except Exception:
-                logger.exception("后台预下载聊天头像失败 account_id=%s", account_id)
-
-        task.add_done_callback(on_done)
+        return self.avatars._schedule_avatar_prefetch(account_id, client, jobs, account=account)
 
     async def _prefetch_chat_avatars(
         self,
@@ -576,307 +279,56 @@ class LoginFlowManager:
         *,
         account: Account | None = None,
     ) -> None:
-        semaphore = asyncio.Semaphore(4)
-
-        async def download(job: tuple[str, Any, int]) -> None:
-            chat_id, entity, photo_id = job
-            async with semaphore:
-                try:
-                    await self._download_avatar_file(client, entity, chat_id, photo_id)
-                except Exception:
-                    logger.warning(
-                        "后台下载聊天头像失败 account_id=%s chat_id=%s",
-                        account_id,
-                        chat_id,
-                        exc_info=True,
-                    )
-
-        try:
-            await asyncio.gather(*(download(job) for job in jobs))
-        finally:
-            if account is not None:
-                await self._release_pooled_client(account)
+        return await self.avatars._prefetch_chat_avatars(account_id, client, jobs, account=account)
 
     async def _download_avatar_file(
-        self,
-        client: Any,
-        entity: Any,
-        chat_id: str,
-        photo_id: int,
+        self, client: Any, entity: Any, chat_id: str, photo_id: int
     ) -> Path | None:
-        cache_dir = self._avatar_cache_dir()
-        cache_path = cache_dir / f"{chat_id}-{photo_id}.jpg"
-        lock = self._avatar_download_locks.setdefault(str(cache_path), asyncio.Lock())
-        async with lock:
-            # A pull prefetch and a browser request can arrive at the same
-            # time. Re-check after acquiring the lock to avoid duplicate
-            # Telegram downloads for the same avatar.
-            if self._valid_avatar_file(cache_path):
-                return cache_path
-
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            temporary_path = cache_dir / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
-            try:
-                downloaded = await client.download_profile_photo(entity, file=str(temporary_path))
-                if downloaded is None or not temporary_path.is_file():
-                    return None
-                if temporary_path.stat().st_size <= 0:
-                    return None
-                temporary_path.replace(cache_path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
-
-            # Keep only the current photo for this chat.  Old versions are
-            # never needed after the photo id has changed.
-            for stale_path in cache_dir.glob(f"{chat_id}-*.jpg"):
-                if stale_path != cache_path:
-                    stale_path.unlink(missing_ok=True)
-        return cache_path
+        return await self.avatars._download_avatar_file(client, entity, chat_id, photo_id)
 
     def _avatar_cache_dir(self) -> Path:
-        return self.settings.data_dir / "cache" / "avatars"
+        return self.avatars._avatar_cache_dir()
 
     @staticmethod
     def _valid_avatar_file(path: Path) -> bool:
-        try:
-            return path.is_file() and path.stat().st_size > 0
-        except OSError:
-            return False
+        return AvatarCache._valid_avatar_file(path)
 
     def _find_legacy_avatar(self, cache_dir: Path, chat_id: str) -> Path | None:
-        try:
-            candidates = [
-                path for path in cache_dir.glob(f"{chat_id}-*.jpg") if self._valid_avatar_file(path)
-            ]
-        except OSError:
-            return None
-        if not candidates:
-            return None
-        # There should normally be one file.  Choosing the newest makes the
-        # fallback deterministic if an interrupted previous download left
-        # multiple versions behind.
-        try:
-            return max(candidates, key=lambda path: path.stat().st_mtime_ns)
-        except OSError:
-            return None
+        return self.avatars._find_legacy_avatar(cache_dir, chat_id)
 
     async def probe_message(
-        self,
-        account_id_or_name: str,
-        target: str,
-        text: str,
-        *,
-        timeout_seconds: int = 30,
+        self, account_id_or_name: str, target: str, text: str, *, timeout_seconds: int = 30
     ) -> MessageProbeView:
-        """Send a probe command and return the next bot message's buttons."""
-
-        account = self._find_account(account_id_or_name)
-        if account is None:
-            raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
-        if not account.is_active:
-            raise AdminAccountError("ACCOUNT_INACTIVE", "Telegram 账号已停用")
-        if not target.strip():
-            raise AdminAccountError("CHAT_TARGET_INVALID", "目标聊天不能为空")
-        if not text:
-            raise AdminAccountError("MESSAGE_TEXT_INVALID", "发送内容不能为空")
-        if timeout_seconds < 1 or timeout_seconds > 120:
-            raise AdminAccountError("MESSAGE_TIMEOUT_INVALID", "等待时间必须在 1–120 秒之间")
-
-        client = await self._acquire_pooled_client(account)
-        try:
-            entity = await client.get_entity(target.strip())
-            sent = await client.send_message(entity, text)
-            baseline = int(getattr(sent, "id", 0) or 0)
-            loop = asyncio.get_running_loop()
-            future: asyncio.Future[Any] = loop.create_future()
-
-            async def inspect(message: Any) -> None:
-                if future.done() or int(getattr(message, "id", 0) or 0) <= baseline:
-                    return
-                target_id = getattr(entity, "id", None)
-                sender_id = getattr(message, "sender_id", None)
-                if (
-                    target_id is not None
-                    and getattr(entity, "bot", False)
-                    and sender_id != target_id
-                ):
-                    return
-                future.set_result(message)
-
-            async def handler(event: Any) -> None:
-                await inspect(event.message)
-
-            client.add_event_handler(handler, events.NewMessage(chats=entity))
-            try:
-                messages = await client.get_messages(entity, limit=20, min_id=baseline)
-                for message in reversed(messages or []):
-                    await inspect(message)
-                    if future.done():
-                        break
-                try:
-                    received = await asyncio.wait_for(future, timeout=timeout_seconds)
-                except TimeoutError:
-                    raise AdminAccountError("MESSAGE_WAIT_TIMEOUT", "等待机器人回复超时") from None
-            finally:
-                client.remove_event_handler(handler, events.NewMessage(chats=entity))
-        except AdminAccountError:
-            await self._release_pooled_client(account)
-            raise
-        except asyncio.CancelledError:
-            await self._release_pooled_client(account)
-            raise
-        except Exception:
-            await self._release_pooled_client(account)
-            raise AdminAccountError("MESSAGE_PROBE_FAILED", "发送指令或读取回复失败") from None
-
-        try:
-            refreshed = await client.get_messages(entity, ids=received.id)
-            if isinstance(refreshed, (list, tuple)):
-                refreshed = refreshed[0] if refreshed else None
-            if refreshed is not None:
-                received = refreshed
-        except asyncio.CancelledError:
-            await self._release_pooled_client(account)
-            raise
-        except Exception:
-            pass
-        await self._release_pooled_client(account)
-
-        buttons = getattr(received, "buttons", None) or []
-        if not buttons:
-            markup_rows = getattr(getattr(received, "reply_markup", None), "rows", None) or []
-            buttons = [getattr(row, "buttons", None) or [] for row in markup_rows]
-        rows: list[dict[str, Any]] = []
-        for row_index, row in enumerate(buttons):
-            for column_index, button in enumerate(row):
-                callback_data = getattr(button, "data", None)
-                if isinstance(callback_data, bytes):
-                    callback_value = callback_data.decode("utf-8", errors="replace")
-                elif callback_data is None:
-                    callback_value = None
-                else:
-                    callback_value = str(callback_data)
-                rows.append(
-                    {
-                        "row": row_index,
-                        "column": column_index,
-                        "text": str(getattr(button, "text", "") or ""),
-                        "callbackData": callback_value,
-                    }
-                )
-        return MessageProbeView(
-            message_id=int(getattr(received, "id", 0) or 0),
-            text=str(getattr(received, "raw_text", "") or ""),
-            buttons=tuple(rows),
+        return await self.probe.probe_message(
+            account_id_or_name, target, text, timeout_seconds=timeout_seconds
         )
 
     async def _get_pooled_client(self, account: Account) -> Any:
-        if self._client_pool is None:
-            raise AdminAccountError("TELEGRAM_UNAVAILABLE", "Telegram 服务暂不可用")
-        try:
-            return await self._client_pool.get(account)
-        except Exception:
-            raise AdminAccountError("TELEGRAM_UNAVAILABLE", "无法连接 Telegram 账号") from None
+        return await self.access._get_pooled_client(account)
 
     async def _acquire_pooled_client(self, account: Account) -> Any:
-        if self._client_pool is None:
-            raise AdminAccountError("TELEGRAM_UNAVAILABLE", "Telegram 服务暂不可用")
-        try:
-            acquire = getattr(self._client_pool, "acquire", None)
-            return await (
-                acquire(account) if acquire is not None else self._client_pool.get(account)
-            )
-        except Exception:
-            raise AdminAccountError("TELEGRAM_UNAVAILABLE", "无法连接 Telegram 账号") from None
+        return await self.access._acquire_pooled_client(account)
 
     async def _release_pooled_client(self, account: Account) -> None:
-        if self._client_pool is None:
-            return
-        release = getattr(self._client_pool, "release", None)
-        if release is None:
-            return
-        try:
-            await release(account)
-        except Exception:
-            logger.warning("释放 Telegram 账号连接失败 account_id=%s", account.id, exc_info=True)
+        return await self.access._release_pooled_client(account)
 
     @staticmethod
     def _chat_type(entity: Any) -> Literal["bot", "group", "private"] | None:
-        if isinstance(entity, User):
-            return "bot" if bool(getattr(entity, "bot", False)) else "private"
-        if isinstance(entity, (Chat, Channel)):
-            return "group"
-        return None
+        return ChatDirectory._chat_type(entity)
 
     @staticmethod
     def _chat_photo_id(entity: Any) -> int | None:
-        photo = getattr(entity, "photo", None)
-        photo_id = getattr(photo, "photo_id", None)
-        return photo_id if isinstance(photo_id, int) else None
+        return ChatDirectory._chat_photo_id(entity)
 
     @staticmethod
     def _chat_title(entity: Any, dialog: Any) -> str:
-        if isinstance(entity, User):
-            name = " ".join(
-                value
-                for value in (
-                    getattr(entity, "first_name", None),
-                    getattr(entity, "last_name", None),
-                )
-                if value
-            ).strip()
-            return name or getattr(entity, "username", None) or str(entity.id)
-        return getattr(dialog, "title", None) or getattr(entity, "title", None) or str(entity.id)
+        return ChatDirectory._chat_title(entity, dialog)
 
     def logout_impact(self, account_id_or_name: str) -> LogoutImpact:
-        account = self._find_account(account_id_or_name)
-        if account is None:
-            raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
-        tasks = [
-            AccountTaskImpact(
-                task_id=task.id,
-                name=task.name,
-                enabled=task.enabled,
-                archived=task.archived,
-            )
-            for task in self.database.list_tasks(include_archived=True)
-            if task.account_id == account.id
-        ]
-        return LogoutImpact(account.id, account.name, tuple(tasks))
+        return self.directory.logout_impact(account_id_or_name)
 
     async def logout(self, account_id_or_name: str) -> LogoutImpact:
-        impact = self.logout_impact(account_id_or_name)
-        if impact.enabled_task_ids:
-            raise AdminAccountError("ACCOUNT_HAS_ENABLED_TASKS", "账号仍有关联的启用任务，无法退出")
-        account = self.database.get_account_by_id(impact.account_id)
-        if account is None:
-            raise AdminAccountError("ACCOUNT_NOT_FOUND", "Telegram 账号不存在")
-        self._ensure_pooled_client_idle(account)
-
-        try:
-            await self._disconnect_pooled_client(account)
-            api_id, api_hash = self._credentials()
-            client = self._client_factory(
-                str(self.settings.sessions_dir / account.session_name), api_id, api_hash
-            )
-            await client.connect()
-            if await client.is_user_authorized():
-                await client.log_out()
-        except AdminAccountError:
-            raise
-        except Exception:
-            raise AdminAccountError("ACCOUNT_LOGOUT_FAILED", "Telegram 账号退出失败") from None
-        finally:
-            if "client" in locals():
-                try:
-                    result = client.disconnect()
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception:
-                    pass
-
-        self.database.deactivate_account(account.id)
-        return impact
+        return await self.directory.logout(account_id_or_name)
 
     async def _connect(self, flow: _LoginFlow) -> None:
         if not flow.connected:
@@ -972,30 +424,10 @@ class LoginFlowManager:
             flow.client = None
 
     async def _disconnect_pooled_client(self, account: Account) -> None:
-        if self._client_pool is None:
-            return
-        remover = getattr(self._client_pool, "disconnect_account", None)
-        if remover is not None:
-            result = remover(account)
-            if inspect.isawaitable(result):
-                result = await result
-            if result is False:
-                raise AdminAccountError("ACCOUNT_BUSY", "账号当前正在执行任务，请稍后再试")
-            return
-        clients = getattr(self._client_pool, "clients", None)
-        if isinstance(clients, dict):
-            client = clients.pop(account.id, None)
-            if client is not None:
-                result = client.disconnect()
-                if inspect.isawaitable(result):
-                    await result
+        return await self.access._disconnect_pooled_client(account)
 
     def _ensure_pooled_client_idle(self, account: Account) -> None:
-        if self._client_pool is None:
-            return
-        checker = getattr(self._client_pool, "has_active_leases", None)
-        if checker is not None and checker(account):
-            raise AdminAccountError("ACCOUNT_BUSY", "账号当前正在执行任务，请稍后再试")
+        return self.access._ensure_pooled_client_idle(account)
 
     async def _require_flow(self, flow_id: str) -> _LoginFlow:
         async with self._lock:
@@ -1021,40 +453,22 @@ class LoginFlowManager:
         return normalized
 
     def _credentials(self) -> tuple[int, str]:
-        try:
-            return self.settings.require_api_credentials()
-        except Exception:
-            raise AdminAccountError(
-                "TELEGRAM_CONFIGURATION_INVALID", "Telegram API 配置不可用"
-            ) from None
+        return self.access._credentials()
 
     def _find_account(self, account_id_or_name: str) -> Account | None:
-        return self.database.get_account_by_id(account_id_or_name) or self.database.get_account(
-            account_id_or_name
-        )
+        return self.access._find_account(account_id_or_name)
 
     @staticmethod
     def _account_view(
         account: Account, *, task_count: int = 0, enabled_task_count: int = 0
     ) -> AccountView:
-        return AccountView(
-            account_id=account.id,
-            name=account.name,
-            phone_masked=LoginFlowManager._mask_phone(account.phone),
-            session_name=account.session_name,
-            is_active=account.is_active,
-            created_at=account.created_at,
-            task_count=task_count,
-            enabled_task_count=enabled_task_count,
+        return AccountDirectory._account_view(
+            account, task_count=task_count, enabled_task_count=enabled_task_count
         )
 
     @staticmethod
     def _mask_phone(phone: str | None) -> str | None:
-        if not phone:
-            return None
-        if len(phone) <= 4:
-            return "*" * len(phone)
-        return f"{phone[:3]}{'*' * (len(phone) - 5)}{phone[-2:]}"
+        return AccountDirectory._mask_phone(phone)
 
     @staticmethod
     def _utc_datetime(value: Any) -> datetime | None:

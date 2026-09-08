@@ -9,7 +9,7 @@ import typer
 
 from tg_botx.config import Settings
 from tg_botx.core.time import utc_isoformat
-from tg_botx.features.admin_bot import BotManagementService
+from tg_botx.features.bot.management import BotManagementService
 from tg_botx.features.checkin.runtime import CheckinService, TaskNotFound, TaskStateError
 from tg_botx.features.checkin.schedule import schedule_from_task
 from tg_botx.infrastructure.observability.logging import IconFormatter, SensitiveDataFilter
@@ -107,24 +107,24 @@ def logout(account: str = typer.Option("default", "--account")):
 def create_bot_binding() -> None:
     """生成一个一次性 Telegram 管理 Bot 绑定码。"""
     settings, database = resources()
-    service = BotManagementService(database, CheckinService(settings, database))
+    service = BotManagementService(database)
     code, item = service.create_binding_code()
     typer.echo(f"绑定码：{code}")
-    typer.echo(f"有效期至：{item.expires_at.isoformat()}")
+    typer.echo(f"有效期至：{(utc_isoformat(item.expires_at) or '永久')}")
 
 
 @binding_app.command("list")
 def list_bot_bindings() -> None:
     """查看绑定码和当前已绑定的 Telegram 用户。"""
     settings, database = resources()
-    service = BotManagementService(database, CheckinService(settings, database))
+    service = BotManagementService(database)
     codes = service.binding_codes()
     bindings = service.bindings()
     if codes:
         typer.echo("绑定码：")
         for item in codes:
             typer.echo(
-                f"  {item.id}  *{item.hint}  {item.status}  expires={item.expires_at.isoformat()}"
+                f"  {item.id}  *{item.hint}  {item.status}  expires={(utc_isoformat(item.expires_at) or '永久')}"
             )
     else:
         typer.echo("暂无绑定码")
@@ -143,7 +143,7 @@ def list_bot_bindings() -> None:
 def revoke_bot_binding(binding_id: str) -> None:
     """撤销绑定码或已绑定用户。"""
     settings, database = resources()
-    service = BotManagementService(database, CheckinService(settings, database))
+    service = BotManagementService(database)
     if service.revoke_code(binding_id) or service.revoke_binding(binding_id):
         typer.echo("绑定已撤销")
         return

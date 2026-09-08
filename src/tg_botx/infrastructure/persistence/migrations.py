@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from sqlalchemy import inspect, select, insert
+from sqlalchemy import insert, inspect, select
 from sqlalchemy.engine import Connection, Engine
 
 from tg_botx.infrastructure.persistence.models import Base, SchemaVersion

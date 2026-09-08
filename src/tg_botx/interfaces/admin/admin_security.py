@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import ipaddress
@@ -346,10 +347,8 @@ class TransportKeyManager:
             if stop_event is None:
                 await asyncio.sleep(delay)
                 continue
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop_event.wait(), timeout=delay)
-            except TimeoutError:
-                pass
 
     def _generate_key(self, now: float) -> _TransportKey:
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=self.key_size)
@@ -628,9 +627,12 @@ class SessionManager:
         # request makes a transient database outage take down the entire admin
         # API.  Keep it bounded to once per minute while retaining an explicit
         # ``prune()`` method for startup/shutdown jobs that need an immediate run.
-        if not force and self._last_prune_at is not None:
-            if now - self._last_prune_at < self.prune_interval_seconds:
-                return
+        if (
+            not force
+            and self._last_prune_at is not None
+            and now - self._last_prune_at < self.prune_interval_seconds
+        ):
+            return
         self._last_prune_at = now
         self._session_store.delete_expired_admin_sessions(datetime.fromtimestamp(now, tz=UTC))
 
