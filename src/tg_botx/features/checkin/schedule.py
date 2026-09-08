@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from tg_botx.infrastructure.persistence.db import Task
@@ -14,20 +14,20 @@ def parse_clock(value: str) -> time:
 
 
 def to_utc(local: datetime, zone: ZoneInfo) -> datetime:
-    return local.astimezone(timezone.utc)
+    return local.astimezone(UTC)
 
 
 def _localize(naive: datetime, zone: ZoneInfo) -> datetime:
     candidate = naive.replace(tzinfo=zone, fold=0)
-    roundtrip = candidate.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None)
+    roundtrip = candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None)
     if roundtrip == naive:
         return candidate
     alternate = naive.replace(tzinfo=zone, fold=1)
-    alternate_roundtrip = alternate.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None)
+    alternate_roundtrip = alternate.astimezone(UTC).astimezone(zone).replace(tzinfo=None)
     if alternate_roundtrip == naive:
         return candidate  # ambiguous wall time: choose the first occurrence
     # Nonexistent wall time: zoneinfo's fold=0 UTC roundtrip is the next valid time.
-    return candidate.astimezone(timezone.utc).astimezone(zone)
+    return candidate.astimezone(UTC).astimezone(zone)
 
 
 def _seed_for(schedule: ScheduleConfig, seed: str | None) -> str:
@@ -95,7 +95,7 @@ def next_runs(
 ) -> list[datetime]:
     if count <= 0:
         return []
-    now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_utc = (now or datetime.now(UTC)).astimezone(UTC)
     zone = ZoneInfo(schedule.timezone)
     cutoff = now_utc.astimezone(zone)
     if start_after is not None:

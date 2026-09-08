@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -24,13 +24,13 @@ from sqlalchemy import (
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from tg_botx.core.time import utc_isoformat
+from tg_botx.core.time import utc_isoformat as utc_isoformat
 
-PERMANENT_EXPIRY = datetime.max.replace(tzinfo=timezone.utc)
+PERMANENT_EXPIRY = datetime.max.replace(tzinfo=UTC)
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class UTCDateTime(TypeDecorator[datetime]):
@@ -52,8 +52,8 @@ class UTCDateTime(TypeDecorator[datetime]):
         if value is None:
             return None
         if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        value = value.astimezone(timezone.utc)
+            value = value.replace(tzinfo=UTC)
+        value = value.astimezone(UTC)
         # SQLite has no timezone-aware datetime type, so preserve the existing
         # naive-UTC storage format.  PostgreSQL's TIMESTAMP WITH TIME ZONE
         # should receive an aware value so the server timezone cannot alter it.
@@ -65,8 +65,8 @@ class UTCDateTime(TypeDecorator[datetime]):
         if value is None:
             return None
         if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 class Base(DeclarativeBase):
@@ -520,6 +520,25 @@ class Database:
             session.commit()
             session.refresh(account)
             return account
+
+    def activate_account(self, name: str, phone: str | None) -> Account:
+        with self.session() as session:
+            account = session.scalar(select(Account).where(Account.name == name))
+            if account is None:
+                account = Account(name=name, session_name=name)
+                session.add(account)
+            account.phone = phone
+            account.is_active = True
+            session.commit()
+            session.refresh(account)
+            return account
+
+    def deactivate_account(self, account_id: str) -> None:
+        with self.session() as session:
+            account = session.get(Account, account_id)
+            if account is not None:
+                account.is_active = False
+                session.commit()
 
     def list_account_chats(
         self,
@@ -1075,8 +1094,12 @@ class Database:
         *,
         release_note: str | None = None,
         published_by: str | None = None,
+        task_values: dict[str, Any] | None = None,
     ) -> WorkflowVersion:
         with self.session() as session:
+            task = session.get(Task, task_id, with_for_update=True)
+            if task is None:
+                raise KeyError(task_id)
             latest = session.scalar(
                 select(WorkflowVersion.version_number)
                 .where(WorkflowVersion.task_id == task_id)
@@ -1090,6 +1113,10 @@ class Database:
                 release_note=release_note.strip() if release_note else None,
                 published_by=published_by,
             )
+            if task_values is not None:
+                for key, value in task_values.items():
+                    setattr(task, key, value)
+                task.updated_at = utc_now()
             session.add(version)
             session.commit()
             session.refresh(version)

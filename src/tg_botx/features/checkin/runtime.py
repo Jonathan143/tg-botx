@@ -931,19 +931,21 @@ class CheckinService:
             task.id,
             self._execution_definition(definition),
             release_note=release_note,
+            task_values={
+                "timezone": schedule.timezone,
+                "schedule_type": schedule.type,
+                "fixed_time": schedule.time,
+                "random_start": schedule.start,
+                "random_end": schedule.end,
+                "published_schedule_json": json.dumps(
+                    schedule.model_dump(mode="json"), ensure_ascii=False
+                ),
+                "next_run_at": next_run,
+            },
         )
-        updated = self.database.update_task(
-            task.id,
-            timezone=schedule.timezone,
-            schedule_type=schedule.type,
-            fixed_time=schedule.time,
-            random_start=schedule.start,
-            random_end=schedule.end,
-            published_schedule_json=json.dumps(
-                schedule.model_dump(mode="json"), ensure_ascii=False
-            ),
-            next_run_at=next_run,
-        )
+        updated = self.database.get_task_any(task.id)
+        if updated is None:
+            raise TaskNotFound("任务不存在")
         self._bump_task_revision(task.id)
         self._sync_schedule(updated)
         self._publish_task_updated(task.id)

@@ -185,7 +185,7 @@ class BotManagementService:
         )
         if replay:
             # Idempotent replay cannot recover plaintext; return masked values rather than secrets.
-            plain = [f"****-****-****" for _ in items]
+            plain = ["****-****-****" for _ in items]
         return batch.id if batch else str(uuid.uuid4()), list(zip(plain, items))
 
     def binding_codes(self) -> list[BindingCodeView]:

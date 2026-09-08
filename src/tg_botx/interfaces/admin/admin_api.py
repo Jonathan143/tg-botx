@@ -14,7 +14,7 @@ import uuid
 import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import yaml
@@ -50,7 +50,7 @@ from tg_botx.infrastructure.persistence.db import (
     utc_isoformat,
     utc_now,
 )
-from tg_botx.interfaces.admin.admin_accounts import AdminAccountError, LoginFlowManager
+from tg_botx.features.accounts.service import AdminAccountError, LoginFlowManager
 from tg_botx.interfaces.admin.admin_security import (
     FailureRateLimiter,
     SecurityError,
@@ -406,7 +406,7 @@ def _dashboard_trend(
     selected_range: Literal["24h", "7d", "30d"],
     now: datetime,
 ) -> tuple[datetime, list[dict[str, Any]]]:
-    now = now.astimezone(timezone.utc)
+    now = now.astimezone(UTC)
     if selected_range == "24h":
         bucket_count = 24
         bucket_width = timedelta(hours=1)
@@ -429,9 +429,9 @@ def _dashboard_trend(
         if status not in {"success", "failed"}:
             continue
         normalized = (
-            started_at.replace(tzinfo=timezone.utc)
+            started_at.replace(tzinfo=UTC)
             if started_at.tzinfo is None
-            else started_at.astimezone(timezone.utc)
+            else started_at.astimezone(UTC)
         )
         index = int((normalized - first_bucket).total_seconds() // width_seconds)
         if 0 <= index < bucket_count:
@@ -528,15 +528,15 @@ def _filter_logs(
 ) -> list[dict[str, Any]]:
     if started_from:
         started_from = (
-            started_from.replace(tzinfo=timezone.utc)
+            started_from.replace(tzinfo=UTC)
             if started_from.tzinfo is None
-            else started_from.astimezone(timezone.utc)
+            else started_from.astimezone(UTC)
         )
     if started_to:
         started_to = (
-            started_to.replace(tzinfo=timezone.utc)
+            started_to.replace(tzinfo=UTC)
             if started_to.tzinfo is None
-            else started_to.astimezone(timezone.utc)
+            else started_to.astimezone(UTC)
         )
     wanted = level.upper() if level else None
     needle = query.casefold() if query else None
@@ -551,7 +551,7 @@ def _filter_logs(
             try:
                 parsed = datetime.fromisoformat(timestamp.replace(" ", "T", 1))
                 if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
+                    parsed = parsed.replace(tzinfo=UTC)
                 if started_from and parsed < started_from:
                     continue
                 if started_to and parsed > started_to:

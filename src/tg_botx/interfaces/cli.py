@@ -1,23 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import typer
 
 from tg_botx.config import Settings
 from tg_botx.core.time import utc_isoformat
-from tg_botx.features.accounts.auth import AuthService
+from tg_botx.interfaces.account_console import AuthService
 from tg_botx.features.admin_bot import BotManagementService
-from tg_botx.features.checkin.runtime import CheckinService, TaskStateError
-from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
+from tg_botx.features.checkin.runtime import CheckinService, TaskNotFound, TaskStateError
+from tg_botx.features.checkin.schedule import schedule_from_task
 from tg_botx.infrastructure.observability.logging import IconFormatter, SensitiveDataFilter
-from tg_botx.infrastructure.persistence.db import Database, Task
+from tg_botx.infrastructure.persistence.db import Database
 from tg_botx.schemas import TaskDefinition
 
 app = typer.Typer(help="Telegram 用户账号签到调度器")
@@ -156,36 +153,15 @@ def revoke_bot_binding(binding_id: str) -> None:
 @task_app.command("create")
 def create_task(config: Path = typer.Option(..., "--config", exists=True, readable=True)):
     """从 YAML 创建签到任务。"""
-    _, database = resources()
+    settings, database = resources()
+    service = CheckinService(settings, database)
     try:
         definition = TaskDefinition.from_yaml(config)
-    except Exception as exc:
+        task = service.create_task(definition)
+    except (ValueError, TaskStateError) as exc:
         raise typer.BadParameter(f"配置无效：{exc}") from exc
-    account = database.get_account(definition.account)
-    if not account:
-        raise typer.BadParameter(f"账号不存在，请先登录：{definition.account}")
-    if database.get_task(definition.name):
-        raise typer.BadParameter(f"任务已存在：{definition.name}")
-    schedule = definition.schedule
-    if schedule.start_date is None:
-        schedule = schedule.model_copy(
-            update={"start_date": datetime.now(ZoneInfo(schedule.timezone)).date()}
-        )
-        definition = definition.model_copy(update={"schedule": schedule})
-    task = Task(
-        account_id=account.id,
-        name=definition.name,
-        target=definition.target,
-        timezone=schedule.timezone,
-        schedule_type=schedule.type,
-        fixed_time=schedule.time,
-        random_start=schedule.start,
-        random_end=schedule.end,
-        config_json=json.dumps(definition.model_dump(mode="json"), ensure_ascii=False),
-        enabled=False,
-        next_run_at=next_run_for(schedule, now=datetime.now(timezone.utc)),
-    )
-    database.save_task(task)
+    finally:
+        asyncio.run(service.close())
     logger.info("创建任务 task_id=%s name=%s enabled=%s", task.id, task.name, task.enabled)
     typer.echo(f"任务已创建：{task.name} ({task.id})，当前为停用状态")
 
@@ -231,24 +207,15 @@ def validate_task(task_id: str):
 @task_app.command("enable")
 def enable_task(task_id: str):
     """启用任务并安排下一次执行。"""
-    _, database = resources()
-    task = database.get_task(task_id)
-    if not task:
-        raise typer.BadParameter("任务不存在")
-    if database.get_latest_workflow_version(task.id) is None:
-        raise typer.BadParameter("请先发布工作流后再启用任务")
+    settings, database = resources()
+    service = CheckinService(settings, database)
     try:
-        next_run = next_run_for(schedule_from_task(task))
-    except ValueError as exc:
-        raise typer.BadParameter("调度规则没有可执行的未来时间") from exc
-    database.update_task(task.id, enabled=True, next_run_at=next_run)
-    logger.info(
-        "启用任务 task_id=%s name=%s next_run_at=%s",
-        task.id,
-        task.name,
-        utc_isoformat(next_run),
-    )
-    typer.echo(f"任务已启用，下次执行：{utc_isoformat(next_run)}")
+        task = service.enable_task(task_id)
+    except (TaskNotFound, TaskStateError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        asyncio.run(service.close())
+    typer.echo(f"任务已启用，下次执行：{utc_isoformat(task.next_run_at)}")
 
 
 @task_app.command("publish")
@@ -261,7 +228,7 @@ def publish_task(
     service = CheckinService(settings, database)
     try:
         version = service.publish_task(task_id, release_note)
-    except TaskStateError as exc:
+    except (TaskNotFound, TaskStateError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         asyncio.run(service.close())
@@ -271,12 +238,14 @@ def publish_task(
 @task_app.command("disable")
 def disable_task(task_id: str):
     """停用任务，不影响当前已经开始的执行。"""
-    _, database = resources()
-    task = database.get_task(task_id)
-    if not task:
-        raise typer.BadParameter("任务不存在")
-    database.update_task(task.id, enabled=False)
-    logger.info("停用任务 task_id=%s name=%s", task.id, task.name)
+    settings, database = resources()
+    service = CheckinService(settings, database)
+    try:
+        task = service.disable_task(task_id)
+    except (TaskNotFound, TaskStateError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        asyncio.run(service.close())
     typer.echo(f"任务已停用：{task.name}")
 
 
