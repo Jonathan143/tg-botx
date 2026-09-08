@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 
 class StepBase(BaseModel):
@@ -91,4 +91,11 @@ STEP_FIELDS = {
 
 def validate_step_shape(step: dict[str, Any]) -> None:
     """Validate canonical fields without changing omitted fields in stored YAML."""
-    STEP_ADAPTER.validate_python(step)
+    try:
+        STEP_ADAPTER.validate_python(step)
+    except ValidationError as exc:
+        fields = [
+            ".".join(str(part) for part in error["loc"])
+            for error in exc.errors(include_input=False)
+        ]
+        raise ValueError("步骤字段格式无效：" + "、".join(fields)) from None

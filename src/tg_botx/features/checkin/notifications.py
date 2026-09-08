@@ -12,7 +12,6 @@ from tg_botx.infrastructure.persistence.db import (
     Task,
     utc_now,
 )
-from tg_botx.integrations.client_pool import ClientPool as ClientPool
 
 logger = logging.getLogger(__name__)
 

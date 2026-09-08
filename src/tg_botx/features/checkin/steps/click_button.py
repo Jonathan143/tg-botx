@@ -7,9 +7,7 @@ from tg_botx.features.checkin.condition import (
     callback_data_values,
     render_template,
 )
-from tg_botx.features.checkin.execution_types import CheckinError as CheckinError
-from tg_botx.features.checkin.execution_types import ExecutionContext as ExecutionContext
-from tg_botx.features.checkin.execution_types import StepReport
+from tg_botx.features.checkin.execution_types import CheckinError, ExecutionContext, StepReport
 from tg_botx.features.checkin.matching import match_button
 
 if TYPE_CHECKING:

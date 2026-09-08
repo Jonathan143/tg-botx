@@ -7,9 +7,7 @@ from tg_botx.features.checkin.condition import (
     ConditionInput,
     select_branch,
 )
-from tg_botx.features.checkin.execution_types import CheckinError as CheckinError
-from tg_botx.features.checkin.execution_types import ExecutionContext as ExecutionContext
-from tg_botx.features.checkin.execution_types import StepReport
+from tg_botx.features.checkin.execution_types import ExecutionContext, StepReport
 
 if TYPE_CHECKING:
     from tg_botx.features.checkin.executor import CheckinExecutor

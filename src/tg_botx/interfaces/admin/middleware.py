@@ -11,6 +11,7 @@ from sqlalchemy.exc import OperationalError
 
 from tg_botx.config import Settings
 from tg_botx.features.accounts.service import AdminAccountError
+from tg_botx.features.checkin.errors import ManualRunConflict, TaskNotFound, TaskStateError
 from tg_botx.interfaces.admin.admin_security import (
     SecurityError,
     SessionManager,
@@ -40,6 +41,18 @@ def install_middleware(
     @app.exception_handler(APIError)
     async def handle_api_error(request: Request, exc: APIError) -> JSONResponse:
         return error_response(request, exc)
+
+    @app.exception_handler(TaskNotFound)
+    async def handle_task_missing(request: Request, exc: TaskNotFound) -> JSONResponse:
+        return error_response(request, APIError("NOT_FOUND", "任务不存在", 404))
+
+    @app.exception_handler(TaskStateError)
+    async def handle_task_state(request: Request, exc: TaskStateError) -> JSONResponse:
+        return error_response(request, APIError("CONFLICT", str(exc), 409))
+
+    @app.exception_handler(ManualRunConflict)
+    async def handle_run_conflict(request: Request, exc: ManualRunConflict) -> JSONResponse:
+        return error_response(request, APIError("TASK_BUSY", "同一账号和目标已有任务在执行", 409))
 
     @app.exception_handler(SecurityError)
     async def handle_security_error(request: Request, exc: SecurityError) -> JSONResponse:

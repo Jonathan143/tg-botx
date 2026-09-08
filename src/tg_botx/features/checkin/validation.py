@@ -297,6 +297,7 @@ def _validate_v2_condition(
     node_ids: set[str],
 ) -> tuple[dict[str, str], dict[str, str], bool]:
     _unsupported(step, _STEP_FIELDS["condition"], path)
+    validate_step_shape(step)
     if step.get("schema_version") != 2:
         raise ValueError(f"{path}.schema_version 必须是 2")
     if not isinstance(step.get("strict", False), bool):

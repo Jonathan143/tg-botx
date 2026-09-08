@@ -10,6 +10,8 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from tg_botx.application.container import AdminContext
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,7 +42,10 @@ def _restore_signal_handlers(previous_handlers: dict[signal.Signals, Any]) -> No
         signal.signal(received, previous)
 
 
-def build_lifespan(service, keys, accounts, admin_bot, shutdown_event, log_stream):
+def build_lifespan(context: AdminContext):
+    service, keys, admin_bot = context.application.checkin, context.keys, context.bot
+    shutdown_event = context.shutdown
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         rotation_task: asyncio.Task[None] | None = None
@@ -61,12 +66,11 @@ def build_lifespan(service, keys, accounts, admin_bot, shutdown_event, log_strea
                     rotation_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await rotation_task
-                await log_stream.close()
-                await admin_bot.close()
-                await accounts.close()
-                if started:
-                    await service.notifications.service_stopped("管理 API 服务停止")
-                await service.close()
+                try:
+                    if started:
+                        await service.notifications.service_stopped("管理 API 服务停止")
+                finally:
+                    await context.close()
             finally:
                 _restore_signal_handlers(previous_signal_handlers)
 

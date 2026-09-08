@@ -4,7 +4,7 @@
 
 项目使用 Python 3.12+、`src/` 布局和显式分层设计。当前默认启用签到调度；机器人管理、频道通知和群监控以独立 feature/adapter 形式预留，便于逐步上线而不影响现有任务。
 
-架构说明见 [`docs/architecture.md`](docs/architecture.md)。
+架构说明见 [`docs/architecture.md`](docs/architecture.md)。重构边界和验证范围见 [`docs/refactoring.md`](docs/refactoring.md)。
 业务代码统一从 `tg_botx.infrastructure`、`tg_botx.features` 和 `tg_botx.interfaces` 子包导入。
 
 ## 快速开始

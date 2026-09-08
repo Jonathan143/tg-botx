@@ -231,12 +231,12 @@ class LoginFlowManager:
         await self._disconnect(flow)
 
     async def close(self) -> None:
-        await self.avatars.close()
         async with self._lock:
             flow_ids = tuple(self._flows_by_id)
         for flow_id in flow_ids:
             with contextlib.suppress(AdminAccountError):
                 await self.cancel(flow_id)
+        await self.avatars.close()
 
     def list_accounts(self) -> list[AccountView]:
         return self.directory.list_accounts()

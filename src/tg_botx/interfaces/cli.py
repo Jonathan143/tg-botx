@@ -7,10 +7,12 @@ from pathlib import Path
 
 import typer
 
+from tg_botx.application.container import build_context, build_database
 from tg_botx.config import Settings
 from tg_botx.core.time import utc_isoformat
+from tg_botx.features.accounts.models import AdminAccountError
 from tg_botx.features.bot.management import BotManagementService
-from tg_botx.features.checkin.runtime import CheckinService, TaskNotFound, TaskStateError
+from tg_botx.features.checkin.runtime import TaskNotFound, TaskStateError
 from tg_botx.features.checkin.schedule import schedule_from_task
 from tg_botx.infrastructure.observability.logging import IconFormatter, SensitiveDataFilter
 from tg_botx.infrastructure.persistence.db import Database
@@ -65,21 +67,20 @@ def resources(*, create_schema: bool = True) -> tuple[Settings, Database]:
     settings = Settings()
     settings.ensure_directories()
     configure_logging(settings)
-    database = Database(settings.database_url)
-    if create_schema:
-        database.create_all()
+    database = build_database(settings, initialize_schema=create_schema)
     return settings, database
 
 
 def create_server_app():
     """Create a fresh admin application for the Uvicorn worker process."""
-    settings, database = resources()
+    settings = Settings()
     settings.require_admin_config()
-
+    settings.ensure_directories()
+    configure_logging(settings)
+    context = build_context(settings)
     from tg_botx.interfaces.admin.admin_api import create_admin_app
 
-    service = CheckinService(settings, database)
-    return create_admin_app(settings, database, service)
+    return create_admin_app(settings, context.database, context.checkin, context=context)
 
 
 @app.command()
@@ -91,7 +92,10 @@ def login(
     if method not in {"qr", "phone"}:
         raise typer.BadParameter("必须是 qr 或 phone")
     settings, database = resources()
-    asyncio.run(AuthService(settings, database).login(account, method))
+    try:
+        asyncio.run(AuthService(settings, database).login(account, method))
+    except AdminAccountError as exc:
+        raise typer.BadParameter(exc.message) from exc
     typer.echo(f"账号 {account} 登录成功")
 
 
@@ -99,7 +103,10 @@ def login(
 def logout(account: str = typer.Option("default", "--account")):
     """退出 Telegram 登录并停用账号。"""
     settings, database = resources()
-    asyncio.run(AuthService(settings, database).logout(account))
+    try:
+        asyncio.run(AuthService(settings, database).logout(account))
+    except AdminAccountError as exc:
+        raise typer.BadParameter(exc.message) from exc
     typer.echo(f"账号 {account} 已退出登录")
 
 
@@ -154,7 +161,7 @@ def revoke_bot_binding(binding_id: str) -> None:
 def create_task(config: Path = typer.Option(..., "--config", exists=True, readable=True)):
     """从 YAML 创建签到任务。"""
     settings, database = resources()
-    service = CheckinService(settings, database)
+    service = build_context(settings, database, initialize_schema=False).checkin
     try:
         definition = TaskDefinition.from_yaml(config)
         task = service.create_task(definition)
@@ -208,7 +215,7 @@ def validate_task(task_id: str):
 def enable_task(task_id: str):
     """启用任务并安排下一次执行。"""
     settings, database = resources()
-    service = CheckinService(settings, database)
+    service = build_context(settings, database, initialize_schema=False).checkin
     try:
         task = service.enable_task(task_id)
     except (TaskNotFound, TaskStateError) as exc:
@@ -225,7 +232,7 @@ def publish_task(
 ):
     """发布当前任务的 main 工作流。"""
     settings, database = resources()
-    service = CheckinService(settings, database)
+    service = build_context(settings, database, initialize_schema=False).checkin
     try:
         version = service.publish_task(task_id, release_note)
     except (TaskNotFound, TaskStateError) as exc:
@@ -239,7 +246,7 @@ def publish_task(
 def disable_task(task_id: str):
     """停用任务，不影响当前已经开始的执行。"""
     settings, database = resources()
-    service = CheckinService(settings, database)
+    service = build_context(settings, database, initialize_schema=False).checkin
     try:
         task = service.disable_task(task_id)
     except (TaskNotFound, TaskStateError) as exc:
@@ -254,7 +261,7 @@ def run_task(task_id: str):
     """立即执行一次任务。"""
     settings, database = resources()
     logger.info("手动执行任务 task_id=%s", task_id)
-    service = CheckinService(settings, database)
+    service = build_context(settings, database, initialize_schema=False).checkin
 
     async def execute() -> bool:
         await service.start()
@@ -274,7 +281,7 @@ def run_task(task_id: str):
 def cancel_task(task_id: str):
     """取消正在执行的任务。"""
     settings, database = resources()
-    service = CheckinService(settings, database)
+    service = build_context(settings, database, initialize_schema=False).checkin
 
     async def cancel() -> bool:
         try:

@@ -1,36 +1,28 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
 
 from apscheduler.triggers.date import DateTrigger
 
-from tg_botx.features.checkin.errors import AccountNotFoundError as AccountNotFoundError
-from tg_botx.features.checkin.errors import ManualRunConflict as ManualRunConflict
-from tg_botx.features.checkin.errors import TaskNameConflictError as TaskNameConflictError
-from tg_botx.features.checkin.errors import TaskNotFound as TaskNotFound
-from tg_botx.features.checkin.errors import TaskStateError as TaskStateError
-from tg_botx.features.checkin.errors import WorkflowVersionNotFound as WorkflowVersionNotFound
-from tg_botx.features.checkin.notifications import NotificationService as NotificationService
 from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
 from tg_botx.infrastructure.persistence.db import (
     Task,
     utc_isoformat,
 )
-from tg_botx.integrations.client_pool import ClientPool as ClientPool
 
 logger = logging.getLogger(__name__)
 
 
 class TaskScheduler:
-    def __init__(self, database, scheduler, scheduled_run, publish):
+    def __init__(self, database, scheduler, scheduled_run, publish, clock):
+        self.clock = clock
         self.database = database
         self.scheduler = scheduler
         self._scheduled_run = scheduled_run
         self._publish_task_updated = publish
 
     def _ensure_next_run(self, task: Task) -> None:
-        now = datetime.now(UTC)
+        now = self.clock.now()
         if task.next_run_at is None or task.next_run_at <= now:
             try:
                 next_run = next_run_for(schedule_from_task(task), now=now)

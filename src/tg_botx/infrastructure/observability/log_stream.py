@@ -107,11 +107,13 @@ class LogStream:
         self.subscribers: set[asyncio.Queue[dict[str, Any] | None]] = set()
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
+        self._stopping = asyncio.Event()
 
     async def subscribe(self) -> asyncio.Queue[dict[str, Any] | None]:
         async with self._lock:
             if self._task is None:
                 await asyncio.to_thread(self.reader.prime)
+                self._stopping.clear()
                 self._task = asyncio.create_task(self._poll(), name="shared-log-stream")
             queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=200)
             self.subscribers.add(queue)
@@ -124,7 +126,7 @@ class LogStream:
                 await self._stop()
 
     async def _poll(self) -> None:
-        while True:
+        while not self._stopping.is_set():
             for entry in await asyncio.to_thread(self.reader.read):
                 for queue in tuple(self.subscribers):
                     if queue.full():
@@ -132,14 +134,14 @@ class LogStream:
                             queue.get_nowait()
                         queue.put_nowait(None)
                     queue.put_nowait(entry)
-            await asyncio.sleep(1)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._stopping.wait(), timeout=1)
 
     async def _stop(self) -> None:
         if self._task is not None:
             task, self._task = self._task, None
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            self._stopping.set()
+            await task
 
     async def close(self) -> None:
         async with self._lock:

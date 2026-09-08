@@ -37,3 +37,8 @@ def format_local_time(value: datetime | None, timezone_name: str, *, seconds: bo
         value = value.replace(tzinfo=UTC)
     pattern = "%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M"
     return value.astimezone(zone).strftime(pattern) + f" ({timezone_name})"
+
+
+class SystemClock:
+    def now(self) -> datetime:
+        return utc_now()

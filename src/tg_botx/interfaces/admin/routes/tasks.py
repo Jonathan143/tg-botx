@@ -9,9 +9,6 @@ from fastapi import APIRouter, Query
 from tg_botx.application.queries import TaskQueries
 from tg_botx.features.checkin.runtime import (
     CheckinService,
-    ManualRunConflict,
-    TaskNotFound,
-    TaskStateError,
 )
 from tg_botx.features.checkin.schedule import next_runs
 from tg_botx.infrastructure.persistence.db import (
@@ -54,10 +51,7 @@ def build_router(database: Database, service: CheckinService) -> APIRouter:
     async def create_task(body: TaskBody) -> dict[str, Any]:
         if database.get_account(body.definition.account) is None:
             raise APIError("VALIDATION_FAILED", "Telegram 账号不存在", 422)
-        try:
-            task = service.create_task(body.definition)
-        except TaskStateError as exc:
-            raise APIError("CONFLICT", str(exc), 409) from exc
+        task = service.create_task(body.definition)
         return _task_json(task, database, service)
 
     @router.post("/api/tasks/validate")
@@ -127,34 +121,19 @@ def build_router(database: Database, service: CheckinService) -> APIRouter:
     async def edit_task(task_id: str, body: TaskBody) -> dict[str, Any]:
         if database.get_account(body.definition.account) is None:
             raise APIError("VALIDATION_FAILED", "Telegram 账号不存在", 422)
-        try:
-            task = service.edit_task(task_id, body.definition)
-        except TaskNotFound as exc:
-            raise APIError("NOT_FOUND", "任务不存在", 404) from exc
-        except TaskStateError as exc:
-            raise APIError("CONFLICT", str(exc), 409) from exc
+        task = service.edit_task(task_id, body.definition)
         return _task_json(task, database, service)
 
     @router.post("/api/tasks/{task_id}/publish")
     async def publish_task(task_id: str, body: PublishBody) -> dict[str, Any]:
-        try:
-            service.publish_task(task_id, body.release_note)
-        except TaskNotFound as exc:
-            raise APIError("NOT_FOUND", "任务不存在", 404) from exc
-        except TaskStateError as exc:
-            raise APIError("CONFLICT", str(exc), 409) from exc
+        service.publish_task(task_id, body.release_note)
         task = database.get_task_any(task_id)
         if task is None:
             raise APIError("NOT_FOUND", "任务不存在", 404)
         return _task_json(task, database, service)
 
     async def task_action(task_id: str, action: str) -> dict[str, Any]:
-        try:
-            task = getattr(service, f"{action}_task")(task_id)
-        except TaskNotFound as exc:
-            raise APIError("NOT_FOUND", "任务不存在", 404) from exc
-        except TaskStateError as exc:
-            raise APIError("CONFLICT", str(exc), 409) from exc
+        task = getattr(service, f"{action}_task")(task_id)
         return _task_json(task, database, service)
 
     @router.post("/api/tasks/{task_id}/enable")
@@ -179,14 +158,7 @@ def build_router(database: Database, service: CheckinService) -> APIRouter:
 
     @router.post("/api/tasks/{task_id}/run", status_code=202)
     async def run_task(task_id: str, _: EmptyBody) -> dict[str, Any]:
-        try:
-            run_id = service.start_manual_run(task_id)
-        except TaskNotFound as exc:
-            raise APIError("NOT_FOUND", "任务不存在", 404) from exc
-        except ManualRunConflict as exc:
-            raise APIError("TASK_BUSY", "同一账号和目标已有任务在执行", 409) from exc
-        except TaskStateError as exc:
-            raise APIError("CONFLICT", str(exc), 409) from exc
+        run_id = service.start_manual_run(task_id)
         task = database.get_task_any(task_id)
         if task is None:
             raise APIError("NOT_FOUND", "任务不存在", 404)
@@ -198,14 +170,7 @@ def build_router(database: Database, service: CheckinService) -> APIRouter:
     async def test_task(task_id: str, body: TaskBody) -> dict[str, Any]:
         if database.get_account(body.definition.account) is None:
             raise APIError("VALIDATION_FAILED", "Telegram 账号不存在", 422)
-        try:
-            run_id = service.start_test_run(task_id, body.definition)
-        except TaskNotFound as exc:
-            raise APIError("NOT_FOUND", "任务不存在", 404) from exc
-        except ManualRunConflict as exc:
-            raise APIError("TASK_BUSY", "同一账号和目标已有任务在执行", 409) from exc
-        except TaskStateError as exc:
-            raise APIError("CONFLICT", str(exc), 409) from exc
+        run_id = service.start_test_run(task_id, body.definition)
         task = database.get_task_any(task_id)
         if task is None:
             raise APIError("NOT_FOUND", "任务不存在", 404)

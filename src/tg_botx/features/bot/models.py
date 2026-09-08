@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, get_args
 
 from tg_botx.infrastructure.persistence.db import (
     utc_now,
@@ -14,6 +14,10 @@ from tg_botx.infrastructure.persistence.db import (
 """Interactive Telegram management bot and its binding service."""
 
 logger = logging.getLogger(__name__)
+
+CommandRole = Literal["anonymous", "user", "admin"]
+ExecutorType = Literal["none", "http", "builtin_function", "python", "javascript"]
+
 
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -37,7 +41,7 @@ DEFAULT_BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("checkin", "每日签到领取积分"),
 )
 
-_ALL_COMMAND_ROLES = ("anonymous", "user", "admin")
+_ALL_COMMAND_ROLES = get_args(CommandRole)
 
 _DEFAULT_COMMAND_ROLES: dict[str, tuple[str, ...]] = {
     "start": _ALL_COMMAND_ROLES,
@@ -53,7 +57,7 @@ _COMMAND_NAME_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 
 _COMMAND_TYPES = {"system", "custom"}
 
-_EXECUTOR_TYPES = {"none", "http", "builtin_function", "python", "javascript"}
+_EXECUTOR_TYPES = set(get_args(ExecutorType))
 
 _MAX_EXECUTOR_CONFIG_BYTES = 32 * 1024
 
@@ -128,7 +132,3 @@ class BotRuntimeStatus:
         if self.running and self.last_error is None:
             return "healthy"
         return "degraded"
-
-
-CommandRole = Literal["anonymous", "user", "admin"]
-ExecutorType = Literal["none", "http", "builtin_function", "python", "javascript"]

@@ -19,12 +19,9 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from tg_botx.core.time import utc_isoformat as utc_isoformat
+from tg_botx.core.time import utc_now as utc_now
 
 PERMANENT_EXPIRY = datetime.max.replace(tzinfo=UTC)
-
-
-def utc_now() -> datetime:
-    return datetime.now(UTC)
 
 
 class UTCDateTime(TypeDecorator[datetime]):
