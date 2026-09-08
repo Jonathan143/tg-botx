@@ -6,543 +6,111 @@ import json
 import logging
 import signal
 from contextlib import suppress
-from datetime import UTC, datetime, tzinfo
+from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.date import DateTrigger
-from telethon import TelegramClient
 
 from tg_botx.config import Settings
+from tg_botx.features.checkin.errors import AccountNotFoundError as AccountNotFoundError
+from tg_botx.features.checkin.errors import ManualRunConflict as ManualRunConflict
+from tg_botx.features.checkin.errors import TaskNameConflictError as TaskNameConflictError
+from tg_botx.features.checkin.errors import TaskNotFound as TaskNotFound
+from tg_botx.features.checkin.errors import TaskStateError as TaskStateError
+from tg_botx.features.checkin.errors import WorkflowVersionNotFound as WorkflowVersionNotFound
 from tg_botx.features.checkin.executor import CheckinExecutor, run_with_retries
+from tg_botx.features.checkin.notifications import NotificationService as NotificationService
+from tg_botx.features.checkin.progress import ProgressTracker
 from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
+from tg_botx.features.checkin.scheduler import TaskScheduler
+from tg_botx.features.checkin.tasks import TaskService
+from tg_botx.features.checkin.workflows import WorkflowService
 from tg_botx.infrastructure.persistence.db import (
     Account,
     Database,
     Task,
     TaskRun,
     WorkflowVersion,
-    utc_isoformat,
     utc_now,
 )
-from tg_botx.integrations.telegram import TelegramAccountConfig, create_telethon_client
+from tg_botx.integrations.client_pool import ClientPool as ClientPool
 from tg_botx.schemas import TaskDefinition
 
 logger = logging.getLogger(__name__)
 
 
-class TaskNotFound(LookupError):
-    pass
-
-
-class TaskStateError(RuntimeError):
-    pass
-
-
-class TaskNameConflictError(TaskStateError):
-    pass
-
-
-class AccountNotFoundError(TaskStateError):
-    pass
-
-
-class ManualRunConflict(RuntimeError):
-    pass
-
-
-class WorkflowVersionNotFound(TaskStateError):
-    pass
-
-
-class ClientPool:
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.clients: dict[str, TelegramClient] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-        # A client is shared by concurrent runs for one account.  Keep it
-        # connected only while at least one caller holds a lease.
-        self._leases: dict[str, int] = {}
-        self._pending_acquires: dict[str, int] = {}
-
-    def _lock_for(self, account_id: str) -> asyncio.Lock:
-        lock = self._locks.get(account_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[account_id] = lock
-        return lock
-
-    async def get(self, account: Account) -> TelegramClient:
-        # Telethon SQLite sessions cannot be shared. Serialize construction so
-        # parallel tasks for the same account reuse one connected client.
-        async with self._lock_for(account.id):
-            return await self._get_unlocked(account)
-
-    async def _get_unlocked(self, account: Account) -> TelegramClient:
-        client = self.clients.get(account.id)
-        if client is not None:
-            return client
-        api_id, api_hash = self.settings.require_api_credentials()
-        client = create_telethon_client(
-            TelegramAccountConfig(
-                api_id=api_id,
-                api_hash=api_hash,
-                session_path=self.settings.sessions_dir / account.session_name,
-            )
-        )
-        try:
-            await client.connect()
-            if not await client.is_user_authorized():
-                raise RuntimeError(f"账号 {account.name} 尚未登录，请先执行 tg-bot login")
-        except Exception:
-            with suppress(Exception):
-                await client.disconnect()
-            raise
-        self.clients[account.id] = client
-        return client
-
-    async def acquire(self, account: Account) -> TelegramClient:
-        """Get a connected client and hold an account-level lease."""
-
-        # Mark the acquisition before awaiting ``get`` so a concurrent final
-        # release cannot disconnect the client in the middle of this handoff.
-        async with self._lock_for(account.id):
-            self._pending_acquires[account.id] = self._pending_acquires.get(account.id, 0) + 1
-        try:
-            # Keep the public ``get`` seam usable for adapters/tests that
-            # provide their own client factory.
-            client = await self.get(account)
-        finally:
-            async with self._lock_for(account.id):
-                pending = self._pending_acquires.get(account.id, 0)
-                if pending <= 1:
-                    self._pending_acquires.pop(account.id, None)
-                else:
-                    self._pending_acquires[account.id] = pending - 1
-        async with self._lock_for(account.id):
-            pooled = self.clients.get(account.id)
-            if pooled is None:
-                pooled = client
-                self.clients[account.id] = pooled
-            client = pooled
-            self._leases[account.id] = self._leases.get(account.id, 0) + 1
-            return client
-
-    async def release(self, account: Account) -> None:
-        """Release one lease and disconnect when the account becomes idle."""
-
-        async with self._lock_for(account.id):
-            leases = self._leases.get(account.id, 0)
-            if leases <= 0:
-                return
-            if leases > 0:
-                leases -= 1
-                if leases:
-                    self._leases[account.id] = leases
-                else:
-                    self._leases.pop(account.id, None)
-            if leases == 0 and self._pending_acquires.get(account.id, 0) == 0:
-                client = self.clients.pop(account.id, None)
-                if client is not None:
-                    with suppress(Exception):
-                        await client.disconnect()
-
-    def has_active_leases(self, account: Account) -> bool:
-        return self._leases.get(account.id, 0) > 0
-
-    async def disconnect_account(self, account: Account) -> bool:
-        async with self._lock_for(account.id):
-            if self._leases.get(account.id, 0) > 0 or self._pending_acquires.get(account.id, 0) > 0:
-                return False
-            self._leases.pop(account.id, None)
-            client = self.clients.pop(account.id, None)
-            if client is None:
-                return True
-            with suppress(Exception):
-                await client.disconnect()
-            return True
-
-    async def close(self) -> None:
-        for account_id in list(self.clients):
-            async with self._lock_for(account_id):
-                client = self.clients.pop(account_id, None)
-                self._leases.pop(account_id, None)
-                self._pending_acquires.pop(account_id, None)
-                if client is None:
-                    continue
-                with suppress(Exception):
-                    await client.disconnect()
-
-
-class NotificationService:
-    """Send best-effort administrator notifications through Telegram Bot API."""
-
-    _MAX_ATTEMPTS = 3
-    _RETRY_DELAYS = (1, 2)
-    _DIVIDER = "──────────────"
-    _STATUS_ICONS = {
-        "INFO": "ℹ️",
-        "ERROR": "❌",
-        "WARNING": "⚠️",
-    }
-
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        secret = settings.notification_bot_token
-        self._token = secret.get_secret_value().strip() if secret else ""
-        self._chat_id = settings.notification_chat_id
-        self._notification_timezone = settings.notification_timezone
-        self._client: httpx.AsyncClient | None = None
-        self._send_lock = asyncio.Lock()
-        # httpx's INFO access log includes the full request URL.  Telegram Bot
-        # API embeds the Token in that path, so it must never reach app logs.
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        if not self._token:
-            logger.warning("未配置 TG_BOT_NOTIFICATION_BOT_TOKEN，Telegram 机器人通知已禁用")
-        elif self._chat_id is None:
-            logger.warning("未配置 TG_BOT_ADMIN_CHAT_IDS，Telegram 机器人通知已禁用")
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self._token and self._chat_id is not None)
-
-    @staticmethod
-    def _is_enabled(task: Task, status: str) -> bool:
-        notifications = task.config.get("notifications") or {}
-        return bool(notifications.get(status, status == "failure"))
-
-    @staticmethod
-    def _include_response(task: Task) -> bool:
-        return bool(task.config.get("notify_bot_response", False))
-
-    @staticmethod
-    def _message_chunks(text: str, limit: int = 4000) -> list[str]:
-        return [text[index : index + limit] for index in range(0, len(text), limit)]
-
-    @staticmethod
-    def _format_time(value: datetime | None, timezone_name: str) -> str:
-        if value is None:
-            return "未安排"
-        zone: tzinfo
-        try:
-            zone = ZoneInfo(timezone_name)
-        except ZoneInfoNotFoundError:
-            zone = UTC
-        # Keep the wall-clock time and named timezone for readability.  The
-        # numeric UTC offset is intentionally omitted because it is redundant
-        # with the timezone name and makes notifications harder to scan.
-        local = value.astimezone(zone)
-        return local.strftime("%Y-%m-%d %H:%M:%S") + f" ({timezone_name})"
-
-    @staticmethod
-    def _task_time(task: Task, value: datetime | None) -> str:
-        return NotificationService._format_time(value, task.timezone)
-
-    def _notification_time(self, value: datetime | None) -> str:
-        return self._format_time(value, self._notification_timezone)
-
-    async def _http_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0, connect=5.0),
-                headers={"User-Agent": "tg-checkin-bot/0.1"},
-            )
-        return self._client
-
-    async def _send_chunk(self, text: str) -> bool:
-        client = await self._http_client()
-        url = f"https://api.telegram.org/bot{self._token}/sendMessage"
-        payload = {"chat_id": self._chat_id, "text": text, "disable_web_page_preview": True}
-        for attempt in range(1, self._MAX_ATTEMPTS + 1):
-            retryable = False
-            retry_after: float | None = None
-            try:
-                response = await client.post(url, json=payload)
-                try:
-                    body = response.json()
-                except ValueError:
-                    body = {}
-                if not isinstance(body, dict):
-                    body = {}
-                if response.status_code == 200 and body.get("ok") is True:
-                    return True
-                retryable = response.status_code == 429 or response.status_code >= 500
-                if response.status_code == 429:
-                    parameters = body.get("parameters") or {}
-                    value = parameters.get("retry_after")
-                    if isinstance(value, (int, float)):
-                        retry_after = min(float(value), 30.0)
-                logger.error(
-                    "Telegram 机器人通知投递失败 status=%s attempt=%s",
-                    response.status_code,
-                    attempt,
-                )
-            except httpx.RequestError:
-                retryable = True
-                logger.error("Telegram 机器人通知网络异常 attempt=%s", attempt)
-
-            if not retryable or attempt >= self._MAX_ATTEMPTS:
-                return False
-            delay = retry_after if retry_after is not None else self._RETRY_DELAYS[attempt - 1]
-            await asyncio.sleep(delay)
-        return False
-
-    async def _send_text(self, text: str) -> None:
-        if not self.enabled:
-            return
-        try:
-            async with self._send_lock:
-                for chunk in self._message_chunks(text):
-                    if not await self._send_chunk(chunk):
-                        return
-        except Exception as exc:
-            # httpx exceptions can retain the request URL, whose path contains
-            # the Bot Token.  Log only the exception type and never the URL.
-            logger.error("Telegram 机器人通知发生未预期异常 type=%s", type(exc).__name__)
-
-    async def _task_event(
-        self,
-        task: Task,
-        level: str,
-        title: str,
-        next_run: datetime | None,
-        *,
-        error: str | None = None,
-        bot_response: str | None = None,
-        include_next_run: bool = True,
-        icon: str | None = None,
-    ) -> None:
-        icon = icon or self._STATUS_ICONS.get(level, "📣")
-        lines = [
-            f"{icon} {title}",
-            self._DIVIDER,
-            f"📋 任务：{task.name}",
-            f"🎯 目标：{task.target}",
-            f"🕒 时间：{self._task_time(task, utc_now())}",
-        ]
-        if error:
-            lines.append(f"📝 原因：{error}")
-        if include_next_run:
-            lines.append(f"⏭️ 下次计划：{self._task_time(task, next_run)}")
-        if bot_response is not None and self._include_response(task):
-            lines.extend((self._DIVIDER, "🤖 机器人回复：", bot_response))
-        await self._send_text("\n".join(lines))
-
-    async def success(
-        self, task: Task, next_run: datetime | None, bot_response: str | None
-    ) -> None:
-        if self._is_enabled(task, "success"):
-            await self._task_event(
-                task, "INFO", "任务执行成功", next_run, bot_response=bot_response, icon="✅"
-            )
-
-    async def failure(
-        self,
-        task: Task,
-        error: str,
-        next_run: datetime | None,
-        bot_response: str | None = None,
-    ) -> None:
-        if self._is_enabled(task, "failure"):
-            await self._task_event(
-                task,
-                "ERROR",
-                "任务执行失败",
-                next_run,
-                error=error,
-                bot_response=bot_response,
-                icon="❌",
-            )
-
-    async def skipped(self, task: Task, next_run: datetime | None) -> None:
-        await self._task_event(task, "WARNING", "任务因目标聊天忙碌而跳过", next_run, icon="⏭️")
-
-    async def cancel_requested(self, task: Task) -> None:
-        await self._task_event(
-            task,
-            "INFO",
-            "任务取消请求已提交",
-            None,
-            include_next_run=False,
-            icon="🛑",
-        )
-
-    async def canceled(self, task: Task, next_run: datetime | None, reason: str) -> None:
-        await self._task_event(task, "INFO", "任务已取消", next_run, error=reason, icon="🛑")
-
-    async def service_started(self) -> None:
-        if not self.settings.service_lifecycle_notifications_enabled:
-            return
-        await self._send_text(
-            "\n".join(
-                (
-                    "🚀 签到服务已启动",
-                    self._DIVIDER,
-                    f"🕒 时间：{self._notification_time(utc_now())}",
-                )
-            )
-        )
-
-    async def service_stopped(self, reason: str) -> None:
-        if not self.settings.service_lifecycle_notifications_enabled:
-            return
-        await self._send_text(
-            "\n".join(
-                (
-                    "🛑 签到服务已停止",
-                    self._DIVIDER,
-                    f"🕒 时间：{self._notification_time(utc_now())}",
-                    f"📝 原因：{reason}",
-                )
-            )
-        )
-
-    async def service_failed(self, error_type: str) -> None:
-        await self._send_text(
-            "\n".join(
-                (
-                    "💥 签到服务发生致命异常",
-                    self._DIVIDER,
-                    f"🕒 时间：{self._notification_time(utc_now())}",
-                    f"📝 异常类型：{error_type}",
-                )
-            )
-        )
-
-    async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
-
-
 class CheckinService:
-    def __init__(self, settings: Settings, database: Database):
+    def __init__(
+        self,
+        settings: Settings,
+        database: Database,
+        *,
+        pool: ClientPool | None = None,
+        notifications: NotificationService | None = None,
+        scheduler: AsyncIOScheduler | None = None,
+    ):
         self.settings = settings
         self.database = database
-        self.pool = ClientPool(settings)
-        self.notifications = NotificationService(settings)
-        self.scheduler = AsyncIOScheduler(timezone="UTC")
+        self.pool = pool if pool is not None else ClientPool(settings)
+        self.notifications = (
+            notifications if notifications is not None else NotificationService(settings)
+        )
+        self.scheduler = scheduler if scheduler is not None else AsyncIOScheduler(timezone="UTC")
         self.locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.running: dict[str, asyncio.Task[bool]] = {}
         self._manual_reservations: set[tuple[str, str]] = set()
         # In-memory generation counters distinguish administrator scheduling
         # mutations from execution-status writes without a schema migration.
         self._task_revisions: dict[str, int] = {}
-        self._task_event_sequence = 0
-        self._task_subscribers: dict[str, set[asyncio.Queue[int]]] = {}
-        self._task_run_progress: dict[str, dict[str, Any]] = {}
+        self.progress = ProgressTracker(database)
+        self.scheduling = TaskScheduler(
+            database, self.scheduler, self._scheduled_run, self._publish_task_updated
+        )
+        self.tasks = TaskService(
+            database,
+            self._task_revisions,
+            self.running,
+            self._sync_schedule,
+            self._publish_task_updated,
+        )
+        self.workflows = WorkflowService(
+            database, self._bump_task_revision, self._sync_schedule, self._publish_task_updated
+        )
 
     def next_task_event_id(self) -> int:
-        """Reserve a process-local, monotonically increasing task event ID."""
-
-        self._task_event_sequence += 1
-        return self._task_event_sequence
+        return self.progress.next_task_event_id()
 
     def subscribe_task(self, task_id: str) -> asyncio.Queue[int]:
-        """Subscribe to coalesced change notifications for one task."""
-
-        queue: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
-        self._task_subscribers.setdefault(task_id, set()).add(queue)
-        return queue
+        return self.progress.subscribe_task(task_id)
 
     def unsubscribe_task(self, task_id: str, queue: asyncio.Queue[int]) -> None:
-        subscribers = self._task_subscribers.get(task_id)
-        if subscribers is None:
-            return
-        subscribers.discard(queue)
-        if not subscribers:
-            self._task_subscribers.pop(task_id, None)
+        return self.progress.unsubscribe_task(task_id, queue)
 
     def _publish_task_updated(self, task_id: str) -> None:
-        event_id = self.next_task_event_id()
-        for queue in tuple(self._task_subscribers.get(task_id, ())):
-            if queue.full():
-                with suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
-            queue.put_nowait(event_id)
+        return self.progress._publish_task_updated(task_id)
 
     def get_task_run_progress(self, task_id: str) -> dict[str, Any] | None:
-        progress = self._task_run_progress.get(task_id)
-        return copy.deepcopy(progress) if progress is not None else None
+        return self.progress.get_task_run_progress(task_id)
 
     @staticmethod
     def _progress_step_statuses(progress: dict[str, object]) -> list[dict[str, object]]:
-        statuses = progress.get("stepStatuses")
-        if not isinstance(statuses, list):
-            return []
-        return [status for status in statuses if isinstance(status, dict)]
+        return ProgressTracker._progress_step_statuses(progress)
 
     @classmethod
     def _workflow_step_statuses(
-        cls,
-        steps: list[dict[str, object]],
-        path_prefix: str = "steps",
-        *,
-        top_level: bool = True,
+        cls, steps: list[dict[str, object]], path_prefix: str = "steps", *, top_level: bool = True
     ) -> list[dict[str, object]]:
-        statuses: list[dict[str, object]] = []
-        for index, step in enumerate(steps):
-            path = f"{path_prefix}[{index}]"
-            node_id = step.get("node_id") or step.get("nodeId")
-            status: dict[str, object] = {"status": "pending"}
-            if top_level:
-                status["index"] = index
-            if isinstance(node_id, str) and node_id:
-                status["nodeId"] = node_id
-                status["stepPath"] = path
-            elif not top_level:
-                status["stepPath"] = path
-            statuses.append(status)
-            if step.get("type") != "condition":
-                continue
-            branches = step.get("branches")
-            if not isinstance(branches, list):
-                continue
-            for branch_index, branch in enumerate(branches):
-                if not isinstance(branch, dict):
-                    continue
-                branch_steps = branch.get("steps")
-                if not isinstance(branch_steps, list):
-                    continue
-                statuses.extend(
-                    cls._workflow_step_statuses(
-                        branch_steps,
-                        f"{path}.branches[{branch_index}].steps",
-                        top_level=False,
-                    )
-                )
-        return statuses
+        return ProgressTracker._workflow_step_statuses(steps, path_prefix, top_level=top_level)
 
     def _initialize_run_progress(
-        self,
-        task: Task,
-        run: TaskRun,
-        *,
-        workflow_snapshot: dict[str, object] | None = None,
+        self, task: Task, run: TaskRun, *, workflow_snapshot: dict[str, object] | None = None
     ) -> None:
-        progress = {
-            "id": run.id,
-            "status": "running",
-            "attempt": 0,
-            "stepStatuses": self._workflow_step_statuses(task.config["steps"]),
-            "logs": [],
-        }
-        self._task_run_progress[task.id] = progress
-        values: dict[str, object] = {"progress_json": json.dumps(progress, ensure_ascii=False)}
-        if run.run_kind == "test" and workflow_snapshot is not None:
-            values["workflow_json"] = json.dumps(workflow_snapshot, ensure_ascii=False)
-        self.database.update_run(run.id, **values)
+        return self.progress._initialize_run_progress(
+            task, run, workflow_snapshot=workflow_snapshot
+        )
 
     def _persist_run_progress(self, task_id: str, run_id: str) -> None:
-        progress = self._task_run_progress.get(task_id)
-        if progress is None or progress["id"] != run_id:
-            return
-        self.database.update_run(
-            run_id,
-            progress_json=json.dumps(progress, ensure_ascii=False),
-        )
+        return self.progress._persist_run_progress(task_id, run_id)
 
     def _append_run_log(
         self,
@@ -555,43 +123,18 @@ class CheckinService:
         node_id: str | None = None,
         step_path: str | None = None,
     ) -> None:
-        progress = self._task_run_progress.get(task_id)
-        if progress is None or progress["id"] != run_id:
-            return
-        logs = progress.setdefault("logs", [])
-        if not isinstance(logs, list):
-            return
-        entry: dict[str, object] = {
-            "timestamp": utc_isoformat(utc_now()),
-            "level": level,
-            "message": message,
-            "stepIndex": step_index,
-        }
-        if node_id is not None:
-            entry["nodeId"] = node_id
-        if step_path is not None:
-            entry["stepPath"] = step_path
-        logs.append(entry)
-        del logs[:-200]
+        return self.progress._append_run_log(
+            task_id,
+            run_id,
+            message,
+            level=level,
+            step_index=step_index,
+            node_id=node_id,
+            step_path=step_path,
+        )
 
     def _begin_run_attempt(self, task_id: str, run_id: str, attempt: int) -> None:
-        progress = self._task_run_progress.get(task_id)
-        if progress is None or progress["id"] != run_id:
-            return
-        progress["status"] = "running"
-        progress["attempt"] = attempt
-        progress.pop("error", None)
-        for step in self._progress_step_statuses(progress):
-            step["status"] = "pending"
-            step.pop("error", None)
-            step.pop("botResponse", None)
-            step.pop("botButtons", None)
-            step.pop("durationMs", None)
-            step.pop("selectedBranch", None)
-            step.pop("conditionVariables", None)
-        self._append_run_log(task_id, run_id, f"开始第 {attempt} 次尝试")
-        self._persist_run_progress(task_id, run_id)
-        self._publish_task_updated(task_id)
+        return self.progress._begin_run_attempt(task_id, run_id, attempt)
 
     def _update_run_step(
         self,
@@ -609,93 +152,26 @@ class CheckinService:
         condition_variables: list[dict[str, object]] | None = None,
         include_condition_values: bool = False,
     ) -> None:
-        progress = self._task_run_progress.get(task_id)
-        if progress is None or progress["id"] != run_id:
-            return
-        steps = self._progress_step_statuses(progress)
-        step = next(
-            (
-                item
-                for item in steps
-                if (node_id is not None and item.get("nodeId") == node_id)
-                or (step_path is not None and item.get("stepPath") == step_path)
-            ),
-            None,
-        )
-        if step is None and index is not None:
-            step = next((item for item in steps if item.get("index") == index), None)
-        if step is None:
-            return
-        step["status"] = status
-        if error is None:
-            step.pop("error", None)
-        else:
-            step["error"] = error
-        if bot_response is not None:
-            step["botResponse"] = bot_response
-        if bot_buttons is not None:
-            step["botButtons"] = bot_buttons
-        if duration_ms is not None and duration_ms > 0:
-            step["durationMs"] = duration_ms
-        if selected_branch is not None:
-            step["selectedBranch"] = selected_branch
-        if condition_variables is not None:
-            values = copy.deepcopy(condition_variables)
-            if not include_condition_values:
-                for item in values:
-                    item.pop("value", None)
-            step["conditionVariables"] = values
-        labels = {"running": "开始执行", "success": "执行成功", "failed": "执行失败"}
-        self._append_run_log(
+        return self.progress._update_run_step(
             task_id,
             run_id,
-            error if status == "failed" and error else labels.get(status, status),
-            level="ERROR" if status == "failed" else "INFO",
-            step_index=index,
-            node_id=node_id,
-            step_path=step_path,
+            index,
+            status,
+            error,
+            bot_response,
+            bot_buttons,
+            duration_ms,
+            node_id,
+            step_path,
+            selected_branch,
+            condition_variables,
+            include_condition_values,
         )
-        self._persist_run_progress(task_id, run_id)
-        self._publish_task_updated(task_id)
 
     def _finalize_run_progress(
-        self,
-        task_id: str,
-        run_id: str,
-        status: str,
-        error: str | None = None,
+        self, task_id: str, run_id: str, status: str, error: str | None = None
     ) -> None:
-        progress = self._task_run_progress.get(task_id)
-        if progress is None or progress["id"] != run_id:
-            return
-        progress["status"] = status
-        if error is None:
-            progress.pop("error", None)
-        else:
-            progress["error"] = error
-        for step in self._progress_step_statuses(progress):
-            if status == "success":
-                if step["status"] == "running":
-                    step["status"] = "success"
-                    step.pop("error", None)
-                elif step["status"] == "pending":
-                    # Old integrations only report a final result. Preserve
-                    # their top-level index behavior while keeping unvisited
-                    # identity-aware branch nodes visibly skipped.
-                    step["status"] = "skipped" if "stepPath" in step else "success"
-            elif step["status"] == "running":
-                step["status"] = "failed"
-                step["error"] = error or "任务执行失败"
-            elif step["status"] == "pending":
-                step["status"] = "skipped"
-                step.pop("error", None)
-        self._append_run_log(
-            task_id,
-            run_id,
-            error if error else f"运行{status}",
-            level="ERROR" if status == "failed" else "INFO",
-        )
-        self._persist_run_progress(task_id, run_id)
+        return self.progress._finalize_run_progress(task_id, run_id, status, error)
 
     async def start(self) -> None:
         self.settings.ensure_directories()
@@ -762,320 +238,54 @@ class CheckinService:
                 loop.remove_signal_handler(received)
 
     def _ensure_next_run(self, task: Task) -> None:
-        now = datetime.now(UTC)
-        if task.next_run_at is None or task.next_run_at <= now:
-            try:
-                next_run = next_run_for(schedule_from_task(task), now=now)
-            except ValueError:
-                self.database.update_task(task.id, next_run_at=None)
-                self._remove_scheduled_task(task.id)
-                return
-            self.database.update_task(task.id, next_run_at=next_run)
-            task.next_run_at = next_run
-            self._publish_task_updated(task.id)
+        return self.scheduling._ensure_next_run(task)
 
     def _schedule_task(self, task: Task) -> None:
-        if task.next_run_at is None:
-            return
-        self.scheduler.add_job(
-            self._scheduled_run,
-            trigger=DateTrigger(run_date=task.next_run_at),
-            # Carry the occurrence that created this one-shot job.  A stale
-            # callback can still fire after an administrator advances the
-            # schedule (for example via ``skip_next_task``); it must not run
-            # the newly scheduled occurrence immediately.
-            args=[task.id, task.next_run_at],
-            id=f"task:{task.id}",
-            # Use the configured task name instead of the callback name in
-            # APScheduler's own "Added job" log entry.
-            name=task.name,
-            replace_existing=True,
-            misfire_grace_time=None,
-        )
-        logger.info(
-            "已安排任务 task_id=%s name=%s next_run_at=%s",
-            task.id,
-            task.name,
-            utc_isoformat(task.next_run_at),
-        )
+        return self.scheduling._schedule_task(task)
 
     def _remove_scheduled_task(self, task_id: str) -> None:
-        job = self.scheduler.get_job(f"task:{task_id}")
-        if job is not None:
-            self.scheduler.remove_job(job.id)
+        return self.scheduling._remove_scheduled_task(task_id)
 
     def _sync_schedule(self, task: Task) -> None:
-        if task.enabled and not task.archived and task.next_run_at is not None:
-            self._schedule_task(task)
-        else:
-            self._remove_scheduled_task(task.id)
+        return self.scheduling._sync_schedule(task)
 
     def _bump_task_revision(self, task_id: str) -> None:
         self._task_revisions[task_id] = self._task_revisions.get(task_id, 0) + 1
 
     @staticmethod
     def _task_from_definition(account: Account, definition: TaskDefinition) -> Task:
-        schedule = definition.schedule
-        if schedule.start_date is None:
-            local_today = utc_now().astimezone(ZoneInfo(schedule.timezone)).date()
-            schedule = schedule.model_copy(update={"start_date": local_today})
-            definition = definition.model_copy(update={"schedule": schedule})
-        return Task(
-            account_id=account.id,
-            name=definition.name,
-            target=definition.target,
-            timezone=schedule.timezone,
-            schedule_type=schedule.type,
-            fixed_time=schedule.time,
-            random_start=schedule.start,
-            random_end=schedule.end,
-            config_json=json.dumps(definition.model_dump(mode="json"), ensure_ascii=False),
-            published_schedule_json=None,
-            enabled=False,
-            next_run_at=None,
-        )
+        return TaskService._task_from_definition(account, definition)
 
     def create_task(self, definition: TaskDefinition) -> Task:
-        if self.database.get_task_any(definition.name) is not None:
-            raise TaskNameConflictError("任务名称已存在")
-        account = self.database.get_account(definition.account)
-        if account is None:
-            raise AccountNotFoundError("任务绑定的账号不存在")
-        task = self.database.save_task(self._task_from_definition(account, definition))
-        self._publish_task_updated(task.id)
-        return task
+        return self.tasks.create_task(definition)
 
     def edit_task(self, task_id: str, definition: TaskDefinition) -> Task:
-        task = self.database.get_task_any(task_id)
-        if task is None:
-            raise TaskNotFound("任务不存在")
-        if task.archived:
-            raise TaskStateError("归档任务需先恢复后才能编辑")
-        duplicate = self.database.get_task_any(definition.name)
-        if duplicate is not None and duplicate.id != task.id:
-            raise TaskNameConflictError("任务名称已存在")
-        account = self.database.get_account(definition.account)
-        if account is None:
-            raise AccountNotFoundError("任务绑定的账号不存在")
-
-        schedule = definition.schedule
-        if schedule.start_date is None:
-            local_today = utc_now().astimezone(ZoneInfo(schedule.timezone)).date()
-            schedule = schedule.model_copy(update={"start_date": local_today})
-            definition = definition.model_copy(update={"schedule": schedule})
-        next_run = None
-        values: dict[str, object] = {
-            "account_id": account.id,
-            "name": definition.name,
-            "target": definition.target,
-            "config_json": json.dumps(definition.model_dump(mode="json"), ensure_ascii=False),
-        }
-        # An enabled task keeps its currently published schedule and pending
-        # occurrence while this edit remains a draft.  Disabled tasks have no
-        # active scheduler job, so their denormalized fields may follow the
-        # draft; the published snapshot still becomes authoritative on
-        # publish.
-        if task.enabled:
-            values["next_run_at"] = task.next_run_at
-        else:
-            values.update(
-                {
-                    "timezone": schedule.timezone,
-                    "schedule_type": schedule.type,
-                    "fixed_time": schedule.time,
-                    "random_start": schedule.start,
-                    "random_end": schedule.end,
-                    "next_run_at": next_run,
-                }
-            )
-        updated = self.database.update_task(task.id, **values)
-        self._bump_task_revision(task.id)
-        if not task.enabled:
-            self._sync_schedule(updated)
-        self._publish_task_updated(task.id)
-        return updated
+        return self.tasks.edit_task(task_id, definition)
 
     @staticmethod
     def _execution_definition(definition: TaskDefinition) -> dict[str, object]:
-        """Return the immutable portion of a published workflow.
-
-        Scheduling metadata is persisted separately as the task's published
-        schedule.  All values consumed while executing steps or sending
-        notifications are frozen here.
-        """
-
-        payload = definition.model_dump(mode="json")
-        payload.pop("name", None)
-        payload.pop("schedule", None)
-        return payload
+        return WorkflowService._execution_definition(definition)
 
     def publish_task(self, task_id: str, release_note: str | None = None) -> WorkflowVersion:
-        task = self.database.get_task_any(task_id)
-        if task is None:
-            raise TaskNotFound("任务不存在")
-        if task.archived:
-            raise TaskStateError("归档任务不能发布")
-        try:
-            definition = TaskDefinition.model_validate(task.config)
-        except Exception as exc:
-            raise TaskStateError("当前任务配置无效，无法发布") from exc
-        schedule = definition.schedule
-        if task.enabled:
-            try:
-                next_run = next_run_for(schedule, now=utc_now())
-            except ValueError as exc:
-                raise TaskStateError("调度规则没有可执行的未来时间") from exc
-        else:
-            next_run = None
-        version = self.database.publish_workflow(
-            task.id,
-            self._execution_definition(definition),
-            release_note=release_note,
-            task_values={
-                "timezone": schedule.timezone,
-                "schedule_type": schedule.type,
-                "fixed_time": schedule.time,
-                "random_start": schedule.start,
-                "random_end": schedule.end,
-                "published_schedule_json": json.dumps(
-                    schedule.model_dump(mode="json"), ensure_ascii=False
-                ),
-                "next_run_at": next_run,
-            },
-        )
-        updated = self.database.get_task_any(task.id)
-        if updated is None:
-            raise TaskNotFound("任务不存在")
-        self._bump_task_revision(task.id)
-        self._sync_schedule(updated)
-        self._publish_task_updated(task.id)
-        return version
+        return self.workflows.publish_task(task_id, release_note)
 
     def workflow_versions(self, task_id: str) -> list[WorkflowVersion]:
-        return self.database.list_workflow_versions(task_id)
+        return self.workflows.workflow_versions(task_id)
 
     def enable_task(self, task_id: str) -> Task:
-        task = self.database.get_task_any(task_id)
-        if task is None:
-            raise TaskNotFound("任务不存在")
-        if task.archived:
-            raise TaskStateError("归档任务需先恢复后才能启用")
-        if self.database.get_latest_workflow_version(task.id) is None:
-            raise TaskStateError("请先发布工作流后再启用任务")
-        try:
-            next_run = next_run_for(schedule_from_task(task), now=utc_now())
-        except ValueError as exc:
-            raise TaskStateError("调度规则没有可执行的未来时间") from exc
-        updated = self.database.update_task(task.id, enabled=True, next_run_at=next_run)
-        self._bump_task_revision(task.id)
-        self._sync_schedule(updated)
-        self._publish_task_updated(task.id)
-        return updated
+        return self.tasks.enable_task(task_id)
 
     def disable_task(self, task_id: str) -> Task:
-        task = self.database.get_task_any(task_id)
-        if task is None:
-            raise TaskNotFound("任务不存在")
-        updated = self.database.update_task(task.id, enabled=False, next_run_at=None)
-        self._bump_task_revision(task.id)
-        self._sync_schedule(updated)
-        self._publish_task_updated(task.id)
-        return updated
+        return self.tasks.disable_task(task_id)
 
     def skip_next_task(self, task_id: str) -> Task:
-        """Skip the currently scheduled occurrence and advance the schedule.
-
-        Skipping is an administrator action on the future schedule only; it
-        does not affect an execution that is already running.  The consumed
-        occurrence is recorded as a skipped run so task history and dashboard
-        counters retain an auditable record of the action.
-        """
-
-        task = self.database.get_task_any(task_id)
-        if task is None:
-            raise TaskNotFound("任务不存在")
-        if task.archived:
-            raise TaskStateError("归档任务不能跳过下次运行")
-        if not task.enabled:
-            raise TaskStateError("任务未启用，无法跳过下次运行")
-        planned_at = task.next_run_at
-        if planned_at is None:
-            raise TaskStateError("任务当前没有安排中的下次运行")
-
-        finished = utc_now()
-        # A scheduled callback keeps the consumed occurrence in
-        # ``next_run_at`` until it finishes.  Do not create a second skipped
-        # history row if that occurrence has already started.
-        if planned_at <= finished and (
-            task.id in self.running or self.database.has_running_run(task.id)
-        ):
-            raise TaskStateError("任务当前正在执行，无法跳过已开始的运行")
-        try:
-            next_run = next_run_for(
-                schedule_from_task(task),
-                now=finished,
-                after=planned_at,
-            )
-        except ValueError:
-            next_run = None
-
-        version = self.database.get_latest_workflow_version(task.id)
-        skipped_run = self.database.add_run(
-            TaskRun(
-                task_id=task.id,
-                planned_at=planned_at,
-                started_at=finished,
-                finished_at=finished,
-                status="skipped",
-                attempts=0,
-                error="管理员跳过本次运行",
-                run_kind="published",
-                workflow_version=str(version.version_number) if version else None,
-                workflow_version_id=version.id if version else None,
-            )
-        )
-        updated = self.database.update_task(
-            task.id,
-            next_run_at=next_run,
-            last_run_at=finished,
-            last_status="skipped",
-        )
-        self._bump_task_revision(task.id)
-        self._sync_schedule(updated)
-        self._publish_task_updated(task.id)
-        logger.info(
-            "跳过任务下次运行 task_id=%s name=%s planned_at=%s next_run_at=%s run_id=%s",
-            task.id,
-            task.name,
-            utc_isoformat(planned_at),
-            utc_isoformat(next_run),
-            skipped_run.id,
-        )
-        return updated
+        return self.tasks.skip_next_task(task_id)
 
     def archive_task(self, task_id: str) -> Task:
-        task = self.database.get_task_any(task_id)
-        if task is None:
-            raise TaskNotFound("任务不存在")
-        # Archiving always disables future scheduling, but deliberately leaves
-        # an already running execution untouched.
-        updated = self.database.update_task(task.id, enabled=False, archived=True, next_run_at=None)
-        self._bump_task_revision(task.id)
-        self._sync_schedule(updated)
-        self._publish_task_updated(task.id)
-        return updated
+        return self.tasks.archive_task(task_id)
 
     def restore_task(self, task_id: str) -> Task:
-        task = self.database.get_task_any(task_id)
-        if task is None:
-            raise TaskNotFound("任务不存在")
-        updated = self.database.update_task(
-            task.id, archived=False, enabled=False, next_run_at=None
-        )
-        self._bump_task_revision(task.id)
-        self._sync_schedule(updated)
-        self._publish_task_updated(task.id)
-        return updated
+        return self.tasks.restore_task(task_id)
 
     async def _scheduled_run(self, task_id: str, planned_at: datetime | None = None) -> None:
         if planned_at is not None:
@@ -1459,55 +669,7 @@ class CheckinService:
                 workflow_version_id=version.id,
             )
         )
-        self._initialize_run_progress(execution_task, run)
-        self._manual_reservations.add(lock_key)
-        revision = self._task_revisions.get(task.id, 0)
-
-        async def execute() -> bool:
-            try:
-                return await self._execute_run(
-                    execution_task,
-                    account,
-                    run,
-                    manual=True,
-                    state_task=task,
-                )
-            finally:
-                self._manual_reservations.discard(lock_key)
-
-        running = asyncio.create_task(execute(), name=f"manual:{task.id}:{run.id}")
-        self.running[task.id] = running
-        self._publish_task_updated(task.id)
-
-        def cleanup(completed: asyncio.Task[bool]) -> None:
-            self._manual_reservations.discard(lock_key)
-            if self.running.get(task.id) is completed:
-                self.running.pop(task.id, None)
-            if not completed.cancelled():
-                completed.exception()
-            stored = self.database.get_run(run.id)
-            if stored is not None and stored.status == "running":
-                status = "canceled" if completed.cancelled() else "failed"
-                finished = utc_now()
-                error = "执行在启动前被取消" if completed.cancelled() else "执行异常中止"
-                self.database.update_run(
-                    run.id,
-                    finished_at=finished,
-                    status=status,
-                    error=error,
-                )
-                self._finalize_run_progress(task.id, run.id, status, error)
-                self._update_after_run(
-                    task,
-                    status,
-                    finished,
-                    manual=True,
-                    revision=revision,
-                )
-            self._publish_task_updated(task.id)
-
-        running.add_done_callback(cleanup)
-        return run.id
+        return self._start_background_run(task, execution_task, account, run, lock_key)
 
     def start_test_run(self, task_id: str, definition: TaskDefinition) -> str:
         """Start a test run from the editor's current (possibly unsaved) state."""
@@ -1535,12 +697,30 @@ class CheckinService:
                 workflow_version_id=None,
             )
         )
-        self._initialize_run_progress(
+        return self._start_background_run(
+            task,
             execution_task,
+            account,
             run,
+            lock_key,
             workflow_snapshot=execution_definition,
+            update_task_state=False,
         )
+
+    def _start_background_run(
+        self,
+        task: Task,
+        execution_task: Task,
+        account: Account,
+        run: TaskRun,
+        lock_key: tuple[str, str],
+        *,
+        workflow_snapshot: dict[str, Any] | None = None,
+        update_task_state: bool = True,
+    ) -> str:
+        self._initialize_run_progress(execution_task, run, workflow_snapshot=workflow_snapshot)
         self._manual_reservations.add(lock_key)
+        revision = self._task_revisions.get(task.id, 0)
 
         async def execute() -> bool:
             try:
@@ -1549,13 +729,13 @@ class CheckinService:
                     account,
                     run,
                     manual=True,
-                    update_task_state=False,
+                    update_task_state=update_task_state,
                     state_task=task,
                 )
             finally:
                 self._manual_reservations.discard(lock_key)
 
-        running = asyncio.create_task(execute(), name=f"test:{task.id}:{run.id}")
+        running = asyncio.create_task(execute(), name=f"{run.run_kind}:{task.id}:{run.id}")
         self.running[task.id] = running
         self._publish_task_updated(task.id)
 
@@ -1577,6 +757,14 @@ class CheckinService:
                     error=error,
                 )
                 self._finalize_run_progress(task.id, run.id, status, error)
+                if update_task_state:
+                    self._update_after_run(
+                        task,
+                        status,
+                        finished,
+                        manual=True,
+                        revision=revision,
+                    )
             self._publish_task_updated(task.id)
 
         running.add_done_callback(cleanup)

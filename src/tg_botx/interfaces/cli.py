@@ -9,12 +9,12 @@ import typer
 
 from tg_botx.config import Settings
 from tg_botx.core.time import utc_isoformat
-from tg_botx.interfaces.account_console import AuthService
 from tg_botx.features.admin_bot import BotManagementService
 from tg_botx.features.checkin.runtime import CheckinService, TaskNotFound, TaskStateError
 from tg_botx.features.checkin.schedule import schedule_from_task
 from tg_botx.infrastructure.observability.logging import IconFormatter, SensitiveDataFilter
 from tg_botx.infrastructure.persistence.db import Database
+from tg_botx.interfaces.account_console import AuthService
 from tg_botx.schemas import TaskDefinition
 
 app = typer.Typer(help="Telegram 用户账号签到调度器")

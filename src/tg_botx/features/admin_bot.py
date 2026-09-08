@@ -15,11 +15,11 @@ import uuid
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tg_botx.config import Settings
+from tg_botx.core.time import format_local_time
 from tg_botx.features.checkin.runtime import (
     CheckinService,
     ManualRunConflict,
@@ -1325,11 +1325,4 @@ class TelegramManagementBot:
 
     @staticmethod
     def _format_time(value: datetime | None, timezone_name: str) -> str:
-        if value is None:
-            return "未安排"
-        zone: tzinfo
-        try:
-            zone = ZoneInfo(timezone_name)
-        except (ZoneInfoNotFoundError, ValueError):
-            zone = UTC
-        return value.astimezone(zone).strftime("%Y-%m-%d %H:%M") + f" ({timezone_name})"
+        return format_local_time(value, timezone_name, seconds=False)
