@@ -604,3 +604,41 @@ def test_chat_avatar_url_uses_cache_only_avatar_endpoint(tmp_path):
 
         cache_path.unlink()
         assert client.get("/api/avatar/123/456").status_code == 404
+
+
+def test_http_extraction_save_and_source_removal_validation(tmp_path):
+    app = app_for(tmp_path)
+    with TestClient(app, base_url=ORIGIN) as client:
+        verified = authenticate(client).json()
+        headers = {
+            "Origin": ORIGIN,
+            "Content-Type": "application/json",
+            "X-CSRF-Token": verified["csrfToken"],
+        }
+        definition = {
+            "name": "http-extraction",
+            "account": "default",
+            "target": "checkin_bot",
+            "schedule": {"type": "fixed", "timezone": "UTC", "time": "23:59:00"},
+            "steps": [
+                {"type": "http_request", "node_id": "http1", "url": "https://example.test"},
+                {
+                    "type": "extract_variable",
+                    "name": "balance",
+                    "source": "http_body",
+                    "source_node_id": "http1",
+                    "value_type": "number",
+                    "path": "balance",
+                },
+                {"type": "send_message", "text": "{{ balance }}"},
+            ],
+        }
+        created = client.post("/api/tasks", headers=headers, json={"definition": definition})
+        assert created.status_code == 201, created.text
+        task_id = created.json()["id"]
+        definition["steps"].pop(0)
+        rejected = client.patch(
+            f"/api/tasks/{task_id}", headers=headers, json={"definition": definition}
+        )
+        assert rejected.status_code == 422
+        assert "source_node_id" in rejected.text

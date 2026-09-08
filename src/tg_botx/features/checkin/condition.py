@@ -469,7 +469,7 @@ def extract_variables(
                 raw = execute_regex(
                     str(extraction.get("pattern", "")),
                     str(raw),
-                    extraction.get("regex", {}),
+                    extraction.get("regex") or {},
                     budget,
                     capture_group=extraction.get("capture_group", 1),
                 )

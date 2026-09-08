@@ -6,22 +6,24 @@ import json
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
-from telethon import TelegramClient, events
 import httpx
+from telethon import TelegramClient, events
 
 from tg_botx.features.checkin.condition import (
     ConditionEvaluationError,
     ConditionInput,
     ConditionVariable,
+    RegexBudget,
+    ValueType,
     callback_data_values,
+    convert_value,
+    extract_variables,
     normalize_legacy_condition,
     render_matcher_templates,
     render_template,
-    extract_variables,
-    RegexBudget,
     select_branch,
 )
 from tg_botx.features.checkin.matching import match_button, matches
@@ -483,6 +485,12 @@ class CheckinExecutor:
                         raise CheckinError("HTTP 请求头必须是有效 JSON") from exc
                     if not isinstance(headers, dict):
                         raise CheckinError("HTTP 请求头必须是 JSON 对象")
+                    if any(not isinstance(value, str) for value in headers.values()):
+                        raise CheckinError("HTTP 请求头的值必须是字符串")
+                    headers = {
+                        key: render_template(value, context.variables)
+                        for key, value in headers.items()
+                    }
                     body = step.get("body")
                     rendered_body = (
                         render_template(body, context.variables) if isinstance(body, str) else None
@@ -509,14 +517,11 @@ class CheckinExecutor:
                     )
                     step_response_reported = True
                 elif kind == "extract_variable":
-                    response = context.http_responses.get(
-                        str(step.get("source_node_id", "")), context.http_response
-                    )
-                    if response is None and step.get("source") != "wait_message_text":
-                        raise CheckinError("变量提取节点前没有 HTTP 响应")
+                    source_id = str(step.get("source_node_id") or "")
                     source = step.get("source", "http_body")
                     if source == "wait_message_text":
-                        source_id = str(step.get("source_node_id", ""))
+                        if source_id and source_id not in context.wait_messages:
+                            raise CheckinError(f"等待消息数据源节点未执行或不存在：{source_id}")
                         raw = (
                             context.wait_messages.get(source_id)
                             if source_id
@@ -524,7 +529,11 @@ class CheckinExecutor:
                         )
                         if raw is None and step.get("mode", "whole_text") != "metadata":
                             raise CheckinError("等待消息前没有可提取的内容")
-                        metadata = context.wait_metadata.get(source_id, context.last_wait_metadata)
+                        metadata = (
+                            context.wait_metadata.get(source_id, {})
+                            if source_id
+                            else context.last_wait_metadata
+                        )
                         extraction = {
                             "name": step["name"],
                             "source": "metadata"
@@ -535,7 +544,7 @@ class CheckinExecutor:
                             "field": step.get("field"),
                             "pattern": step.get("pattern"),
                             "capture_group": step.get("capture_group", 1),
-                            "regex": step.get("regex"),
+                            "regex": step.get("regex") or {},
                         }
                         extract_variables(
                             {"extracts": [extraction], "strict": True},
@@ -547,29 +556,40 @@ class CheckinExecutor:
                             context.variables,
                             RegexBudget(),
                         )
-                    elif source == "http_status":
-                        raw = str(response.status_code)
-                    elif source == "http_headers":
-                        raw = json.dumps(dict(response.headers), ensure_ascii=False)
-                    elif source == "http_body":
-                        raw = response.text
                     else:
-                        raw = ""
-                    path = step.get("path")
-                    if path and source == "http_body":
-                        try:
-                            value: Any = response.json()
-                            for part in str(path).lstrip("$.").split("."):
-                                value = value[int(part)] if isinstance(value, list) else value[part]
-                            raw = str(value)
-                        except (ValueError, KeyError, IndexError, TypeError) as exc:
-                            raise CheckinError(f"无法提取响应字段：{path}") from exc
-                    if source != "wait_message_text":
-                        context.variables[str(step["name"])] = ConditionVariable(
-                            name=str(step["name"]),
-                            value_type=str(step.get("value_type", "text")),
-                            raw=raw,
-                            value=raw,
+                        source_response = (
+                            context.http_responses.get(source_id)
+                            if source_id
+                            else context.http_response
+                        )
+                        if source_response is None:
+                            raise CheckinError(
+                                f"HTTP 数据源节点未执行或不存在：{source_id}"
+                                if source_id
+                                else "变量提取节点前没有 HTTP 响应"
+                            )
+                        if source == "http_status":
+                            raw = str(source_response.status_code)
+                        elif source == "http_headers":
+                            raw = json.dumps(dict(source_response.headers), ensure_ascii=False)
+                        else:
+                            raw = source_response.text
+                        path = step.get("path")
+                        if path and source == "http_body":
+                            try:
+                                value: Any = source_response.json()
+                                for part in str(path).lstrip("$.").split("."):
+                                    value = (
+                                        value[int(part)] if isinstance(value, list) else value[part]
+                                    )
+                                raw = str(value)
+                            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                                raise CheckinError(f"无法提取响应字段：{path}") from exc
+                        context.variables[str(step["name"])] = convert_value(
+                            str(step["name"]),
+                            raw,
+                            cast(ValueType, step.get("value_type", "text")),
+                            context.timezone,
                         )
                 elif kind == "condition":
                     selected_index, selected, extraction_results = select_branch(
