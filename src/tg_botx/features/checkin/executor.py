@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -14,54 +12,29 @@ from telethon import TelegramClient, events
 
 from tg_botx.features.checkin.condition import (
     ConditionEvaluationError,
-    ConditionInput,
-    ConditionVariable,
-    RegexBudget,
-    ValueType,
-    callback_data_values,
-    convert_value,
-    extract_variables,
     normalize_legacy_condition,
-    render_matcher_templates,
-    render_template,
-    select_branch,
 )
-from tg_botx.features.checkin.matching import match_button, matches
+from tg_botx.features.checkin.execution_types import CheckinError as CheckinError
+from tg_botx.features.checkin.execution_types import ExecutionContext as ExecutionContext
+from tg_botx.features.checkin.execution_types import StepReport
+from tg_botx.features.checkin.matching import matches
+from tg_botx.features.checkin.steps import (
+    click_button,
+    condition,
+    extract_variable,
+    http_request,
+    send_message,
+    wait_message,
+)
 
-
-class CheckinError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        bot_response: str | None = None,
-        bot_buttons: list[list[str]] | None = None,
-    ):
-        super().__init__(message)
-        self.bot_response = bot_response
-        self.bot_buttons = bot_buttons
-
-
-@dataclass(slots=True)
-class ExecutionContext:
-    entity: Any
-    bot_id: int | None
-    timezone: ZoneInfo
-    baseline: int
-    current_message: Any = None
-    last_wait_message: Any = None
-    last_wait_text: str | None = None
-    last_wait_metadata: dict[str, Any] = field(default_factory=dict)
-    last_clicked_callback_data_text: str | None = None
-    last_clicked_callback_data_base64: str | None = None
-    bot_response: str | None = None
-    bot_buttons: list[list[str]] | None = None
-    editable_message_ids: set[int] = field(default_factory=set)
-    editable_message_texts: dict[int, str] = field(default_factory=dict)
-    variables: dict[str, ConditionVariable] = field(default_factory=dict)
-    http_response: Any = None
-    http_responses: dict[str, Any] = field(default_factory=dict)
-    wait_messages: dict[str, str] = field(default_factory=dict)
-    wait_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+STEP_HANDLERS = {
+    "send_message": send_message.execute,
+    "wait_message": wait_message.execute,
+    "click_button": click_button.execute,
+    "http_request": http_request.execute,
+    "extract_variable": extract_variable.execute,
+    "condition": condition.execute,
+}
 
 
 class CheckinExecutor:
@@ -72,12 +45,25 @@ class CheckinExecutor:
         on_attempt: Callable[[int], Awaitable[None]] | None = None,
         on_step_status: Callable[..., Awaitable[None]] | None = None,
         on_step_response: Callable[..., Awaitable[None]] | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ):
+        self._http_client = http_client
+        self._owns_http_client = http_client is None
         self.client = client
         self.is_cancelled = is_cancelled or (lambda: False)
         self.on_attempt = on_attempt
         self.on_step_status = on_step_status
         self.on_step_response = on_step_response
+
+    def http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient()
+        return self._http_client
+
+    async def close(self) -> None:
+        if self._owns_http_client and self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
 
     async def begin_attempt(self, attempt: int) -> None:
         if self.on_attempt is not None:
@@ -333,7 +319,7 @@ class CheckinExecutor:
 
     async def execute(self, task: Any) -> str | None:
         entity = await self.client.get_entity(task.target)
-        bot = await self.client.get_entity(task.target)
+        bot = entity
         timezone_name = getattr(task, "timezone", None) or task.config.get("schedule", {}).get(
             "timezone", "Asia/Shanghai"
         )
@@ -343,8 +329,11 @@ class CheckinExecutor:
             timezone=ZoneInfo(str(timezone_name)),
             baseline=await self._latest_message_id(entity),
         )
-        await self._execute_steps(task.config["steps"], context, "steps", top_level=True)
-        return context.bot_response
+        try:
+            await self._execute_steps(task.config["steps"], context, "steps", top_level=True)
+            return context.bot_response
+        finally:
+            await self.close()
 
     async def _execute_steps(
         self,
@@ -377,258 +366,15 @@ class CheckinExecutor:
             def step_duration_ms(started_at: float = step_started_at) -> int:
                 return max(0, round((time.perf_counter() - started_at) * 1000))
 
-            step_response_reported = False
-            condition_reported = False
+            report = StepReport()
             step_label = f"步骤 {index + 1}" if index is not None else f"节点 {resolved_path}"
             try:
-                if kind == "send_message":
-                    text = render_template(str(step["text"]), context.variables)
-                    context.current_message = await self.client.send_message(context.entity, text)
-                    context.baseline = max(context.baseline, context.current_message.id)
-                    context.editable_message_ids.clear()
-                    context.editable_message_texts.clear()
-                elif kind == "wait_message":
-                    rendered_step = {
-                        **step,
-                        "success": render_matcher_templates(step.get("success"), context.variables),
-                        "failure": render_matcher_templates(step.get("failure"), context.variables),
-                    }
-                    context.current_message = await self._wait_for_message(
-                        entity=context.entity,
-                        bot_id=context.bot_id,
-                        baseline=context.baseline,
-                        step=rendered_step,
-                        timeout=step.get("timeout_seconds", 60),
-                        editable_message_ids=context.editable_message_ids,
-                        editable_message_texts=context.editable_message_texts,
-                    )
-                    context.current_message = await self._hydrate_message(
-                        context.entity, context.current_message
-                    )
-                    context.last_wait_message = context.current_message
-                    context.last_wait_text = context.current_message.raw_text or ""
-                    context.last_wait_metadata = await self._condition_metadata(
-                        context.current_message, context.entity
-                    )
-                    context.last_wait_metadata["runtime.last_clicked_callback_data_text"] = (
-                        context.last_clicked_callback_data_text
-                    )
-                    context.last_wait_metadata["runtime.last_clicked_callback_data_base64"] = (
-                        context.last_clicked_callback_data_base64
-                    )
-                    context.wait_messages[node_id or resolved_path] = context.last_wait_text
-                    context.wait_metadata[node_id or resolved_path] = dict(
-                        context.last_wait_metadata
-                    )
-                    context.bot_response = context.last_wait_text
-                    context.bot_buttons = await self._message_buttons(
-                        context.current_message, context.entity
-                    )
-                    if context.bot_buttons is None:
-                        await self.report_step_response(
-                            index,
-                            context.bot_response,
-                            node_id=node_id,
-                            step_path=resolved_path,
-                        )
-                    else:
-                        await self.report_step_response(
-                            index,
-                            context.bot_response,
-                            context.bot_buttons,
-                            node_id=node_id,
-                            step_path=resolved_path,
-                        )
-                    step_response_reported = True
-                    context.baseline = max(context.baseline, context.current_message.id)
-                    context.editable_message_ids.clear()
-                    context.editable_message_texts.clear()
-                elif kind == "click_button":
-                    if context.current_message is None:
-                        raise CheckinError("点击按钮步骤前没有可用的机器人消息")
-                    rendered_step = dict(step)
-                    for field in ("text", "text_contains", "callback_data"):
-                        if isinstance(rendered_step.get(field), str):
-                            rendered_step[field] = render_template(
-                                rendered_step[field], context.variables
-                            )
-                    context.current_message = await self._hydrate_message(
-                        context.entity, context.current_message
-                    )
-                    if not getattr(context.current_message, "buttons", None):
-                        get_buttons = getattr(context.current_message, "get_buttons", None)
-                        if callable(get_buttons):
-                            await get_buttons()
-                    button = match_button(context.current_message, rendered_step)
-                    context.editable_message_ids = {context.current_message.id}
-                    context.editable_message_texts = {
-                        context.current_message.id: context.current_message.raw_text or ""
-                    }
-                    await self._click(context.current_message, button, rendered_step)
-                    callback_value = getattr(button, "data", None)
-                    if callback_value is None:
-                        callback_value = rendered_step.get("callback_data")
-                    callback_text, callback_base64 = callback_data_values(callback_value)
-                    context.last_clicked_callback_data_text = callback_text
-                    context.last_clicked_callback_data_base64 = callback_base64
-                    context.last_wait_metadata["runtime.last_clicked_callback_data_text"] = (
-                        callback_text
-                    )
-                    context.last_wait_metadata["runtime.last_clicked_callback_data_base64"] = (
-                        callback_base64
-                    )
-                elif kind == "http_request":
-                    url = render_template(str(step["url"]), context.variables)
-                    try:
-                        headers = json.loads(step.get("headers") or "{}")
-                    except json.JSONDecodeError as exc:
-                        raise CheckinError("HTTP 请求头必须是有效 JSON") from exc
-                    if not isinstance(headers, dict):
-                        raise CheckinError("HTTP 请求头必须是 JSON 对象")
-                    if any(not isinstance(value, str) for value in headers.values()):
-                        raise CheckinError("HTTP 请求头的值必须是字符串")
-                    headers = {
-                        key: render_template(value, context.variables)
-                        for key, value in headers.items()
-                    }
-                    body = step.get("body")
-                    rendered_body = (
-                        render_template(body, context.variables) if isinstance(body, str) else None
-                    )
-                    kwargs: dict[str, Any] = {
-                        "headers": headers,
-                        "timeout": step.get("timeout_seconds", 30),
-                    }
-                    if rendered_body:
-                        try:
-                            kwargs["json"] = json.loads(rendered_body)
-                        except json.JSONDecodeError:
-                            kwargs["content"] = rendered_body
-                    async with httpx.AsyncClient() as client:
-                        response = await client.request(
-                            str(step.get("method", "GET")), url, **kwargs
-                        )
-                        response.raise_for_status()
-                    context.http_response = response
-                    context.http_responses[node_id or resolved_path] = response
-                    context.bot_response = response.text[:4000]
-                    await self.report_step_response(
-                        index, context.bot_response, node_id=node_id, step_path=resolved_path
-                    )
-                    step_response_reported = True
-                elif kind == "extract_variable":
-                    source_id = str(step.get("source_node_id") or "")
-                    source = step.get("source", "http_body")
-                    if source == "wait_message_text":
-                        if source_id and source_id not in context.wait_messages:
-                            raise CheckinError(f"等待消息数据源节点未执行或不存在：{source_id}")
-                        raw = (
-                            context.wait_messages.get(source_id)
-                            if source_id
-                            else context.last_wait_text
-                        )
-                        if raw is None and step.get("mode", "whole_text") != "metadata":
-                            raise CheckinError("等待消息前没有可提取的内容")
-                        metadata = (
-                            context.wait_metadata.get(source_id, {})
-                            if source_id
-                            else context.last_wait_metadata
-                        )
-                        extraction = {
-                            "name": step["name"],
-                            "source": "metadata"
-                            if step.get("mode") == "metadata"
-                            else step.get("extract_source", "message_text"),
-                            "mode": step.get("mode", "whole_text"),
-                            "value_type": step.get("value_type", "text"),
-                            "field": step.get("field"),
-                            "pattern": step.get("pattern"),
-                            "capture_group": step.get("capture_group", 1),
-                            "regex": step.get("regex") or {},
-                        }
-                        extract_variables(
-                            {"extracts": [extraction], "strict": True},
-                            ConditionInput(
-                                message_text=raw,
-                                metadata=metadata,
-                                timezone=context.timezone,
-                            ),
-                            context.variables,
-                            RegexBudget(),
-                        )
-                    else:
-                        source_response = (
-                            context.http_responses.get(source_id)
-                            if source_id
-                            else context.http_response
-                        )
-                        if source_response is None:
-                            raise CheckinError(
-                                f"HTTP 数据源节点未执行或不存在：{source_id}"
-                                if source_id
-                                else "变量提取节点前没有 HTTP 响应"
-                            )
-                        if source == "http_status":
-                            raw = str(source_response.status_code)
-                        elif source == "http_headers":
-                            raw = json.dumps(dict(source_response.headers), ensure_ascii=False)
-                        else:
-                            raw = source_response.text
-                        path = step.get("path")
-                        if path and source == "http_body":
-                            try:
-                                value: Any = source_response.json()
-                                for part in str(path).lstrip("$.").split("."):
-                                    value = (
-                                        value[int(part)] if isinstance(value, list) else value[part]
-                                    )
-                                raw = str(value)
-                            except (ValueError, KeyError, IndexError, TypeError) as exc:
-                                raise CheckinError(f"无法提取响应字段：{path}") from exc
-                        context.variables[str(step["name"])] = convert_value(
-                            str(step["name"]),
-                            raw,
-                            cast(ValueType, step.get("value_type", "text")),
-                            context.timezone,
-                        )
-                elif kind == "condition":
-                    selected_index, selected, extraction_results = select_branch(
-                        step,
-                        ConditionInput(
-                            message_text=context.last_wait_text,
-                            metadata=context.last_wait_metadata,
-                            timezone=context.timezone,
-                        ),
-                        context.variables,
-                    )
-                    selected_branch = {
-                        "index": selected_index,
-                        "kind": selected.get("kind"),
-                        "name": selected.get("name"),
-                    }
-                    await self.report_step_status(
-                        index,
-                        "success",
-                        duration_ms=step_duration_ms(),
-                        node_id=node_id,
-                        step_path=resolved_path,
-                        selected_branch=selected_branch,
-                        condition_variables=extraction_results,
-                    )
-                    condition_reported = True
-                    for branch_index, branch in enumerate(step.get("branches", [])):
-                        if branch_index != selected_index:
-                            await self._mark_steps_skipped(
-                                branch.get("steps") or [],
-                                f"{resolved_path}.branches[{branch_index}].steps",
-                            )
-                    await self._execute_steps(
-                        selected.get("steps") or [],
-                        context,
-                        f"{resolved_path}.branches[{selected_index}].steps",
-                    )
-                else:
+                handler = STEP_HANDLERS.get(kind)
+                if handler is None:
                     raise CheckinError(f"不支持的步骤类型：{kind}")
+                await handler(
+                    self, step, context, index, node_id, resolved_path, step_duration_ms, report
+                )
             except asyncio.CancelledError:
                 await self.report_step_status(
                     index,
@@ -668,7 +414,7 @@ class CheckinExecutor:
                 )
                 raise error from exc
             except CheckinError as exc:
-                if exc.bot_response is not None and not step_response_reported:
+                if exc.bot_response is not None and not report.response_reported:
                     context.bot_response = exc.bot_response
                     if exc.bot_buttons is None:
                         await self.report_step_response(
@@ -709,7 +455,7 @@ class CheckinExecutor:
                     step_path=resolved_path,
                 )
                 raise error from exc
-            if not condition_reported:
+            if not report.condition_reported:
                 await self.report_step_status(
                     index,
                     "success",

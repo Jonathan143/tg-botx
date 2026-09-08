@@ -6,6 +6,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from tg_botx.application.queries import TaskQueries, TaskView
 from tg_botx.features.checkin.runtime import (
     CheckinService,
 )
@@ -46,22 +47,36 @@ def _redact_step_buttons(step: dict[str, Any]) -> None:
 
 
 def _task_json(task: Task, database: Database, service: CheckinService) -> dict[str, Any]:
-    account = database.get_account_by_id(task.account_id)
-    run = service.get_task_run_progress(task.id)
-    if run is not None:
-        if isinstance(run.get("error"), str):
-            run["error"] = redact_sensitive(run["error"])
-        for step in run["stepStatuses"]:
-            if isinstance(step.get("error"), str):
-                step["error"] = redact_sensitive(step["error"])
-            if isinstance(step.get("botResponse"), str):
-                step["botResponse"] = redact_sensitive(step["botResponse"])
-            _redact_step_buttons(step)
-        for log in run.get("logs", []):
-            if isinstance(log.get("message"), str):
-                log["message"] = redact_sensitive(log["message"])
+    return task_json(TaskQueries(database, service).views([task])[0])
+
+
+def redact_progress(
+    progress: dict[str, Any] | None, *, include_logs: bool = True
+) -> dict[str, Any] | None:
+    if progress is None:
+        return None
+    run = copy.deepcopy(progress)
+    if not include_logs:
+        run.pop("logs", None)
+    if isinstance(run.get("error"), str):
+        run["error"] = redact_sensitive(run["error"])
+    for step in run.get("stepStatuses", []):
+        if isinstance(step.get("error"), str):
+            step["error"] = redact_sensitive(step["error"])
+        if isinstance(step.get("botResponse"), str):
+            step["botResponse"] = redact_sensitive(step["botResponse"])
+        _redact_step_buttons(step)
+    for log in run.get("logs", []):
+        if isinstance(log.get("message"), str):
+            log["message"] = redact_sensitive(log["message"])
+    return run
+
+
+def task_json(view: TaskView) -> dict[str, Any]:
+    task, account, run = view.task, view.account, view.progress
+    run = redact_progress(run)
     schedule = schedule_from_task(task).model_dump(mode="json", exclude_none=True)
-    versions = database.list_workflow_versions(task.id)
+    versions = view.versions
     latest_version = versions[0] if versions else None
     return {
         "id": task.id,
@@ -74,7 +89,7 @@ def _task_json(task: Task, database: Database, service: CheckinService) -> dict[
         "definition": TaskDefinition.model_validate(task.config).to_api_dict(),
         "enabled": task.enabled,
         "archived": task.archived,
-        "running": task.id in service.running or database.has_running_run(task.id),
+        "running": view.running,
         "nextRunAt": _iso(task.next_run_at),
         "lastRunAt": _iso(task.last_run_at),
         "lastStatus": task.last_status,
@@ -101,8 +116,13 @@ def _run_json(
     *,
     include_workflow: bool = True,
     include_progress_logs: bool = True,
+    task_lookup: dict[str, Task] | None = None,
 ) -> dict[str, Any]:
-    task = database.get_task_any(run.task_id)
+    task = (
+        task_lookup.get(run.task_id)
+        if task_lookup is not None
+        else database.get_task_any(run.task_id)
+    )
     progress = service.get_task_run_progress(run.task_id) if service and task else None
     if progress is not None and progress.get("id") != run.id:
         progress = None
@@ -113,26 +133,7 @@ def _run_json(
                 progress = stored_progress
         except (TypeError, json.JSONDecodeError):
             progress = None
-    if progress is not None:
-        progress = copy.deepcopy(
-            {
-                key: value
-                for key, value in progress.items()
-                if include_progress_logs or key != "logs"
-            }
-        )
-        if isinstance(progress.get("error"), str):
-            progress["error"] = redact_sensitive(progress["error"])
-        for step in progress.get("stepStatuses", []):
-            if isinstance(step.get("error"), str):
-                step["error"] = redact_sensitive(step["error"])
-            if isinstance(step.get("botResponse"), str):
-                step["botResponse"] = redact_sensitive(step["botResponse"])
-            _redact_step_buttons(step)
-        if include_progress_logs:
-            for log in progress.get("logs", []):
-                if isinstance(log.get("message"), str):
-                    log["message"] = redact_sensitive(log["message"])
+    progress = redact_progress(progress, include_logs=include_progress_logs)
     result = {
         "id": run.id,
         "taskId": run.task_id,

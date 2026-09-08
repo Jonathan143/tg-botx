@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Query
 
+from tg_botx.application.queries import TaskQueries
 from tg_botx.features.checkin.runtime import (
     CheckinService,
     ManualRunConflict,
@@ -19,7 +20,7 @@ from tg_botx.infrastructure.persistence.db import (
 )
 from tg_botx.interfaces.admin.errors import APIError
 from tg_botx.interfaces.admin.models import EmptyBody, PublishBody, TaskBody
-from tg_botx.interfaces.admin.presenters import _iso, _task_json
+from tg_botx.interfaces.admin.presenters import _iso, _task_json, task_json
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ def build_router(database: Database, service: CheckinService) -> APIRouter:
             search=search,
         )
         return {
-            "items": [_task_json(item, database, service) for item in items],
+            "items": [task_json(view) for view in TaskQueries(database, service).views(items)],
             "page": page,
             "pageSize": page_size,
             "total": total,

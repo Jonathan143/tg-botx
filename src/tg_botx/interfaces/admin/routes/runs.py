@@ -38,6 +38,7 @@ def build_router(database: Database, service: CheckinService) -> APIRouter:
             started_from=started_from,
             started_to=started_to,
         )
+        task_lookup = database.tasks.get_many(list({item.task_id for item in items}))
         return {
             "items": [
                 _run_json(
@@ -46,6 +47,7 @@ def build_router(database: Database, service: CheckinService) -> APIRouter:
                     service,
                     include_workflow=False,
                     include_progress_logs=False,
+                    task_lookup=task_lookup,
                 )
                 for item in items
             ],

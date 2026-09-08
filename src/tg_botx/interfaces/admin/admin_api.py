@@ -11,6 +11,7 @@ from tg_botx.features.accounts.service import LoginFlowManager
 from tg_botx.features.checkin.runtime import (
     CheckinService,
 )
+from tg_botx.infrastructure.observability.log_stream import LogStream
 from tg_botx.infrastructure.persistence.db import (
     Database,
 )
@@ -64,6 +65,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         raise RuntimeError("TG_BOT_TRUSTED_PROXIES 包含无效 CIDR") from exc
     started_at = time.monotonic()
     shutdown_event = asyncio.Event()
+    log_stream = LogStream(settings)
 
     app = FastAPI(
         title="tg-bot 后台管理 API",
@@ -71,7 +73,7 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
-        lifespan=build_lifespan(service, keys, accounts, admin_bot, shutdown_event),
+        lifespan=build_lifespan(service, keys, accounts, admin_bot, shutdown_event, log_stream),
     )
     app.state.transport_keys = keys
     app.state.sessions = sessions
@@ -116,7 +118,9 @@ def create_admin_app(settings: Settings, database: Database, service: CheckinSer
             app=app,
         )
     )
-    app.include_router(logs.build_router(settings=settings, shutdown_event=shutdown_event))
+    app.include_router(
+        logs.build_router(settings=settings, shutdown_event=shutdown_event, log_stream=log_stream)
+    )
     app.include_router(
         bot_bindings.build_router(settings=settings, database=database, admin_bot=admin_bot)
     )

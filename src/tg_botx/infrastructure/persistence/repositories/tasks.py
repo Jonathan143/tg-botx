@@ -10,7 +10,9 @@ from sqlalchemy import (
 )
 
 from tg_botx.infrastructure.persistence.models import (
+    Account,
     Task,
+    TaskRun,
     WorkflowVersion,
     utc_now,
 )
@@ -152,3 +154,39 @@ class TasksRepository:
                     .order_by(WorkflowVersion.version_number.desc())
                 )
             )
+
+    def get_many(self, task_ids: list[str]) -> dict[str, Task]:
+        if not task_ids:
+            return {}
+        with self.session() as session:
+            return {
+                task.id: task for task in session.scalars(select(Task).where(Task.id.in_(task_ids)))
+            }
+
+    def load_related(
+        self, tasks: list[Task]
+    ) -> tuple[dict[str, Account], dict[str, list[WorkflowVersion]], set[str]]:
+        if not tasks:
+            return {}, {}, set()
+        task_ids = [task.id for task in tasks]
+        account_ids = {task.account_id for task in tasks}
+        with self.session() as session:
+            accounts = {
+                account.id: account
+                for account in session.scalars(select(Account).where(Account.id.in_(account_ids)))
+            }
+            versions: dict[str, list[WorkflowVersion]] = {}
+            for version in session.scalars(
+                select(WorkflowVersion)
+                .where(WorkflowVersion.task_id.in_(task_ids))
+                .order_by(WorkflowVersion.version_number.desc())
+            ):
+                versions.setdefault(version.task_id, []).append(version)
+            running = set(
+                session.scalars(
+                    select(TaskRun.task_id)
+                    .where(TaskRun.task_id.in_(task_ids), TaskRun.status == "running")
+                    .distinct()
+                )
+            )
+        return accounts, versions, running

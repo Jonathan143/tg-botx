@@ -6,25 +6,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 from tg_botx.config import Settings
+from tg_botx.infrastructure.observability.log_stream import LOG_PATTERN, log_secrets
 from tg_botx.infrastructure.observability.logging import allowed_log_files, redact_sensitive
-from tg_botx.interfaces.admin.constants import (
-    _LOG_PATTERN,
-)
 
 logger = logging.getLogger(__name__)
 
 
 def _read_log_entries(settings: Settings) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    secrets = [settings.api_hash or "", settings.database_url_override or ""]
-    if settings.admin_key:
-        secrets.append(settings.admin_key.get_secret_value())
-    if settings.notification_bot_token:
-        secrets.append(settings.notification_bot_token.get_secret_value())
-    if settings.admin_bot_token:
-        secrets.append(settings.admin_bot_token.get_secret_value())
-    if settings.bot_webhook_secret:
-        secrets.append(settings.bot_webhook_secret.get_secret_value())
+    secrets = log_secrets(settings)
     # Oldest backup first, current log last.
     paths = list(reversed(allowed_log_files(settings.log_path, settings.log_backup_count)))
     for path in paths:
@@ -34,7 +24,7 @@ def _read_log_entries(settings: Settings) -> list[dict[str, Any]]:
             continue
         for line in lines:
             safe_line = redact_sensitive(line, secrets)
-            matched = _LOG_PATTERN.match(safe_line)
+            matched = LOG_PATTERN.match(safe_line)
             if matched:
                 item = matched.groupdict()
                 item["source"] = path.name

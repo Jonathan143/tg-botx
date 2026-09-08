@@ -40,7 +40,7 @@ def _restore_signal_handlers(previous_handlers: dict[signal.Signals, Any]) -> No
         signal.signal(received, previous)
 
 
-def build_lifespan(service, keys, accounts, admin_bot, shutdown_event):
+def build_lifespan(service, keys, accounts, admin_bot, shutdown_event, log_stream):
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         rotation_task: asyncio.Task[None] | None = None
@@ -61,6 +61,7 @@ def build_lifespan(service, keys, accounts, admin_bot, shutdown_event):
                     rotation_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await rotation_task
+                await log_stream.close()
                 await admin_bot.close()
                 await accounts.close()
                 if started:

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import io
 import json
 import logging
-import time
 import zipfile
 from collections.abc import AsyncIterator
 from datetime import datetime
@@ -15,16 +13,16 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
 from tg_botx.config import Settings
+from tg_botx.infrastructure.observability.log_stream import LogStream
 from tg_botx.infrastructure.observability.logging import allowed_log_files, redact_sensitive
-from tg_botx.interfaces.admin.constants import (
-    LOG_EVENT_POLL_SECONDS,
-)
 from tg_botx.interfaces.admin.log_reader import _filter_logs, _read_log_entries
 
 logger = logging.getLogger(__name__)
 
 
-def build_router(settings: Settings, shutdown_event: asyncio.Event) -> APIRouter:
+def build_router(
+    settings: Settings, shutdown_event: asyncio.Event, log_stream: LogStream
+) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/logs")
@@ -36,7 +34,13 @@ def build_router(settings: Settings, shutdown_event: asyncio.Event) -> APIRouter
         started_from: datetime | None = Query(None, alias="from"),
         started_to: datetime | None = Query(None, alias="to"),
     ) -> dict[str, Any]:
-        entries = _filter_logs(_read_log_entries(settings), level, query, started_from, started_to)
+        entries = _filter_logs(
+            await asyncio.to_thread(_read_log_entries, settings),
+            level,
+            query,
+            started_from,
+            started_to,
+        )
         entries.reverse()
         start = (page - 1) * page_size
         return {
@@ -53,20 +57,32 @@ def build_router(settings: Settings, shutdown_event: asyncio.Event) -> APIRouter
         query: str | None = Query(None, max_length=200),
     ) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
-            seen = len(_filter_logs(_read_log_entries(settings), level, query, None, None))
-            last_keepalive = time.monotonic()
-            while not shutdown_event.is_set() and not await request.is_disconnected():
-                entries = _filter_logs(_read_log_entries(settings), level, query, None, None)
-                if len(entries) < seen:
-                    seen = 0
-                for item in entries[seen:]:
-                    yield f"event: log\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
-                seen = len(entries)
-                if time.monotonic() - last_keepalive >= 15:
-                    yield ": keepalive\n\n"
-                    last_keepalive = time.monotonic()
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=LOG_EVENT_POLL_SECONDS)
+            queue = await log_stream.subscribe()
+            try:
+                while not shutdown_event.is_set() and not await request.is_disconnected():
+                    incoming = asyncio.create_task(queue.get())
+                    stopping = asyncio.create_task(shutdown_event.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            {incoming, stopping}, timeout=15, return_when=asyncio.FIRST_COMPLETED
+                        )
+                    finally:
+                        for pending in (incoming, stopping):
+                            if not pending.done():
+                                pending.cancel()
+                        await asyncio.gather(incoming, stopping, return_exceptions=True)
+                    if stopping in done:
+                        return
+                    if incoming not in done:
+                        yield ": keepalive\n\n"
+                        continue
+                    entry = incoming.result()
+                    if entry is None:
+                        yield 'event: gap\ndata: {"message":"日志消费过慢，请刷新日志列表"}\n\n'
+                    elif _filter_logs([entry], level, query, None, None):
+                        yield f"event: log\ndata: {json.dumps(entry, ensure_ascii=False)}\n\n"
+            finally:
+                await log_stream.unsubscribe(queue)
 
         return StreamingResponse(
             events(),
