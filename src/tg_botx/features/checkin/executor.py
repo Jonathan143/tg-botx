@@ -2,66 +2,56 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 
 from tg_botx.features.checkin.condition import (
     ConditionEvaluationError,
-    ConditionInput,
-    ConditionVariable,
-    RegexBudget,
-    ValueType,
-    callback_data_values,
-    convert_value,
-    extract_variables,
     normalize_legacy_condition,
-    render_matcher_templates,
-    render_template,
-    select_branch,
 )
-from tg_botx.features.checkin.matching import match_button, matches
+from tg_botx.features.checkin.execution_types import CheckinError as CheckinError
+from tg_botx.features.checkin.execution_types import ExecutionContext as ExecutionContext
+from tg_botx.features.checkin.execution_types import StepReport
+from tg_botx.features.checkin.steps import (
+    click_button,
+    condition,
+    extract_variable,
+    http_request,
+    send_message,
+    wait_message,
+)
+from tg_botx.integrations.checkin_messages import TelegramMessageAdapter
+
+STEP_HANDLERS = {
+    "send_message": send_message.execute,
+    "wait_message": wait_message.execute,
+    "click_button": click_button.execute,
+    "http_request": http_request.execute,
+    "extract_variable": extract_variable.execute,
+    "condition": condition.execute,
+}
 
 
-class CheckinError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        bot_response: str | None = None,
-        bot_buttons: list[list[str]] | None = None,
-    ):
-        super().__init__(message)
-        self.bot_response = bot_response
-        self.bot_buttons = bot_buttons
-
-
-@dataclass(slots=True)
-class ExecutionContext:
-    entity: Any
-    bot_id: int | None
-    timezone: ZoneInfo
-    baseline: int
-    current_message: Any = None
-    last_wait_message: Any = None
-    last_wait_text: str | None = None
-    last_wait_metadata: dict[str, Any] = field(default_factory=dict)
-    last_clicked_callback_data_text: str | None = None
-    last_clicked_callback_data_base64: str | None = None
-    bot_response: str | None = None
-    bot_buttons: list[list[str]] | None = None
-    editable_message_ids: set[int] = field(default_factory=set)
-    editable_message_texts: dict[int, str] = field(default_factory=dict)
-    variables: dict[str, ConditionVariable] = field(default_factory=dict)
-    http_response: Any = None
-    http_responses: dict[str, Any] = field(default_factory=dict)
-    wait_messages: dict[str, str] = field(default_factory=dict)
-    wait_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+def callback_signature(callback: Callable[..., Awaitable[None]] | None) -> tuple[int, bool]:
+    if callback is None:
+        return 0, False
+    try:
+        parameters = tuple(inspect.signature(callback).parameters.values())
+    except (TypeError, ValueError):
+        return 0, True
+    return (
+        sum(
+            parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            for parameter in parameters
+        ),
+        any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters),
+    )
 
 
 class CheckinExecutor:
@@ -72,12 +62,28 @@ class CheckinExecutor:
         on_attempt: Callable[[int], Awaitable[None]] | None = None,
         on_step_status: Callable[..., Awaitable[None]] | None = None,
         on_step_response: Callable[..., Awaitable[None]] | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ):
+        self._http_client = http_client
+        self._owns_http_client = http_client is None
         self.client = client
+        self.messages = TelegramMessageAdapter(client)
         self.is_cancelled = is_cancelled or (lambda: False)
         self.on_attempt = on_attempt
         self.on_step_status = on_step_status
         self.on_step_response = on_step_response
+        self._status_signature = callback_signature(on_step_status)
+        self._response_signature = callback_signature(on_step_response)
+
+    def http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient()
+        return self._http_client
+
+    async def close(self) -> None:
+        if self._owns_http_client and self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
 
     async def begin_attempt(self, attempt: int) -> None:
         if self.on_attempt is not None:
@@ -97,21 +103,8 @@ class CheckinExecutor:
         callback = self.on_step_status
         if callback is None:
             return
-        try:
-            parameters = inspect.signature(callback).parameters.values()
-            positional = [
-                parameter
-                for parameter in parameters
-                if parameter.kind
-                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            has_varargs = any(
-                parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters
-            )
-        except (TypeError, ValueError):
-            has_varargs = True
-            positional = []
-        if len(positional) >= 8 or has_varargs:
+        positional_count, has_varargs = self._status_signature
+        if positional_count >= 8 or has_varargs:
             await callback(
                 index,
                 status,
@@ -122,7 +115,7 @@ class CheckinExecutor:
                 selected_branch,
                 condition_variables,
             )
-        elif len(positional) >= 4:
+        elif positional_count >= 4:
             await callback(index, status, error, duration_ms)
         else:
             # Preserve compatibility with the original three-argument hook.
@@ -139,25 +132,10 @@ class CheckinExecutor:
         callback = self.on_step_response
         if callback is None:
             return
-        try:
-            parameters = inspect.signature(callback).parameters.values()
-            positional = [
-                parameter
-                for parameter in parameters
-                if parameter.kind
-                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            has_varargs = any(
-                parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters
-            )
-        except (TypeError, ValueError):
-            # Some extension callables do not expose a signature.  The new
-            # callback form is the safest default for those callables.
-            has_varargs = True
-            positional = []
-        if len(positional) >= 5 or has_varargs:
+        positional_count, has_varargs = self._response_signature
+        if positional_count >= 5 or has_varargs:
             await callback(index, response, buttons, node_id, step_path)
-        elif len(positional) >= 3:
+        elif positional_count >= 3:
             await callback(index, response, buttons)
         else:
             # Keep compatibility with integrations using the original
@@ -166,141 +144,19 @@ class CheckinExecutor:
             await callback(index, response)
 
     async def _hydrate_message(self, entity: Any, message: Any) -> Any:
-        """Reload a message so event updates carry a usable Telegram client."""
-
-        get_messages = getattr(self.client, "get_messages", None)
-        if not callable(get_messages):
-            return message
-        try:
-            refreshed = await get_messages(entity, ids=message.id)
-        except Exception:
-            return message
-        if isinstance(refreshed, (list, tuple)):
-            refreshed = refreshed[0] if refreshed else None
-        return refreshed or message
+        return await self.messages._hydrate_message(entity, message)
 
     async def _message_buttons(
-        self,
-        message: Any,
-        entity: Any | None = None,
+        self, message: Any, entity: Any | None = None
     ) -> list[list[str]] | None:
-        """Return visible Telegram button labels while preserving rows."""
-
-        def read_buttons(value: Any) -> list[list[Any]]:
-            try:
-                buttons = getattr(value, "buttons", None) or []
-            except Exception:
-                buttons = []
-            if buttons:
-                return buttons
-            # ``Message.buttons`` needs a resolved client/input chat.  The
-            # raw reply markup still contains the visible labels, so use it
-            # as a rendering-only fallback when that context is unavailable.
-            try:
-                markup_rows = getattr(getattr(value, "reply_markup", None), "rows", None) or []
-                return [
-                    raw_row_buttons
-                    for raw_row in markup_rows
-                    if (raw_row_buttons := getattr(raw_row, "buttons", None))
-                ]
-            except Exception:
-                return []
-
-        buttons = read_buttons(message)
-        if not buttons and entity is not None:
-            refreshed = await self._hydrate_message(entity, message)
-            buttons = read_buttons(refreshed)
-        if not buttons:
-            get_buttons = getattr(message, "get_buttons", None)
-            if callable(get_buttons):
-                try:
-                    resolved = get_buttons()
-                    if inspect.isawaitable(resolved):
-                        resolved = await resolved
-                    buttons = read_buttons(message) or resolved or []
-                except Exception:
-                    # Button metadata is supplementary to the message text;
-                    # a failed refresh must not turn a successful wait into a
-                    # failed task.
-                    buttons = []
-
-        rows: list[list[str]] = []
-        for row in buttons:
-            labels = [
-                label
-                for label in (str(getattr(button, "text", "") or "") for button in row)
-                if label
-            ]
-            if labels:
-                rows.append(labels)
-        return rows or None
+        return await self.messages._message_buttons(message, entity)
 
     @staticmethod
     def _message_type(message: Any) -> str:
-        checks = (
-            ("sticker", "sticker"),
-            ("gif", "animation"),
-            ("video_note", "video_note"),
-            ("video", "video"),
-            ("voice", "voice"),
-            ("audio", "audio"),
-            ("photo", "photo"),
-            ("contact", "contact"),
-            ("venue", "venue"),
-            ("geo", "location"),
-            ("poll", "poll"),
-            ("dice", "dice"),
-            ("game", "game"),
-            ("invoice", "invoice"),
-            ("document", "document"),
-            ("action", "service"),
-        )
-        for attribute, label in checks:
-            try:
-                if getattr(message, attribute, None):
-                    return label
-            except Exception:
-                continue
-        if getattr(message, "raw_text", None) is not None:
-            return "text"
-        return "unknown"
+        return TelegramMessageAdapter._message_type(message)
 
     async def _condition_metadata(self, message: Any, entity: Any) -> dict[str, Any]:
-        sender = None
-        get_sender = getattr(message, "get_sender", None)
-        if callable(get_sender):
-            try:
-                sender = await get_sender()
-            except Exception:
-                sender = None
-        username = getattr(sender, "username", None) if sender is not None else None
-        first_name = getattr(sender, "first_name", None) if sender is not None else None
-        last_name = getattr(sender, "last_name", None) if sender is not None else None
-        display_name = " ".join(
-            part for part in (str(first_name or "").strip(), str(last_name or "").strip()) if part
-        )
-        if not display_name:
-            display_name = str(getattr(sender, "title", "") or username or "")
-        is_channel = bool(
-            getattr(message, "is_channel", False) or getattr(entity, "broadcast", False)
-        )
-        is_group = bool(getattr(message, "is_group", False) or getattr(entity, "megagroup", False))
-        chat_type = "channel" if is_channel and not is_group else "group" if is_group else "private"
-        return {
-            "sender.id": getattr(message, "sender_id", None),
-            "sender.username": username,
-            "sender.display_name": display_name or None,
-            "chat.id": getattr(message, "chat_id", None),
-            "chat.title": getattr(entity, "title", None),
-            "chat.username": getattr(entity, "username", None),
-            "chat.type": chat_type,
-            "message.id": getattr(message, "id", None),
-            "message.date": getattr(message, "date", None),
-            "message.text": getattr(message, "raw_text", None) or "",
-            "message.type": self._message_type(message),
-            "runtime.last_clicked_callback_data_text": None,
-            "runtime.last_clicked_callback_data_base64": None,
-        }
+        return await self.messages._condition_metadata(message, entity)
 
     @staticmethod
     def _step_identity(
@@ -333,7 +189,7 @@ class CheckinExecutor:
 
     async def execute(self, task: Any) -> str | None:
         entity = await self.client.get_entity(task.target)
-        bot = await self.client.get_entity(task.target)
+        bot = entity
         timezone_name = getattr(task, "timezone", None) or task.config.get("schedule", {}).get(
             "timezone", "Asia/Shanghai"
         )
@@ -343,8 +199,11 @@ class CheckinExecutor:
             timezone=ZoneInfo(str(timezone_name)),
             baseline=await self._latest_message_id(entity),
         )
-        await self._execute_steps(task.config["steps"], context, "steps", top_level=True)
-        return context.bot_response
+        try:
+            await self._execute_steps(task.config["steps"], context, "steps", top_level=True)
+            return context.bot_response
+        finally:
+            await self.close()
 
     async def _execute_steps(
         self,
@@ -377,258 +236,15 @@ class CheckinExecutor:
             def step_duration_ms(started_at: float = step_started_at) -> int:
                 return max(0, round((time.perf_counter() - started_at) * 1000))
 
-            step_response_reported = False
-            condition_reported = False
+            report = StepReport()
             step_label = f"步骤 {index + 1}" if index is not None else f"节点 {resolved_path}"
             try:
-                if kind == "send_message":
-                    text = render_template(str(step["text"]), context.variables)
-                    context.current_message = await self.client.send_message(context.entity, text)
-                    context.baseline = max(context.baseline, context.current_message.id)
-                    context.editable_message_ids.clear()
-                    context.editable_message_texts.clear()
-                elif kind == "wait_message":
-                    rendered_step = {
-                        **step,
-                        "success": render_matcher_templates(step.get("success"), context.variables),
-                        "failure": render_matcher_templates(step.get("failure"), context.variables),
-                    }
-                    context.current_message = await self._wait_for_message(
-                        entity=context.entity,
-                        bot_id=context.bot_id,
-                        baseline=context.baseline,
-                        step=rendered_step,
-                        timeout=step.get("timeout_seconds", 60),
-                        editable_message_ids=context.editable_message_ids,
-                        editable_message_texts=context.editable_message_texts,
-                    )
-                    context.current_message = await self._hydrate_message(
-                        context.entity, context.current_message
-                    )
-                    context.last_wait_message = context.current_message
-                    context.last_wait_text = context.current_message.raw_text or ""
-                    context.last_wait_metadata = await self._condition_metadata(
-                        context.current_message, context.entity
-                    )
-                    context.last_wait_metadata["runtime.last_clicked_callback_data_text"] = (
-                        context.last_clicked_callback_data_text
-                    )
-                    context.last_wait_metadata["runtime.last_clicked_callback_data_base64"] = (
-                        context.last_clicked_callback_data_base64
-                    )
-                    context.wait_messages[node_id or resolved_path] = context.last_wait_text
-                    context.wait_metadata[node_id or resolved_path] = dict(
-                        context.last_wait_metadata
-                    )
-                    context.bot_response = context.last_wait_text
-                    context.bot_buttons = await self._message_buttons(
-                        context.current_message, context.entity
-                    )
-                    if context.bot_buttons is None:
-                        await self.report_step_response(
-                            index,
-                            context.bot_response,
-                            node_id=node_id,
-                            step_path=resolved_path,
-                        )
-                    else:
-                        await self.report_step_response(
-                            index,
-                            context.bot_response,
-                            context.bot_buttons,
-                            node_id=node_id,
-                            step_path=resolved_path,
-                        )
-                    step_response_reported = True
-                    context.baseline = max(context.baseline, context.current_message.id)
-                    context.editable_message_ids.clear()
-                    context.editable_message_texts.clear()
-                elif kind == "click_button":
-                    if context.current_message is None:
-                        raise CheckinError("点击按钮步骤前没有可用的机器人消息")
-                    rendered_step = dict(step)
-                    for field in ("text", "text_contains", "callback_data"):
-                        if isinstance(rendered_step.get(field), str):
-                            rendered_step[field] = render_template(
-                                rendered_step[field], context.variables
-                            )
-                    context.current_message = await self._hydrate_message(
-                        context.entity, context.current_message
-                    )
-                    if not getattr(context.current_message, "buttons", None):
-                        get_buttons = getattr(context.current_message, "get_buttons", None)
-                        if callable(get_buttons):
-                            await get_buttons()
-                    button = match_button(context.current_message, rendered_step)
-                    context.editable_message_ids = {context.current_message.id}
-                    context.editable_message_texts = {
-                        context.current_message.id: context.current_message.raw_text or ""
-                    }
-                    await self._click(context.current_message, button, rendered_step)
-                    callback_value = getattr(button, "data", None)
-                    if callback_value is None:
-                        callback_value = rendered_step.get("callback_data")
-                    callback_text, callback_base64 = callback_data_values(callback_value)
-                    context.last_clicked_callback_data_text = callback_text
-                    context.last_clicked_callback_data_base64 = callback_base64
-                    context.last_wait_metadata["runtime.last_clicked_callback_data_text"] = (
-                        callback_text
-                    )
-                    context.last_wait_metadata["runtime.last_clicked_callback_data_base64"] = (
-                        callback_base64
-                    )
-                elif kind == "http_request":
-                    url = render_template(str(step["url"]), context.variables)
-                    try:
-                        headers = json.loads(step.get("headers") or "{}")
-                    except json.JSONDecodeError as exc:
-                        raise CheckinError("HTTP 请求头必须是有效 JSON") from exc
-                    if not isinstance(headers, dict):
-                        raise CheckinError("HTTP 请求头必须是 JSON 对象")
-                    if any(not isinstance(value, str) for value in headers.values()):
-                        raise CheckinError("HTTP 请求头的值必须是字符串")
-                    headers = {
-                        key: render_template(value, context.variables)
-                        for key, value in headers.items()
-                    }
-                    body = step.get("body")
-                    rendered_body = (
-                        render_template(body, context.variables) if isinstance(body, str) else None
-                    )
-                    kwargs: dict[str, Any] = {
-                        "headers": headers,
-                        "timeout": step.get("timeout_seconds", 30),
-                    }
-                    if rendered_body:
-                        try:
-                            kwargs["json"] = json.loads(rendered_body)
-                        except json.JSONDecodeError:
-                            kwargs["content"] = rendered_body
-                    async with httpx.AsyncClient() as client:
-                        response = await client.request(
-                            str(step.get("method", "GET")), url, **kwargs
-                        )
-                        response.raise_for_status()
-                    context.http_response = response
-                    context.http_responses[node_id or resolved_path] = response
-                    context.bot_response = response.text[:4000]
-                    await self.report_step_response(
-                        index, context.bot_response, node_id=node_id, step_path=resolved_path
-                    )
-                    step_response_reported = True
-                elif kind == "extract_variable":
-                    source_id = str(step.get("source_node_id") or "")
-                    source = step.get("source", "http_body")
-                    if source == "wait_message_text":
-                        if source_id and source_id not in context.wait_messages:
-                            raise CheckinError(f"等待消息数据源节点未执行或不存在：{source_id}")
-                        raw = (
-                            context.wait_messages.get(source_id)
-                            if source_id
-                            else context.last_wait_text
-                        )
-                        if raw is None and step.get("mode", "whole_text") != "metadata":
-                            raise CheckinError("等待消息前没有可提取的内容")
-                        metadata = (
-                            context.wait_metadata.get(source_id, {})
-                            if source_id
-                            else context.last_wait_metadata
-                        )
-                        extraction = {
-                            "name": step["name"],
-                            "source": "metadata"
-                            if step.get("mode") == "metadata"
-                            else step.get("extract_source", "message_text"),
-                            "mode": step.get("mode", "whole_text"),
-                            "value_type": step.get("value_type", "text"),
-                            "field": step.get("field"),
-                            "pattern": step.get("pattern"),
-                            "capture_group": step.get("capture_group", 1),
-                            "regex": step.get("regex") or {},
-                        }
-                        extract_variables(
-                            {"extracts": [extraction], "strict": True},
-                            ConditionInput(
-                                message_text=raw,
-                                metadata=metadata,
-                                timezone=context.timezone,
-                            ),
-                            context.variables,
-                            RegexBudget(),
-                        )
-                    else:
-                        source_response = (
-                            context.http_responses.get(source_id)
-                            if source_id
-                            else context.http_response
-                        )
-                        if source_response is None:
-                            raise CheckinError(
-                                f"HTTP 数据源节点未执行或不存在：{source_id}"
-                                if source_id
-                                else "变量提取节点前没有 HTTP 响应"
-                            )
-                        if source == "http_status":
-                            raw = str(source_response.status_code)
-                        elif source == "http_headers":
-                            raw = json.dumps(dict(source_response.headers), ensure_ascii=False)
-                        else:
-                            raw = source_response.text
-                        path = step.get("path")
-                        if path and source == "http_body":
-                            try:
-                                value: Any = source_response.json()
-                                for part in str(path).lstrip("$.").split("."):
-                                    value = (
-                                        value[int(part)] if isinstance(value, list) else value[part]
-                                    )
-                                raw = str(value)
-                            except (ValueError, KeyError, IndexError, TypeError) as exc:
-                                raise CheckinError(f"无法提取响应字段：{path}") from exc
-                        context.variables[str(step["name"])] = convert_value(
-                            str(step["name"]),
-                            raw,
-                            cast(ValueType, step.get("value_type", "text")),
-                            context.timezone,
-                        )
-                elif kind == "condition":
-                    selected_index, selected, extraction_results = select_branch(
-                        step,
-                        ConditionInput(
-                            message_text=context.last_wait_text,
-                            metadata=context.last_wait_metadata,
-                            timezone=context.timezone,
-                        ),
-                        context.variables,
-                    )
-                    selected_branch = {
-                        "index": selected_index,
-                        "kind": selected.get("kind"),
-                        "name": selected.get("name"),
-                    }
-                    await self.report_step_status(
-                        index,
-                        "success",
-                        duration_ms=step_duration_ms(),
-                        node_id=node_id,
-                        step_path=resolved_path,
-                        selected_branch=selected_branch,
-                        condition_variables=extraction_results,
-                    )
-                    condition_reported = True
-                    for branch_index, branch in enumerate(step.get("branches", [])):
-                        if branch_index != selected_index:
-                            await self._mark_steps_skipped(
-                                branch.get("steps") or [],
-                                f"{resolved_path}.branches[{branch_index}].steps",
-                            )
-                    await self._execute_steps(
-                        selected.get("steps") or [],
-                        context,
-                        f"{resolved_path}.branches[{selected_index}].steps",
-                    )
-                else:
+                handler = STEP_HANDLERS.get(kind)
+                if handler is None:
                     raise CheckinError(f"不支持的步骤类型：{kind}")
+                await handler(
+                    self, step, context, index, node_id, resolved_path, step_duration_ms, report
+                )
             except asyncio.CancelledError:
                 await self.report_step_status(
                     index,
@@ -668,7 +284,7 @@ class CheckinExecutor:
                 )
                 raise error from exc
             except CheckinError as exc:
-                if exc.bot_response is not None and not step_response_reported:
+                if exc.bot_response is not None and not report.response_reported:
                     context.bot_response = exc.bot_response
                     if exc.bot_buttons is None:
                         await self.report_step_response(
@@ -709,7 +325,7 @@ class CheckinExecutor:
                     step_path=resolved_path,
                 )
                 raise error from exc
-            if not condition_reported:
+            if not report.condition_reported:
                 await self.report_step_status(
                     index,
                     "success",
@@ -719,8 +335,7 @@ class CheckinExecutor:
                 )
 
     async def _latest_message_id(self, entity: Any) -> int:
-        message = await self.client.get_messages(entity, limit=1)
-        return message[0].id if message else 0
+        return await self.messages._latest_message_id(entity)
 
     async def _wait_for_message(
         self,
@@ -732,89 +347,12 @@ class CheckinExecutor:
         editable_message_ids: set[int] | None = None,
         editable_message_texts: dict[int, str] | None = None,
     ) -> Any:
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[Any] = loop.create_future()
-        editable_message_ids = editable_message_ids or set()
-        editable_message_texts = editable_message_texts or {}
-
-        async def inspect_message(message: Any) -> None:
-            """Resolve the waiter when a new matching bot message is found.
-
-            A response can arrive between the previous step and event-handler
-            registration.  Keeping the same matching logic in one function
-            lets us catch up from message history after registering handlers.
-            """
-            if future.done():
-                return
-            is_editable_message = message.id in editable_message_ids
-            if message.id <= baseline and not is_editable_message:
-                return
-            if is_editable_message and message.raw_text == editable_message_texts.get(message.id):
-                return
-            if bot_id is not None:
-                if getattr(message, "sender_id", None) != bot_id:
-                    return
-            else:
-                sender = await message.get_sender()
-                if not getattr(sender, "bot", False):
-                    return
-            text = message.raw_text or ""
-            if matches(text, step.get("failure")):
-                buttons = await self._message_buttons(message, entity)
-                future.set_exception(CheckinError("机器人返回失败消息", text, buttons))
-                return
-            success_rule = step.get("success")
-            if success_rule is None or matches(text, success_rule):
-                future.set_result(message)
-
-        async def handler(event: Any) -> None:
-            await inspect_message(event.message)
-
-        self.client.add_event_handler(handler, events.NewMessage(chats=entity))
-        self.client.add_event_handler(handler, events.MessageEdited(chats=entity))
-        try:
-            # Catch responses that were sent before the event handlers were
-            # attached.  Telegram returns newest messages first, so inspect in
-            # chronological order to preserve the event-handler semantics.
-            min_id = max(0, baseline - 1) if editable_message_ids else baseline
-            messages = await self.client.get_messages(entity, limit=50, min_id=min_id)
-            for message in reversed(messages or []):
-                await inspect_message(message)
-                if future.done():
-                    break
-            if future.done():
-                return await future
-            return await asyncio.wait_for(future, timeout=timeout)
-        finally:
-            self.client.remove_event_handler(handler, events.NewMessage(chats=entity))
-            self.client.remove_event_handler(handler, events.MessageEdited(chats=entity))
+        return await self.messages._wait_for_message(
+            entity, bot_id, baseline, step, timeout, editable_message_ids, editable_message_texts
+        )
 
     async def _click(self, message: Any, button: Any, selector: dict[str, Any]) -> None:
-        # Telethon's ``Message.click`` returns ``None`` without raising when
-        # the message is not attached to a client.  Treat that state as an
-        # actionable error so a workflow cannot report a false success.
-        if hasattr(message, "_client") and getattr(message, "_client", None) is None:
-            raise CheckinError("Telegram 消息未完成加载，无法点击按钮")
-        if selector.get("callback_data") is not None:
-            value = selector["callback_data"]
-            await message.click(data=value.encode() if isinstance(value, str) else value)
-            return
-        if selector.get("row") is not None and selector.get("column") is not None:
-            await message.click(selector["row"], selector["column"])
-            return
-        # A text match identifies a concrete button object, but resolving it
-        # again through ``Message.click(text=...)`` can lose the opaque
-        # callback payload (especially when labels contain emoji or invisible
-        # formatting).  Send the payload from the matched button directly so
-        # Telegram receives exactly the callback data that was inspected.
-        button_data = getattr(button, "data", None)
-        if button_data is not None:
-            await message.click(data=button_data)
-            return
-        # Resolve the action from the refreshed message instead of invoking a
-        # button object retained from an event update.  The latter may not
-        # carry the input chat/client and can silently do nothing.
-        await message.click(text=getattr(button, "text", ""))
+        return await self.messages._click(message, button, selector)
 
 
 async def run_with_retries(

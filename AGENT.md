@@ -31,15 +31,15 @@ tg-bot serve
 
 - `src/tg_botx/config.py`：环境变量、数据目录及日志配置。
 - `src/tg_botx/schemas.py`：任务 YAML 的 Pydantic 模型和输入校验。
-- `src/tg_botx/infrastructure/persistence/`：SQLAlchemy 模型、SQLite/PostgreSQL 初始化与数据访问。
+- `src/tg_botx/infrastructure/persistence/`：SQLAlchemy 模型、按版本迁移与按业务划分的 Repository；`db.py` 保留兼容门面。
 - `src/tg_botx/features/accounts/`：手机号和二维码登录、退出登录及 session 管理。
 - `src/tg_botx/features/checkin/`：消息执行、匹配规则和固定/随机调度。
-- `src/tg_botx/features/checkin/runtime.py`：客户端池、任务调度、并发锁、通知和取消。
-- `src/tg_botx/interfaces/`：Typer CLI、FastAPI 管理 API、账号和安全接口。
+- `src/tg_botx/features/checkin/runtime.py`：服务门面和生命周期；任务、发布、进度、调度及运行协调分别位于同包独立模块。
+- `src/tg_botx/interfaces/`：Typer CLI、FastAPI 管理路由及 Telegram 管理入口；账号业务位于 `features/accounts/`。
 - `src/tg_botx/application/`：CLI、API、worker 共用的依赖组装。
 - `src/tg_botx/core/`：不依赖基础设施的领域事件和稳定契约。
 - `src/tg_botx/features/`：自定义命令、频道通知、群监控等可组合业务能力。
-- `src/tg_botx/integrations/`：Telethon、Bot API 等外部系统适配器。
+- `src/tg_botx/integrations/`：Telethon、Bot API、客户端池和签到消息适配器。
 - 根目录旧模块：仅作兼容导出，新代码应使用上述子包路径。
 - `examples/`：可直接参考的任务 YAML。
 - `data/`：SQLite 数据库（使用 PostgreSQL 时仅保存 Telegram session 和运行日志）；属于本地持久化数据，不得提交。

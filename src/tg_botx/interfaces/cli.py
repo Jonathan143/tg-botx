@@ -1,23 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import typer
 
+from tg_botx.application.container import build_context, build_database
 from tg_botx.config import Settings
 from tg_botx.core.time import utc_isoformat
-from tg_botx.features.accounts.auth import AuthService
-from tg_botx.features.admin_bot import BotManagementService
-from tg_botx.features.checkin.runtime import CheckinService, TaskStateError
-from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
+from tg_botx.features.accounts.models import AdminAccountError
+from tg_botx.features.bot.management import BotManagementService
+from tg_botx.features.checkin.runtime import TaskNotFound, TaskStateError
+from tg_botx.features.checkin.schedule import schedule_from_task
 from tg_botx.infrastructure.observability.logging import IconFormatter, SensitiveDataFilter
-from tg_botx.infrastructure.persistence.db import Database, Task
+from tg_botx.infrastructure.persistence.db import Database
+from tg_botx.interfaces.account_console import AuthService
 from tg_botx.schemas import TaskDefinition
 
 app = typer.Typer(help="Telegram 用户账号签到调度器")
@@ -68,21 +67,20 @@ def resources(*, create_schema: bool = True) -> tuple[Settings, Database]:
     settings = Settings()
     settings.ensure_directories()
     configure_logging(settings)
-    database = Database(settings.database_url)
-    if create_schema:
-        database.create_all()
+    database = build_database(settings, initialize_schema=create_schema)
     return settings, database
 
 
 def create_server_app():
     """Create a fresh admin application for the Uvicorn worker process."""
-    settings, database = resources()
+    settings = Settings()
     settings.require_admin_config()
-
+    settings.ensure_directories()
+    configure_logging(settings)
+    context = build_context(settings)
     from tg_botx.interfaces.admin.admin_api import create_admin_app
 
-    service = CheckinService(settings, database)
-    return create_admin_app(settings, database, service)
+    return create_admin_app(settings, context.database, context.checkin, context=context)
 
 
 @app.command()
@@ -94,7 +92,10 @@ def login(
     if method not in {"qr", "phone"}:
         raise typer.BadParameter("必须是 qr 或 phone")
     settings, database = resources()
-    asyncio.run(AuthService(settings, database).login(account, method))
+    try:
+        asyncio.run(AuthService(settings, database).login(account, method))
+    except AdminAccountError as exc:
+        raise typer.BadParameter(exc.message) from exc
     typer.echo(f"账号 {account} 登录成功")
 
 
@@ -102,7 +103,10 @@ def login(
 def logout(account: str = typer.Option("default", "--account")):
     """退出 Telegram 登录并停用账号。"""
     settings, database = resources()
-    asyncio.run(AuthService(settings, database).logout(account))
+    try:
+        asyncio.run(AuthService(settings, database).logout(account))
+    except AdminAccountError as exc:
+        raise typer.BadParameter(exc.message) from exc
     typer.echo(f"账号 {account} 已退出登录")
 
 
@@ -110,24 +114,24 @@ def logout(account: str = typer.Option("default", "--account")):
 def create_bot_binding() -> None:
     """生成一个一次性 Telegram 管理 Bot 绑定码。"""
     settings, database = resources()
-    service = BotManagementService(database, CheckinService(settings, database))
+    service = BotManagementService(database)
     code, item = service.create_binding_code()
     typer.echo(f"绑定码：{code}")
-    typer.echo(f"有效期至：{item.expires_at.isoformat()}")
+    typer.echo(f"有效期至：{(utc_isoformat(item.expires_at) or '永久')}")
 
 
 @binding_app.command("list")
 def list_bot_bindings() -> None:
     """查看绑定码和当前已绑定的 Telegram 用户。"""
     settings, database = resources()
-    service = BotManagementService(database, CheckinService(settings, database))
+    service = BotManagementService(database)
     codes = service.binding_codes()
     bindings = service.bindings()
     if codes:
         typer.echo("绑定码：")
         for item in codes:
             typer.echo(
-                f"  {item.id}  *{item.hint}  {item.status}  expires={item.expires_at.isoformat()}"
+                f"  {item.id}  *{item.hint}  {item.status}  expires={(utc_isoformat(item.expires_at) or '永久')}"
             )
     else:
         typer.echo("暂无绑定码")
@@ -146,7 +150,7 @@ def list_bot_bindings() -> None:
 def revoke_bot_binding(binding_id: str) -> None:
     """撤销绑定码或已绑定用户。"""
     settings, database = resources()
-    service = BotManagementService(database, CheckinService(settings, database))
+    service = BotManagementService(database)
     if service.revoke_code(binding_id) or service.revoke_binding(binding_id):
         typer.echo("绑定已撤销")
         return
@@ -156,36 +160,15 @@ def revoke_bot_binding(binding_id: str) -> None:
 @task_app.command("create")
 def create_task(config: Path = typer.Option(..., "--config", exists=True, readable=True)):
     """从 YAML 创建签到任务。"""
-    _, database = resources()
+    settings, database = resources()
+    service = build_context(settings, database, initialize_schema=False).checkin
     try:
         definition = TaskDefinition.from_yaml(config)
-    except Exception as exc:
+        task = service.create_task(definition)
+    except (ValueError, TaskStateError) as exc:
         raise typer.BadParameter(f"配置无效：{exc}") from exc
-    account = database.get_account(definition.account)
-    if not account:
-        raise typer.BadParameter(f"账号不存在，请先登录：{definition.account}")
-    if database.get_task(definition.name):
-        raise typer.BadParameter(f"任务已存在：{definition.name}")
-    schedule = definition.schedule
-    if schedule.start_date is None:
-        schedule = schedule.model_copy(
-            update={"start_date": datetime.now(ZoneInfo(schedule.timezone)).date()}
-        )
-        definition = definition.model_copy(update={"schedule": schedule})
-    task = Task(
-        account_id=account.id,
-        name=definition.name,
-        target=definition.target,
-        timezone=schedule.timezone,
-        schedule_type=schedule.type,
-        fixed_time=schedule.time,
-        random_start=schedule.start,
-        random_end=schedule.end,
-        config_json=json.dumps(definition.model_dump(mode="json"), ensure_ascii=False),
-        enabled=False,
-        next_run_at=next_run_for(schedule, now=datetime.now(timezone.utc)),
-    )
-    database.save_task(task)
+    finally:
+        asyncio.run(service.close())
     logger.info("创建任务 task_id=%s name=%s enabled=%s", task.id, task.name, task.enabled)
     typer.echo(f"任务已创建：{task.name} ({task.id})，当前为停用状态")
 
@@ -231,24 +214,15 @@ def validate_task(task_id: str):
 @task_app.command("enable")
 def enable_task(task_id: str):
     """启用任务并安排下一次执行。"""
-    _, database = resources()
-    task = database.get_task(task_id)
-    if not task:
-        raise typer.BadParameter("任务不存在")
-    if database.get_latest_workflow_version(task.id) is None:
-        raise typer.BadParameter("请先发布工作流后再启用任务")
+    settings, database = resources()
+    service = build_context(settings, database, initialize_schema=False).checkin
     try:
-        next_run = next_run_for(schedule_from_task(task))
-    except ValueError as exc:
-        raise typer.BadParameter("调度规则没有可执行的未来时间") from exc
-    database.update_task(task.id, enabled=True, next_run_at=next_run)
-    logger.info(
-        "启用任务 task_id=%s name=%s next_run_at=%s",
-        task.id,
-        task.name,
-        utc_isoformat(next_run),
-    )
-    typer.echo(f"任务已启用，下次执行：{utc_isoformat(next_run)}")
+        task = service.enable_task(task_id)
+    except (TaskNotFound, TaskStateError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        asyncio.run(service.close())
+    typer.echo(f"任务已启用，下次执行：{utc_isoformat(task.next_run_at)}")
 
 
 @task_app.command("publish")
@@ -258,10 +232,10 @@ def publish_task(
 ):
     """发布当前任务的 main 工作流。"""
     settings, database = resources()
-    service = CheckinService(settings, database)
+    service = build_context(settings, database, initialize_schema=False).checkin
     try:
         version = service.publish_task(task_id, release_note)
-    except TaskStateError as exc:
+    except (TaskNotFound, TaskStateError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         asyncio.run(service.close())
@@ -271,12 +245,14 @@ def publish_task(
 @task_app.command("disable")
 def disable_task(task_id: str):
     """停用任务，不影响当前已经开始的执行。"""
-    _, database = resources()
-    task = database.get_task(task_id)
-    if not task:
-        raise typer.BadParameter("任务不存在")
-    database.update_task(task.id, enabled=False)
-    logger.info("停用任务 task_id=%s name=%s", task.id, task.name)
+    settings, database = resources()
+    service = build_context(settings, database, initialize_schema=False).checkin
+    try:
+        task = service.disable_task(task_id)
+    except (TaskNotFound, TaskStateError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        asyncio.run(service.close())
     typer.echo(f"任务已停用：{task.name}")
 
 
@@ -285,7 +261,7 @@ def run_task(task_id: str):
     """立即执行一次任务。"""
     settings, database = resources()
     logger.info("手动执行任务 task_id=%s", task_id)
-    service = CheckinService(settings, database)
+    service = build_context(settings, database, initialize_schema=False).checkin
 
     async def execute() -> bool:
         await service.start()
@@ -305,7 +281,7 @@ def run_task(task_id: str):
 def cancel_task(task_id: str):
     """取消正在执行的任务。"""
     settings, database = resources()
-    service = CheckinService(settings, database)
+    service = build_context(settings, database, initialize_schema=False).checkin
 
     async def cancel() -> bool:
         try:
