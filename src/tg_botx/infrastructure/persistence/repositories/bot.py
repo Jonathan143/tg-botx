@@ -9,6 +9,8 @@ from sqlalchemy import (
     or_,
     select,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from tg_botx.infrastructure.persistence.models import (
     PERMANENT_EXPIRY,
@@ -26,6 +28,20 @@ from tg_botx.infrastructure.persistence.models import (
 class BotRepository:
     def __init__(self, session_factory):
         self.session = session_factory
+
+    @staticmethod
+    def _begin_sqlite_write(session) -> None:
+        """Acquire SQLite's database-wide write lock before a read/modify/write flow.
+
+        SQLite does not implement ``SELECT ... FOR UPDATE``.  Starting an
+        IMMEDIATE transaction prevents two bot requests from both reading the
+        same uncommitted state and then racing during the subsequent update.
+        PostgreSQL callers rely on row-level locks instead.
+        """
+
+        bind = session.get_bind()
+        if bind.dialect.name == "sqlite":
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
 
     def create_bot_binding_code(
         self, code_hash: str, code_hint: str, expires_at: datetime | None, role: str = "user"
@@ -151,20 +167,23 @@ class BotRepository:
     ) -> BotBinding | None:
         now = utc_now()
         with self.session() as session:
+            self._begin_sqlite_write(session)
             item = session.scalar(
-                select(BotBindingCode).where(
+                select(BotBindingCode)
+                .where(
                     BotBindingCode.code_hash == code_hash,
                     BotBindingCode.used_at.is_(None),
                     BotBindingCode.revoked_at.is_(None),
                     or_(BotBindingCode.expires_at.is_(None), BotBindingCode.expires_at > now),
                 )
+                .with_for_update()
             )
             if item is None:
                 return None
             previous = session.scalar(
-                select(BotBinding).where(
-                    BotBinding.user_id == user_id, BotBinding.is_active.is_(True)
-                )
+                select(BotBinding)
+                .where(BotBinding.user_id == user_id, BotBinding.is_active.is_(True))
+                .with_for_update()
             )
             if previous is not None:
                 return None
@@ -248,6 +267,7 @@ class BotRepository:
         now = utc_now()
         today = now.date()
         with self.session() as session:
+            self._begin_sqlite_write(session)
             binding = session.scalar(
                 select(BotBinding).where(
                     BotBinding.user_id == user_id,
@@ -257,11 +277,32 @@ class BotRepository:
             )
             if binding is None:
                 return "not_bound", 0, 0
-            row = session.get(BotUserPoint, user_id)
+            row = session.scalar(
+                select(BotUserPoint).where(BotUserPoint.user_id == user_id).with_for_update()
+            )
             if row is None:
-                row = BotUserPoint(user_id=user_id, points=0)
-                session.add(row)
+                values = {"user_id": user_id, "points": 0}
+                dialect = session.get_bind().dialect.name
+                if dialect == "sqlite":
+                    session.execute(
+                        sqlite_insert(BotUserPoint)
+                        .values(**values)
+                        .on_conflict_do_nothing(index_elements=[BotUserPoint.user_id])
+                    )
+                elif dialect == "postgresql":
+                    session.execute(
+                        postgresql_insert(BotUserPoint)
+                        .values(**values)
+                        .on_conflict_do_nothing(index_elements=[BotUserPoint.user_id])
+                    )
+                else:
+                    session.add(BotUserPoint(**values))
                 session.flush()
+                row = session.scalar(
+                    select(BotUserPoint).where(BotUserPoint.user_id == user_id).with_for_update()
+                )
+                if row is None:
+                    raise RuntimeError("积分记录初始化失败")
             if row.last_checkin_date == today:
                 return "already", 0, row.points
             amount = secrets.randbelow(amount_max - amount_min + 1) + amount_min
