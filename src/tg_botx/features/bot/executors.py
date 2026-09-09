@@ -268,4 +268,4 @@ async def _ensure_public_dns_target(url: str) -> None:
         if not addresses or any(_is_private_address(address) for address in addresses):
             raise CommandExecutionError(
                 "HTTP 目标地址不能解析到本机、内网或保留地址"
-            )
+            ) from None
