@@ -45,7 +45,10 @@ def test_unsafe_and_invalid_executor_configs_are_rejected_before_persistence() -
         service.create_command_config("run", "运行代码", executor_type="python")
     with pytest.raises(BotCommandValidationError, match="内网"):
         service.create_command_config(
-            "hook", "内部回调", executor_type="http", executor_config={"url": "http://127.0.0.1"}
+            "hook",
+            "内部回调",
+            executor_type="http",
+            executor_config={"url": "http://127.0.0.1"},
         )
     assert rows == []
 

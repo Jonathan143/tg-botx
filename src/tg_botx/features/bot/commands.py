@@ -311,7 +311,9 @@ class BotCommandService:
             getattr(item, "command_type", "custom") != "system"
             and item.command not in {name for name, _ in DEFAULT_BOT_COMMANDS}
         )
-        executor_error = cls._executor_error(item, executor_type, executor_config) if is_custom else None
+        executor_error = (
+            cls._executor_error(item, executor_type, executor_config) if is_custom else None
+        )
         return {
             "command": item.command,
             "type": getattr(item, "command_type", "custom")

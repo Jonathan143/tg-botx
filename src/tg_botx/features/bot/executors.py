@@ -98,7 +98,9 @@ def validate_executor_config(
             )
         name = config.get("name")
         if not isinstance(name, str) or name not in BUILTINS:
-            raise CommandConfigError(f"未注册的内置函数，可用值：{', '.join(_BUILTIN_NAMES)}")
+            raise CommandConfigError(
+                f"未注册的内置函数，可用值：{', '.join(_BUILTIN_NAMES)}"
+            )
         return
     if executor_type == "http":
         _validate_http_config(config)
@@ -139,12 +141,18 @@ def _validate_http_config(config: dict[str, Any]) -> None:
         raise CommandConfigError("HTTP 超时必须在 1 至 30 秒之间")
 
     retries = config.get("retries", 0)
-    if isinstance(retries, bool) or not isinstance(retries, int) or not 0 <= retries <= _MAX_RETRIES:
+    if (
+        isinstance(retries, bool)
+        or not isinstance(retries, int)
+        or not 0 <= retries <= _MAX_RETRIES
+    ):
         raise CommandConfigError(f"HTTP retries 必须是 0 至 {_MAX_RETRIES} 的整数")
 
     headers = config.get("headers", {})
     if not isinstance(headers, dict) or len(headers) > _MAX_HEADERS:
-        raise CommandConfigError(f"HTTP headers 必须是最多 {_MAX_HEADERS} 项的字符串键值对象")
+        raise CommandConfigError(
+            f"HTTP headers 必须是最多 {_MAX_HEADERS} 项的字符串键值对象"
+        )
     for name, value in headers.items():
         if (
             not isinstance(name, str)
@@ -258,4 +266,6 @@ async def _ensure_public_dns_target(url: str) -> None:
             raise CommandExecutionError("HTTP 目标地址无法解析") from exc
         addresses = {str(info[4][0]) for info in infos if info and info[4]}
         if not addresses or any(_is_private_address(address) for address in addresses):
-            raise CommandExecutionError("HTTP 目标地址不能解析到本机、内网或保留地址")
+            raise CommandExecutionError(
+                "HTTP 目标地址不能解析到本机、内网或保留地址"
+            )
