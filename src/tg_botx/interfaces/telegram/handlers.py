@@ -8,6 +8,7 @@ from typing import Any
 
 from tg_botx.core.time import format_local_time
 from tg_botx.features.bot.management import BotManagementService
+from tg_botx.features.bot.executors import CommandExecutionError, execute_command
 from tg_botx.features.bot.models import (
     _CONFIRM_TTL_SECONDS,
     _PAGE_SIZE,
@@ -81,7 +82,15 @@ class BotMessageHandlers:
             await self._send(chat_id, "你没有权限调用该命令。")
             return
         if config.get("type") == "custom":
-            await self._send(chat_id, "该自定义指令的执行器尚未实现，请联系管理员。")
+            try:
+                result = await execute_command(
+                    config.get("executorType", "none"), config.get("executorConfig", {}), argument
+                )
+            except CommandExecutionError as exc:
+                logger.warning("自定义指令执行失败 command=%s error=%s", canonical_command, exc)
+                await self._send(chat_id, f"❌ 自定义指令执行失败：{html.escape(str(exc))}")
+            else:
+                await self._send(chat_id, result)
             return
         if command == "start":
             await self._send(chat_id, self._welcome(user_id, chat_id))
