@@ -90,7 +90,9 @@ class BotMessageHandlers:
                 logger.warning("自定义指令执行失败 command=%s error=%s", canonical_command, exc)
                 await self._send(chat_id, f"❌ 自定义指令执行失败：{html.escape(str(exc))}")
             else:
-                await self._send(chat_id, result)
+                # Custom executor responses are plain text. Escape them
+                # before sending because the Telegram adapter uses HTML mode.
+                await self._send(chat_id, html.escape(result))
             return
         if command == "start":
             await self._send(chat_id, self._welcome(user_id, chat_id))
