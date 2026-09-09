@@ -169,9 +169,7 @@ class BotCommandService:
             enabled,
             json.dumps(roles, ensure_ascii=False),
             menu_visible=menu_visible,
-            command_type="system"
-            if command in default_names
-            else None,
+            command_type="system" if command in default_names else None,
             executor_type=effective_executor_type,
             executor_config_json=json.dumps(
                 normalized_executor_config, ensure_ascii=False, separators=(",", ":")

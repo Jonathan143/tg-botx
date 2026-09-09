@@ -170,14 +170,26 @@ def _validate_http_config(config: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(method, str) or method.upper() not in _HTTP_METHODS:
         raise CustomCommandConfigError(f"HTTP method 只支持：{', '.join(sorted(_HTTP_METHODS))}")
     timeout = config.get("timeoutSeconds", 10)
-    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 1 <= timeout <= MAX_HTTP_TIMEOUT_SECONDS:
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not 1 <= timeout <= MAX_HTTP_TIMEOUT_SECONDS
+    ):
         raise CustomCommandConfigError(f"timeoutSeconds 必须在 1-{MAX_HTTP_TIMEOUT_SECONDS} 秒之间")
     retries = config.get("retries", 0)
-    if not isinstance(retries, int) or isinstance(retries, bool) or not 0 <= retries <= MAX_HTTP_RETRIES:
+    if (
+        not isinstance(retries, int)
+        or isinstance(retries, bool)
+        or not 0 <= retries <= MAX_HTTP_RETRIES
+    ):
         raise CustomCommandConfigError(f"retries 必须在 0-{MAX_HTTP_RETRIES} 之间")
     headers = config.get("headers", {})
-    if not isinstance(headers, dict) or len(headers) > 50 or any(
-        not isinstance(key, str) or not isinstance(item, str) for key, item in headers.items()
+    if (
+        not isinstance(headers, dict)
+        or len(headers) > 50
+        or any(
+            not isinstance(key, str) or not isinstance(item, str) for key, item in headers.items()
+        )
     ):
         raise CustomCommandConfigError("headers 必须是最多 50 项的字符串对象")
     if any(key.casefold() == "host" for key in headers):
@@ -198,15 +210,27 @@ def _validate_http_config(config: dict[str, Any]) -> dict[str, Any]:
         not isinstance(response_path, str)
         or not response_path
         or len(response_path) > 200
-        or any(not part or not re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in response_path.split("."))
+        or any(
+            not part or not re.fullmatch(r"[A-Za-z0-9_-]+", part)
+            for part in response_path.split(".")
+        )
     ):
         raise CustomCommandConfigError("responsePath 必须是点分隔的 JSON 字段路径")
     max_response = config.get("maxResponseBytes", MAX_HTTP_RESPONSE_BYTES)
-    if not isinstance(max_response, int) or isinstance(max_response, bool) or not 1 <= max_response <= MAX_HTTP_RESPONSE_BYTES:
+    if (
+        not isinstance(max_response, int)
+        or isinstance(max_response, bool)
+        or not 1 <= max_response <= MAX_HTTP_RESPONSE_BYTES
+    ):
         raise CustomCommandConfigError(f"maxResponseBytes 必须在 1-{MAX_HTTP_RESPONSE_BYTES} 之间")
     allowed_hosts = config.get("allowedHosts", [])
-    if not isinstance(allowed_hosts, list) or len(allowed_hosts) > 50 or any(
-        not isinstance(host, str) or not host.strip() or len(host) > 253 for host in allowed_hosts
+    if (
+        not isinstance(allowed_hosts, list)
+        or len(allowed_hosts) > 50
+        or any(
+            not isinstance(host, str) or not host.strip() or len(host) > 253
+            for host in allowed_hosts
+        )
     ):
         raise CustomCommandConfigError("allowedHosts 必须是最多 50 个主机名的数组")
     follow_redirects = config.get("followRedirects", False)
@@ -227,13 +251,25 @@ def _validate_http_config(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_script_config(config_type: str, config: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+def _validate_script_config(
+    config_type: str, config: dict[str, Any], *, enabled: bool
+) -> dict[str, Any]:
     code = config.get("code")
-    if not isinstance(code, str) or not code.strip() or len(code.encode("utf-8")) > MAX_SCRIPT_BYTES:
+    if (
+        not isinstance(code, str)
+        or not code.strip()
+        or len(code.encode("utf-8")) > MAX_SCRIPT_BYTES
+    ):
         raise CustomCommandConfigError(f"{config_type} 执行器需要不超过 16KB 的 code")
     timeout = config.get("timeoutSeconds", 2)
-    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= MAX_SCRIPT_TIMEOUT_SECONDS:
-        raise CustomCommandConfigError(f"timeoutSeconds 必须在 1-{MAX_SCRIPT_TIMEOUT_SECONDS} 秒之间")
+    if (
+        not isinstance(timeout, int)
+        or isinstance(timeout, bool)
+        or not 1 <= timeout <= MAX_SCRIPT_TIMEOUT_SECONDS
+    ):
+        raise CustomCommandConfigError(
+            f"timeoutSeconds 必须在 1-{MAX_SCRIPT_TIMEOUT_SECONDS} 秒之间"
+        )
     allow_execution = config.get("allowExecution", False)
     if not isinstance(allow_execution, bool):
         raise CustomCommandConfigError("allowExecution 必须是布尔值")
@@ -263,6 +299,7 @@ def _validate_python_code(code: str) -> None:
 
 def _substitute(value: Any, variables: dict[str, str]) -> Any:
     if isinstance(value, str):
+
         def replace(match: re.Match[str]) -> str:
             name = match.group(1)
             if name not in variables:
@@ -342,7 +379,9 @@ async def _execute_http(config: dict[str, Any], context: CustomCommandContext) -
                     await asyncio.sleep(min(2**attempt, 2))
                     continue
                 if not 200 <= response.status_code < 300:
-                    raise CustomCommandExecutorError(f"HTTP 执行器返回状态码 {response.status_code}")
+                    raise CustomCommandExecutorError(
+                        f"HTTP 执行器返回状态码 {response.status_code}"
+                    )
                 return _format_http_response(response, config)
             except CustomCommandExecutorError:
                 raise
@@ -368,7 +407,9 @@ def _format_http_response(response: httpx.Response, config: dict[str, Any]) -> s
                     value = value[part]
                 else:
                     raise CustomCommandExecutorError("HTTP 响应中不存在配置的 responsePath")
-        result = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+        result = (
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+        )
     else:
         result = response.text
     return result[:MAX_HTTP_OUTPUT_CHARS]
@@ -404,7 +445,9 @@ async def _assert_safe_target(parsed: Any, allowed_hosts: list[str]) -> None:
         raise CustomCommandExecutorError("HTTP 目标地址解析到了内网或保留 IP")
 
 
-async def _execute_script(executor_type: str, config: dict[str, Any], context: CustomCommandContext) -> str:
+async def _execute_script(
+    executor_type: str, config: dict[str, Any], context: CustomCommandContext
+) -> str:
     if not config["allowExecution"]:
         raise CustomCommandExecutorError(
             f"{executor_type} 执行器默认禁用，请在配置中显式设置 allowExecution=true"
@@ -433,7 +476,9 @@ async def _execute_script(executor_type: str, config: dict[str, Any], context: C
                 preexec_fn=_resource_limits(timeout_seconds) if os.name == "posix" else None,
             )
             stdout, _ = await asyncio.wait_for(
-                process.communicate(json.dumps(context.payload(), ensure_ascii=False).encode("utf-8")),
+                process.communicate(
+                    json.dumps(context.payload(), ensure_ascii=False).encode("utf-8")
+                ),
                 timeout=timeout_seconds + 1,
             )
         except TimeoutError as exc:
