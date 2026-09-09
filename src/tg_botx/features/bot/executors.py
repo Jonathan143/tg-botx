@@ -254,7 +254,7 @@ async def _ensure_public_dns_target(url: str) -> None:
             infos = await loop.run_in_executor(
                 None, socket.getaddrinfo, hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
             )
-        except (OSError, socket.gaierror) as exc:
+        except OSError as exc:
             raise CommandExecutionError("HTTP 目标地址无法解析") from exc
         addresses = {str(info[4][0]) for info in infos if info and info[4]}
         if not addresses or any(_is_private_address(address) for address in addresses):
