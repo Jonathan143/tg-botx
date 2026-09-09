@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from contextlib import suppress
 import ipaddress
 import json
 import os
@@ -20,6 +19,7 @@ import shutil
 import socket
 import sys
 import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
