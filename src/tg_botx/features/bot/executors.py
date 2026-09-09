@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from contextlib import suppress
 import ipaddress
 import json
 import os
@@ -335,10 +336,11 @@ async def _execute_http(config: dict[str, Any], context: CustomCommandContext) -
                 content = response.content
                 if len(content) > config["maxResponseBytes"]:
                     raise CustomCommandExecutorError("HTTP 响应超过配置的大小限制")
-                if response.status_code in {408, 429} or response.status_code >= 500:
-                    if attempt < retries:
-                        await asyncio.sleep(min(2**attempt, 2))
-                        continue
+                if (
+                    response.status_code in {408, 429} or response.status_code >= 500
+                ) and attempt < retries:
+                    await asyncio.sleep(min(2**attempt, 2))
+                    continue
                 if not 200 <= response.status_code < 300:
                     raise CustomCommandExecutorError(f"HTTP 执行器返回状态码 {response.status_code}")
                 return _format_http_response(response, config)
@@ -434,7 +436,7 @@ async def _execute_script(executor_type: str, config: dict[str, Any], context: C
                 process.communicate(json.dumps(context.payload(), ensure_ascii=False).encode("utf-8")),
                 timeout=timeout_seconds + 1,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             process.kill()
             await process.communicate()
             raise CustomCommandExecutorError("脚本执行超时") from exc
@@ -473,7 +475,7 @@ def _javascript_runner(code: str) -> str:
         "let output = '';\n"
         "const emit = (...values) => { if (output.length < 12288) output += values.map(String).join(' ') + '\\n'; };\n"
         "const sandbox = { context, JSON, Math, String, Number, Boolean, Array, Object, console: { log: emit, info: emit } };\n"
-        f"vm.runInNewContext({code!r}, sandbox, {timeout: 4500});\n"
+        f"vm.runInNewContext({code!r}, sandbox, {{timeout: 4500}});\n"
         "process.stdout.write(output.slice(0, 12288));\n"
     )
 
@@ -491,9 +493,7 @@ def _resource_limits(timeout_seconds: int):
         ):
             resource_name = getattr(resource, name, None)
             if resource_name is not None:
-                try:
+                with suppress(OSError, ValueError):
                     resource.setrlimit(resource_name, limits)
-                except (OSError, ValueError):
-                    pass
 
     return limit
