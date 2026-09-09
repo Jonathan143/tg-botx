@@ -129,6 +129,8 @@ def build_router(admin_bot: TelegramManagementBot) -> APIRouter:
                 body.allowed_roles,
                 menu_visible,
                 body.command,
+                body.executor_type,
+                body.executor_config,
             )
         except BotCommandConflictError as exc:
             raise APIError("COMMAND_CONFLICT", str(exc), 409) from exc

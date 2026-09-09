@@ -6,6 +6,10 @@ from collections.abc import Sequence
 from typing import Any
 
 from tg_botx.core.time import utc_isoformat
+from tg_botx.features.bot.executors import (
+    CustomCommandConfigError,
+    validate_executor_config,
+)
 from tg_botx.features.bot.models import (
     _ALL_COMMAND_ROLES,
     _COMMAND_NAME_PATTERN,
@@ -68,7 +72,7 @@ class BotCommandService:
                 if getattr(item, "command_type", "custom") in _COMMAND_TYPES
                 else "custom",
                 "description": item.description,
-                "enabled": item.enabled,
+                "enabled": self._effective_enabled(item),
                 "menuVisible": getattr(item, "menu_visible", item.enabled),
                 "allowedRoles": self._item_roles(item.command, item),
                 "executorType": getattr(item, "executor_type", "none")
@@ -77,6 +81,11 @@ class BotCommandService:
                 "executorConfig": self._item_executor_config(item),
                 "sortOrder": getattr(item, "sort_order", None),
                 "updatedAt": utc_isoformat(getattr(item, "updated_at", None)),
+                **(
+                    {"disabledReason": "自定义指令未配置可执行的执行器"}
+                    if self._effective_enabled(item) is False and item.enabled
+                    else {}
+                ),
             }
             for item in stored.values()
             if item.command not in default_names and _COMMAND_NAME_PATTERN.fullmatch(item.command)
@@ -98,6 +107,8 @@ class BotCommandService:
         allowed_roles: Sequence[str] | None = None,
         menu_visible: bool | None = None,
         new_command: str | None = None,
+        executor_type: str | None = None,
+        executor_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not _COMMAND_NAME_PATTERN.fullmatch(command):
             raise BotCommandValidationError("不支持该管理 Bot 指令")
@@ -108,6 +119,20 @@ class BotCommandService:
             (item for item in self.database.list_bot_command_configs() if item.command == command),
             None,
         )
+        default_names = {name for name, _ in DEFAULT_BOT_COMMANDS}
+        current_executor_type = getattr(current, "executor_type", "none") if current else "none"
+        current_executor_config = self._item_executor_config(current) if current else {}
+        effective_executor_type = executor_type or current_executor_type
+        effective_executor_config = (
+            executor_config if executor_config is not None else current_executor_config
+        )
+        if command in default_names:
+            if executor_type not in {None, "none"} or (
+                executor_config is not None and executor_config != {}
+            ):
+                raise BotCommandForbiddenError("系统指令不可配置自定义执行器")
+            effective_executor_type = "none"
+            effective_executor_config = {}
         target_command = (new_command or command).casefold().removeprefix("/")
         if not _COMMAND_NAME_PATTERN.fullmatch(target_command):
             raise BotCommandValidationError("不支持该管理 Bot 指令")
@@ -127,6 +152,17 @@ class BotCommandService:
         roles = self._normalize_roles(
             allowed_roles if allowed_roles is not None else self._item_roles(command, current)
         )
+        if command not in default_names:
+            try:
+                normalized_executor_config = validate_executor_config(
+                    effective_executor_type,
+                    effective_executor_config,
+                    enabled=enabled,
+                )
+            except CustomCommandConfigError as exc:
+                raise BotCommandValidationError(str(exc)) from exc
+        else:
+            normalized_executor_config = {}
         item = self.database.upsert_bot_command_config(
             command,
             description,
@@ -134,8 +170,12 @@ class BotCommandService:
             json.dumps(roles, ensure_ascii=False),
             menu_visible=menu_visible,
             command_type="system"
-            if command in {name for name, _ in DEFAULT_BOT_COMMANDS}
+            if command in default_names
             else None,
+            executor_type=effective_executor_type,
+            executor_config_json=json.dumps(
+                normalized_executor_config, ensure_ascii=False, separators=(",", ":")
+            ),
         )
         return self._command_item(item, roles=roles)
 
@@ -157,15 +197,12 @@ class BotCommandService:
             raise BotCommandValidationError("指令说明不能为空且不能超过 256 个字符")
         if command in {name for name, _ in DEFAULT_BOT_COMMANDS}:
             raise BotCommandConflictError("系统指令不可重复创建")
-        if executor_type not in _EXECUTOR_TYPES:
-            raise BotCommandValidationError("不支持的指令执行器")
         config = executor_config if executor_config is not None else {}
-        if not isinstance(config, dict):
-            raise BotCommandValidationError("执行器配置必须是 JSON 对象")
         try:
-            encoded_config = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
-        except (TypeError, ValueError) as exc:
-            raise BotCommandValidationError("执行器配置必须是合法 JSON") from exc
+            normalized_config = validate_executor_config(executor_type, config, enabled=enabled)
+        except (CustomCommandConfigError, TypeError, ValueError) as exc:
+            raise BotCommandValidationError(str(exc)) from exc
+        encoded_config = json.dumps(normalized_config, ensure_ascii=False, separators=(",", ":"))
         if len(encoded_config.encode("utf-8")) > _MAX_EXECUTOR_CONFIG_BYTES:
             raise BotCommandValidationError("执行器配置不能超过 32KB")
         roles = self._normalize_roles(allowed_roles or [])
@@ -231,13 +268,14 @@ class BotCommandService:
 
     @classmethod
     def _command_item(cls, item: Any, *, roles: list[str] | None = None) -> dict[str, Any]:
+        enabled = cls._effective_enabled(item)
         return {
             "command": item.command,
             "type": getattr(item, "command_type", "custom")
             if getattr(item, "command_type", "custom") in _COMMAND_TYPES
             else "custom",
             "description": item.description,
-            "enabled": item.enabled,
+            "enabled": enabled,
             "menuVisible": getattr(item, "menu_visible", item.enabled),
             "allowedRoles": roles if roles is not None else cls._item_roles(item.command, item),
             "executorType": getattr(item, "executor_type", "none")
@@ -246,7 +284,28 @@ class BotCommandService:
             "executorConfig": cls._item_executor_config(item),
             "sortOrder": getattr(item, "sort_order", None),
             "updatedAt": utc_isoformat(getattr(item, "updated_at", None)),
+            **(
+                {"disabledReason": "自定义指令未配置可执行的执行器"}
+                if enabled is False and item.enabled
+                else {}
+            ),
         }
+
+    @classmethod
+    def _effective_enabled(cls, item: Any) -> bool:
+        enabled = bool(getattr(item, "enabled", False))
+        command_type = getattr(item, "command_type", "custom")
+        executor_type = getattr(item, "executor_type", "none")
+        if command_type == "custom":
+            try:
+                validate_executor_config(
+                    executor_type,
+                    cls._item_executor_config(item),
+                    enabled=True,
+                )
+            except CustomCommandConfigError:
+                return False
+        return enabled
 
     @staticmethod
     def _menu_visible(item: dict[str, Any]) -> bool:

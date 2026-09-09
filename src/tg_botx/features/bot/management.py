@@ -166,9 +166,18 @@ class BotManagementService:
         allowed_roles: Sequence[str] | None = None,
         menu_visible: bool | None = None,
         new_command: str | None = None,
+        executor_type: str | None = None,
+        executor_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.commands.update_command_config(
-            command, description, enabled, allowed_roles, menu_visible, new_command
+            command,
+            description,
+            enabled,
+            allowed_roles,
+            menu_visible,
+            new_command,
+            executor_type,
+            executor_config,
         )
 
     def create_command_config(

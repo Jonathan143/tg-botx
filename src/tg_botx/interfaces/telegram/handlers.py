@@ -8,6 +8,11 @@ from typing import Any
 
 from tg_botx.core.time import format_local_time
 from tg_botx.features.bot.management import BotManagementService
+from tg_botx.features.bot.executors import (
+    CustomCommandContext,
+    CustomCommandExecutorError,
+    execute_custom_command,
+)
 from tg_botx.features.bot.models import (
     _CONFIRM_TTL_SECONDS,
     _PAGE_SIZE,
@@ -81,7 +86,15 @@ class BotMessageHandlers:
             await self._send(chat_id, "你没有权限调用该命令。")
             return
         if config.get("type") == "custom":
-            await self._send(chat_id, "该自定义指令的执行器尚未实现，请联系管理员。")
+            await self._custom_command(
+                chat_id,
+                user_id,
+                canonical_command,
+                argument,
+                text,
+                config,
+                update_number,
+            )
             return
         if command == "start":
             await self._send(chat_id, self._welcome(user_id, chat_id))
@@ -114,6 +127,53 @@ class BotMessageHandlers:
                 await self._send(chat_id, "请先绑定用户后再签到。")
         else:
             await self._send(chat_id, "无法识别该命令，请发送 /help 查看可用命令。")
+
+    async def _custom_command(
+        self,
+        chat_id: int,
+        user_id: int,
+        command: str,
+        argument: str,
+        text: str,
+        config: dict[str, Any],
+        update_id: int | None,
+    ) -> None:
+        try:
+            result = await execute_custom_command(
+                config.get("executorType", "none"),
+                config.get("executorConfig", {}),
+                CustomCommandContext(command, argument, text, user_id, chat_id),
+            )
+        except CustomCommandExecutorError as exc:
+            self.management.audit(
+                user_id,
+                chat_id,
+                command,
+                "failed",
+                update_id=update_id,
+                details=str(exc),
+            )
+            await self._send(chat_id, f"❌ 自定义指令执行失败：{html.escape(str(exc))}")
+            return
+        except Exception:
+            logger.exception("自定义指令执行异常 command=%s", command)
+            self.management.audit(
+                user_id,
+                chat_id,
+                command,
+                "failed",
+                update_id=update_id,
+                details="executor internal error",
+            )
+            await self._send(chat_id, "❌ 自定义指令执行失败，请联系管理员。")
+            return
+        self.management.audit(user_id, chat_id, command, "success", update_id=update_id)
+        if result:
+            # The Bot API client uses HTML parse mode. Escaping executor output
+            # prevents a remote response or script from injecting markup.
+            await self._send(chat_id, html.escape(result))
+        else:
+            await self._send(chat_id, "✅ 指令执行成功，但没有返回内容。")
 
     async def _bind(
         self, chat_id: int, user_id: int, user: dict[str, object], code: str, update_id: int | None

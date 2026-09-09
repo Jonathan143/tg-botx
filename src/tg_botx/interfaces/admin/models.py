@@ -65,6 +65,8 @@ class BotCommandBody(BaseModel):
     allowed_roles: list[CommandRole] | None = Field(
         default=None, alias="allowedRoles", max_length=3
     )
+    executor_type: ExecutorType | None = Field(default=None, alias="executorType")
+    executor_config: dict[str, Any] | None = Field(default=None, alias="executorConfig")
 
 
 class BotCommandCreateBody(BaseModel):
