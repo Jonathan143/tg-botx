@@ -288,3 +288,4 @@ notify_bot_response: false
 ```
 
 回复超过单条 Telegram 消息长度时，通知会自动分段发送。
+管理 Bot 自定义指令的前端接口契约见 [docs/frontend-bot-commands.md](docs/frontend-bot-commands.md)。
