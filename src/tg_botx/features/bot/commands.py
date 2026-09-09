@@ -71,9 +71,7 @@ class BotCommandService:
                 "enabled": item.enabled,
                 "menuVisible": getattr(item, "menu_visible", item.enabled),
                 "allowedRoles": self._item_roles(item.command, item),
-                "executorType": getattr(item, "executor_type", "none")
-                if getattr(item, "executor_type", "none") in _EXECUTOR_TYPES
-                else "none",
+                "executorType": self._item_executor_type(item),
                 "executorConfig": self._item_executor_config(item),
                 "sortOrder": getattr(item, "sort_order", None),
                 "updatedAt": utc_isoformat(getattr(item, "updated_at", None)),
@@ -216,6 +214,11 @@ class BotCommandService:
         if not roles:
             return list(_ALL_COMMAND_ROLES)
         return [str(role) for role in _ALL_COMMAND_ROLES if role in roles]
+
+    @staticmethod
+    def _item_executor_type(item: Any) -> str:
+        value = getattr(item, "executor_type", "none")
+        return value if value in _EXECUTOR_TYPES else "none"
 
     @staticmethod
     def _item_executor_config(item: Any) -> dict[str, Any]:
