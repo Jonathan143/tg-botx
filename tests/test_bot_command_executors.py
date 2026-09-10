@@ -95,25 +95,44 @@ def test_custom_command_service_update_enforces_size_limit() -> None:
     rows: list[SimpleNamespace] = []
 
     def upsert(command, description, enabled, allowed_roles_json, **kwargs):
-        item = SimpleNamespace(command=command, description=description, enabled=enabled,
-            allowed_roles_json=allowed_roles_json, command_type=kwargs.get("command_type", "custom"),
+        item = SimpleNamespace(
+            command=command,
+            description=description,
+            enabled=enabled,
+            allowed_roles_json=allowed_roles_json,
+            command_type=kwargs.get("command_type", "custom"),
             executor_type=kwargs.get("executor_type", "none"),
-            executor_config_json=kwargs.get("executor_config_json", "{}"))
+            executor_config_json=kwargs.get("executor_config_json", "{}"),
+        )
         rows.append(item)
         return item
 
-    database = SimpleNamespace(list_bot_command_configs=lambda: rows, upsert_bot_command_config=upsert)
+    database = SimpleNamespace(
+        list_bot_command_configs=lambda: rows, upsert_bot_command_config=upsert
+    )
     service = BotCommandService(database)
     service.create_command_config("report", "生成报告", enabled=False, executor_type="none")
     with pytest.raises(BotCommandValidationError, match="不能超过 32KB"):
-        service.update_command_config("report", "生成报告更新", enabled=False, executor_type="http",
-            executor_config={"url": "https://example.com/api", "body": {"data": "x" * (33 * 1024)}})
+        service.update_command_config(
+            "report",
+            "生成报告更新",
+            enabled=False,
+            executor_type="http",
+            executor_config={"url": "https://example.com/api", "body": {"data": "x" * (33 * 1024)}},
+        )
 
 
 def test_custom_command_service_does_not_rename_on_invalid_update() -> None:
-    row = SimpleNamespace(command="before", description="demo", enabled=True,
-        allowed_roles_json='["admin"]', command_type="custom", executor_type="builtin_function",
-        executor_config_json='{"name":"echo"}')
+    row = SimpleNamespace(
+        command="before",
+        description="demo",
+        enabled=True,
+        allowed_roles_json='["admin"]',
+        command_type="custom",
+        executor_type="builtin_function",
+        executor_config_json='{"name":"echo"}',
+    )
+
     class Database:
         def list_bot_command_configs(self):
             return [row]
@@ -124,10 +143,12 @@ def test_custom_command_service_does_not_rename_on_invalid_update() -> None:
 
         def upsert_bot_command_config(self, *args, **kwargs):
             raise AssertionError("must not persist")
+
     service = BotCommandService(Database())
     with pytest.raises(BotCommandValidationError):
-        service.update_command_config("before", "demo", True, new_command="after",
-            executor_type="http", executor_config={})
+        service.update_command_config(
+            "before", "demo", True, new_command="after", executor_type="http", executor_config={}
+        )
     assert row.command == "before"
 
 

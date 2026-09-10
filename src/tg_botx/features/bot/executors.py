@@ -376,7 +376,9 @@ async def _execute_http(config: dict[str, Any], context: CustomCommandContext) -
                 if parsed.hostname and not _is_ip_literal(parsed.hostname):
                     current_addresses = await _resolve_public_addresses(parsed)
                     if current_addresses != pinned_addresses:
-                        raise CustomCommandExecutorError("HTTP 目标主机解析结果发生变化，已拒绝请求")
+                        raise CustomCommandExecutorError(
+                            "HTTP 目标主机解析结果发生变化，已拒绝请求"
+                        )
                 request_kwargs: dict[str, Any] = {"headers": headers}
                 if body is not None:
                     if isinstance(body, (dict, list, int, float, bool)):
@@ -493,7 +495,16 @@ async def _execute_script(
         node = shutil.which("node")
         if node is None:
             raise CustomCommandExecutorError("当前环境未安装 Node.js，无法执行 JavaScript")
-        command = [node, "--permission", "--allow-fs-read=/dev/stdin", "--allow-fs-write=/dev/stdout", "--no-addons", "--frozen-intrinsics", "-e", _javascript_runner(config["code"])]
+        command = [
+            node,
+            "--permission",
+            "--allow-fs-read=/dev/stdin",
+            "--allow-fs-write=/dev/stdout",
+            "--no-addons",
+            "--frozen-intrinsics",
+            "-e",
+            _javascript_runner(config["code"]),
+        ]
         path = os.path.dirname(node)
     env = {"PATH": path, "PYTHONNOUSERSITE": "1", "LANG": "C.UTF-8"}
     with tempfile.TemporaryDirectory(prefix="tg-bot-command-") as directory:
