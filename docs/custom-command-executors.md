@@ -84,7 +84,7 @@ HTTP URL、请求头、请求体字符串和 builtin 的 `template` 支持以下
 }
 ```
 
-Python 脚本通过 `context` 读取上下文并通过 `print` 返回结果；JavaScript 脚本同样使用 `context`，通过 `console.log` 返回结果。脚本不能导入模块或访问文件、网络、进程 API，运行在一次性子进程、临时工作目录和资源限制下，超时或非零退出会返回执行失败。Python 代码最多 16KB、运行时间最多 5 秒；JavaScript 需要服务端安装 Node.js。
+Python 脚本通过 `context` 读取上下文并通过 `print` 返回结果；JavaScript 脚本同样使用 JSON 对象 `context`，通过 `console.log` 返回结果。JavaScript 要求 Node.js 20 或更高版本，并通过 Node Permission Model 禁止文件、网络、子进程、Worker、原生 addon 和 WASI 访问；Python 不能导入模块或访问文件、网络、进程 API。两者都运行在一次性子进程、临时工作目录和资源限制下，超时或非零退出会返回执行失败。Python/JavaScript 代码最多 16KB、运行时间最多 5 秒。
 
 对于不需要脚本的场景，优先使用 `http` 或 `builtin_function`。前端应在启用脚本执行器前展示风险提示，并将 `allowExecution` 明确显示为二次确认项。
 
@@ -95,4 +95,3 @@ Python 脚本通过 `context` 读取上下文并通过 `print` 返回结果；Ja
 ```
 
 执行成功后返回执行器输出；空输出返回“指令执行成功，但没有返回内容”。配置错误、HTTP 目标限制、超时和脚本失败都会返回带原因的失败消息，并写入管理 Bot 审计日志。执行器输出会按 Telegram HTML 消息规则进行转义，远程响应不能注入 Telegram 标记。
-

@@ -67,12 +67,14 @@ def test_executor_validation_rejects_unknown_builtin_and_unsafe_script() -> None
             {"code": "x = json.open('test')\nprint(x)", "allowExecution": True},
             enabled=True,
         )
-    with pytest.raises(CustomCommandConfigError, match="包含被禁止的运行时 API"):
+    with pytest.raises(CustomCommandConfigError, match="双下划线"):
         validate_executor_config(
             "javascript",
-            {"code": "console.log(this.constructor);", "allowExecution": True},
+            {"code": "console.log(context.__proto__);", "allowExecution": True},
             enabled=True,
         )
+    with pytest.raises(CustomCommandConfigError, match="responseFormat"):
+        validate_executor_config("http", {"url": "https://example.com", "responseFormat": []})
     with pytest.raises(CustomCommandConfigError, match="allowedHosts 白名单"):
         validate_executor_config("http", {"url": "https://{{arg0}}/test"}, enabled=True)
 
@@ -93,37 +95,34 @@ def test_custom_command_service_update_enforces_size_limit() -> None:
     rows: list[SimpleNamespace] = []
 
     def upsert(command, description, enabled, allowed_roles_json, **kwargs):
-        item = SimpleNamespace(
-            command=command,
-            description=description,
-            enabled=enabled,
-            allowed_roles_json=allowed_roles_json,
-            command_type=kwargs.get("command_type", "custom"),
+        item = SimpleNamespace(command=command, description=description, enabled=enabled,
+            allowed_roles_json=allowed_roles_json, command_type=kwargs.get("command_type", "custom"),
             executor_type=kwargs.get("executor_type", "none"),
-            executor_config_json=kwargs.get("executor_config_json", "{}"),
-        )
+            executor_config_json=kwargs.get("executor_config_json", "{}"))
         rows.append(item)
         return item
 
-    database = SimpleNamespace(
-        list_bot_command_configs=lambda: rows,
-        upsert_bot_command_config=upsert,
-    )
+    database = SimpleNamespace(list_bot_command_configs=lambda: rows, upsert_bot_command_config=upsert)
     service = BotCommandService(database)
     service.create_command_config("report", "生成报告", enabled=False, executor_type="none")
-
-    oversized_body = {"data": "x" * (33 * 1024)}
     with pytest.raises(BotCommandValidationError, match="不能超过 32KB"):
-        service.update_command_config(
-            "report",
-            "生成报告更新",
-            enabled=False,
-            executor_type="http",
-            executor_config={
-                "url": "https://example.com/api",
-                "body": oversized_body,
-            },
-        )
+        service.update_command_config("report", "生成报告更新", enabled=False, executor_type="http",
+            executor_config={"url": "https://example.com/api", "body": {"data": "x" * (33 * 1024)}})
+
+
+def test_custom_command_service_does_not_rename_on_invalid_update() -> None:
+    row = SimpleNamespace(command="before", description="demo", enabled=True,
+        allowed_roles_json='["admin"]', command_type="custom", executor_type="builtin_function",
+        executor_config_json='{"name":"echo"}')
+    class Database:
+        def list_bot_command_configs(self): return [row]
+        def rename_bot_command_config(self, old, new): row.command = new; return row
+        def upsert_bot_command_config(self, *args, **kwargs): raise AssertionError("must not persist")
+    service = BotCommandService(Database())
+    with pytest.raises(BotCommandValidationError):
+        service.update_command_config("before", "demo", True, new_command="after",
+            executor_type="http", executor_config={})
+    assert row.command == "before"
 
 
 @pytest.mark.asyncio
@@ -271,3 +270,9 @@ def test_chunk_message_avoids_splitting_html_entity() -> None:
     assert not chunks[0].endswith("&")
     assert chunks[0] == prefix
     assert chunks[1] == entity
+
+
+def test_chunk_message_always_advances_for_long_entity() -> None:
+    chunks = BotMessageHandlers._chunk_message("&" + "x" * 5000 + ";", max_chunk_size=4000)
+    assert "".join(chunks) == "&" + "x" * 5000 + ";"
+    assert all(chunks)

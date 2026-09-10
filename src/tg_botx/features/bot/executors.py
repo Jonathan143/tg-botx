@@ -62,11 +62,6 @@ _SCRIPT_FORBIDDEN_NAMES = {
     "sys",
     "type",
 }
-_JAVASCRIPT_FORBIDDEN = re.compile(
-    r"(?:^|[^A-Za-z0-9_$])(?:require|process|globalThis|global|Function|eval|WebAssembly|"
-    r"import|fetch|XMLHttpRequest|Deno|Bun|child_process|fs|net|http|constructor|prototype|"
-    r"mainModule|binding)(?:$|[^A-Za-z0-9_$])"
-)
 
 
 class CustomCommandExecutorError(RuntimeError):
@@ -211,7 +206,7 @@ def _validate_http_config(config: dict[str, Any]) -> dict[str, Any]:
         if len(encoded_body.encode("utf-8")) > 32 * 1024:
             raise CustomCommandConfigError("body 不能超过 32KB")
     response_format = config.get("responseFormat", "text")
-    if response_format not in {"text", "json"}:
+    if not isinstance(response_format, str) or response_format not in {"text", "json"}:
         raise CustomCommandConfigError("responseFormat 只能是 text 或 json")
     response_path = config.get("responsePath")
     if response_path is not None and (
@@ -289,8 +284,8 @@ def _validate_script_config(
     if config_type == "python":
         _validate_python_code(code)
     else:
-        if "__" in code or _JAVASCRIPT_FORBIDDEN.search(code):
-            raise CustomCommandConfigError("JavaScript code 包含被禁止的运行时 API")
+        if "__" in code:
+            raise CustomCommandConfigError("JavaScript code 不允许使用双下划线属性")
     return {"code": code, "timeoutSeconds": timeout, "allowExecution": allow_execution}
 
 
@@ -364,7 +359,7 @@ async def _execute_http(config: dict[str, Any], context: CustomCommandContext) -
     variables = context.variables()
     url = str(_substitute(config["url"], variables))
     parsed = urlsplit(url)
-    await _assert_safe_target(parsed, config["allowedHosts"])
+    pinned_addresses = await _assert_safe_target(parsed, config["allowedHosts"])
     headers = _substitute(config["headers"], variables)
     body = _substitute(config.get("body"), variables)
     timeout_seconds = float(config["timeoutSeconds"])
@@ -378,6 +373,10 @@ async def _execute_http(config: dict[str, Any], context: CustomCommandContext) -
     ) as client:
         for attempt in range(retries + 1):
             try:
+                if parsed.hostname and not _is_ip_literal(parsed.hostname):
+                    current_addresses = await _resolve_public_addresses(parsed)
+                    if current_addresses != pinned_addresses:
+                        raise CustomCommandExecutorError("HTTP 目标主机解析结果发生变化，已拒绝请求")
                 request_kwargs: dict[str, Any] = {"headers": headers}
                 if body is not None:
                     if isinstance(body, (dict, list, int, float, bool)):
@@ -434,7 +433,30 @@ def _format_http_response(raw_bytes: bytes, config: dict[str, Any]) -> str:
     return result[:MAX_HTTP_OUTPUT_CHARS]
 
 
-async def _assert_safe_target(parsed: Any, allowed_hosts: list[str]) -> None:
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+async def _resolve_public_addresses(parsed: Any) -> set[str]:
+    host = parsed.hostname
+    if not isinstance(host, str) or not host:
+        raise CustomCommandExecutorError("HTTP 目标地址无效")
+    try:
+        port = parsed.port or (80 if parsed.scheme == "http" else 443)
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM)
+    except (OSError, ValueError) as exc:
+        raise CustomCommandExecutorError("HTTP 目标主机无法解析") from exc
+    addresses = {item[4][0] for item in infos if item[4]}
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise CustomCommandExecutorError("HTTP 目标地址解析到了内网或保留 IP")
+    return addresses
+
+
+async def _assert_safe_target(parsed: Any, allowed_hosts: list[str]) -> set[str]:
     if parsed.username or parsed.password:
         raise CustomCommandExecutorError("HTTP 目标地址不允许携带用户名或密码")
     host = parsed.hostname
@@ -452,19 +474,8 @@ async def _assert_safe_target(parsed: Any, allowed_hosts: list[str]) -> None:
     if literal is not None:
         if not literal.is_global:
             raise CustomCommandExecutorError("HTTP 目标地址不允许访问内网或保留 IP")
-        return
-    try:
-        try:
-            default_port = 80 if getattr(parsed, "scheme", "https") == "http" else 443
-            port = parsed.port or default_port
-        except ValueError as exc:
-            raise CustomCommandExecutorError("HTTP 目标端口无效") from exc
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        raise CustomCommandExecutorError("HTTP 目标主机无法解析") from exc
-    addresses = {item[4][0] for item in infos if item[4]}
-    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
-        raise CustomCommandExecutorError("HTTP 目标地址解析到了内网或保留 IP")
+        return {str(literal)}
+    return await _resolve_public_addresses(parsed)
 
 
 async def _execute_script(
@@ -482,7 +493,7 @@ async def _execute_script(
         node = shutil.which("node")
         if node is None:
             raise CustomCommandExecutorError("当前环境未安装 Node.js，无法执行 JavaScript")
-        command = [node, "--no-addons", "-e", _javascript_runner(config["code"])]
+        command = [node, "--permission", "--allow-fs-read=/dev/stdin", "--allow-fs-write=/dev/stdout", "--no-addons", "--frozen-intrinsics", "-e", _javascript_runner(config["code"])]
         path = os.path.dirname(node)
     env = {"PATH": path, "PYTHONNOUSERSITE": "1", "LANG": "C.UTF-8"}
     with tempfile.TemporaryDirectory(prefix="tg-bot-command-") as directory:
@@ -495,7 +506,13 @@ async def _execute_script(
                 cwd=directory,
                 env=env,
                 start_new_session=True,
-                preexec_fn=_resource_limits(timeout_seconds) if os.name == "posix" else None,
+                preexec_fn=(
+                    _resource_limits(timeout_seconds, memory_bytes=2 * 1024 * 1024 * 1024)
+                    if executor_type == "javascript" and os.name == "posix"
+                    else _resource_limits(timeout_seconds)
+                    if os.name == "posix"
+                    else None
+                ),
             )
             stdout, _ = await asyncio.wait_for(
                 process.communicate(
@@ -540,50 +557,32 @@ def _python_runner(code: str) -> str:
 
 
 def _javascript_runner(code: str) -> str:
+    # JavaScript runs directly in a permission-restricted child process. The
+    # Node permission model blocks filesystem, network, child-process, addon,
+    # and worker access; unlike node:vm it is an OS-enforced boundary.
     return (
-        "const fs = require('fs'); const vm = require('vm');\n"
-        "const rawContext = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
-        "const sanitize = (val) => {\n"
-        "  if (val && typeof val === 'object') {\n"
-        "    Object.setPrototypeOf(val, null);\n"
-        "    for (const k of Object.keys(val)) sanitize(val[k]);\n"
-        "  }\n"
-        "  return val;\n"
-        "};\n"
-        "sanitize(rawContext);\n"
+        "const fs = require('fs');\n"
+        "const context = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
         "let output = '';\n"
         "const emit = (...values) => { if (output.length < 12288) output += values.map(String).join(' ') + '\\n'; };\n"
-        "Object.setPrototypeOf(emit, null);\n"
-        "delete emit.constructor;\n"
-        "const sandbox = Object.create(null);\n"
-        "sandbox.context = rawContext;\n"
-        "sandbox.JSON = JSON;\n"
-        "sandbox.Math = Math;\n"
-        "sandbox.console = Object.create(null);\n"
-        "sandbox.console.log = emit;\n"
-        "sandbox.console.info = emit;\n"
-        "const ctx = vm.createContext(sandbox);\n"
-        "vm.runInContext(\n"
-        "  'for (const C of [Object, Function, Array, String, Number, Boolean, RegExp, Symbol, Map, Set, Promise]) { ' +\n"
-        "  '  if (C && C.prototype) { delete C.prototype.constructor; Object.freeze(C.prototype); Object.freeze(C); } ' +\n"
-        "  '}',\n"
-        "  ctx\n"
-        ");\n"
-        f"vm.runInContext({code!r}, ctx, {{timeout: 4500}});\n"
+        "const console = Object.freeze({log: emit, info: emit});\n"
+        f"{code}\n"
         "process.stdout.write(output.slice(0, 12288));\n"
     )
 
 
-def _resource_limits(timeout_seconds: int):
+def _resource_limits(timeout_seconds: int, *, memory_bytes: int = 512 * 1024 * 1024):
     def limit() -> None:
         import resource
 
         cpu = timeout_seconds + 1
         for name, limits in (
             ("RLIMIT_CPU", (cpu, cpu)),
-            ("RLIMIT_AS", (128 * 1024 * 1024, 128 * 1024 * 1024)),
+            ("RLIMIT_AS", (memory_bytes, memory_bytes)),
             ("RLIMIT_FSIZE", (128 * 1024, 128 * 1024)),
-            ("RLIMIT_NOFILE", (32, 32)),
+            # Node needs more than 32 descriptors during startup; this still
+            # prevents descriptor exhaustion by user code.
+            ("RLIMIT_NOFILE", (256, 256)),
         ):
             resource_name = getattr(resource, name, None)
             if resource_name is not None:

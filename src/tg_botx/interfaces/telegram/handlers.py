@@ -421,7 +421,10 @@ class BotMessageHandlers:
             if end < len(text):
                 amp = text.rfind("&", start, end)
                 if amp != -1 and text.find(";", amp, end) == -1:
-                    end = amp
+                    # Never let an entity boundary leave the cursor in place.
+                    # A malicious/remote response may start with an entity
+                    # longer than one Telegram chunk.
+                    end = amp if amp > start else min(start + max_chunk_size, len(text))
                 else:
                     nl = text.rfind("\n", start + max_chunk_size - 500, end)
                     if nl != -1:

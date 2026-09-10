@@ -7,7 +7,6 @@ from typing import Any
 
 from tg_botx.core.time import utc_isoformat
 from tg_botx.features.bot.executors import (
-    BUILTIN_FUNCTIONS,
     CustomCommandConfigError,
     validate_executor_config,
 )
@@ -137,7 +136,8 @@ class BotCommandService:
         target_command = (new_command or command).casefold().removeprefix("/")
         if not _COMMAND_NAME_PATTERN.fullmatch(target_command):
             raise BotCommandValidationError("不支持该管理 Bot 指令")
-        if target_command != command:
+        renaming_from = command if target_command != command else None
+        if renaming_from is not None:
             if command in {name for name, _ in DEFAULT_BOT_COMMANDS}:
                 raise BotCommandForbiddenError("系统指令不可修改指令名")
             if target_command in {name for name, _ in DEFAULT_BOT_COMMANDS}:
@@ -146,10 +146,6 @@ class BotCommandService:
                 item.command == target_command for item in self.database.list_bot_command_configs()
             ):
                 raise BotCommandConflictError("该管理 Bot 指令已存在")
-            renamed = self.database.rename_bot_command_config(command, target_command)
-            if renamed is None:
-                raise ValueError("指令不存在")
-            command = target_command
         roles = self._normalize_roles(
             allowed_roles if allowed_roles is not None else self._item_roles(command, current)
         )
@@ -169,6 +165,11 @@ class BotCommandService:
         )
         if len(encoded_executor_config.encode("utf-8")) > _MAX_EXECUTOR_CONFIG_BYTES:
             raise BotCommandValidationError("执行器配置不能超过 32KB")
+        if renaming_from is not None:
+            renamed = self.database.rename_bot_command_config(renaming_from, target_command)
+            if renamed is None:
+                raise ValueError("指令不存在")
+            command = target_command
         item = self.database.upsert_bot_command_config(
             command,
             description,
@@ -299,14 +300,10 @@ class BotCommandService:
         command_type = getattr(item, "command_type", "custom")
         executor_type = getattr(item, "executor_type", "none")
         if command_type == "custom":
-            if executor_type == "none":
-                return False
             config = cls._item_executor_config(item)
-            if executor_type in {"python", "javascript"} and not config.get("allowExecution"):
-                return False
-            if executor_type == "builtin_function" and config.get("name") not in BUILTIN_FUNCTIONS:
-                return False
-            if executor_type == "http" and not config.get("url"):
+            try:
+                validate_executor_config(executor_type, config, enabled=True)
+            except (CustomCommandConfigError, TypeError, ValueError):
                 return False
         return enabled
 
