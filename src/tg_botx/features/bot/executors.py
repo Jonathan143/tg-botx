@@ -452,7 +452,11 @@ async def _resolve_public_addresses(parsed: Any) -> set[str]:
         infos = await asyncio.to_thread(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM)
     except (OSError, ValueError) as exc:
         raise CustomCommandExecutorError("HTTP 目标主机无法解析") from exc
-    addresses = {item[4][0] for item in infos if item[4]}
+    addresses: set[str] = set()
+    for item in infos:
+        sockaddr = item[4]
+        if sockaddr and isinstance(sockaddr[0], str):
+            addresses.add(sockaddr[0])
     if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise CustomCommandExecutorError("HTTP 目标地址解析到了内网或保留 IP")
     return addresses
