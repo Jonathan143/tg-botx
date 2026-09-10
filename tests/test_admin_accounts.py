@@ -149,7 +149,7 @@ def test_qr_timeout_refreshes_url_and_completes(manager_parts):
     async def scenario():
         settings, database = manager_parts
         scanned = asyncio.Event()
-        first = FakeQrLogin("tg://login?token=first", asyncio.TimeoutError())
+        first = FakeQrLogin("tg://login?token=first", TimeoutError())
         second = FakeQrLogin("tg://login?token=second", scanned)
         client = FakeTelegramClient(qr_logins=(first, second))
         manager = LoginFlowManager(settings, database, client_factory=ClientFactory(client))

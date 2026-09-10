@@ -7,6 +7,7 @@ from typing import Any
 
 from tg_botx.core.time import utc_isoformat
 from tg_botx.features.bot.executors import (
+    BUILTIN_FUNCTIONS,
     CustomCommandConfigError,
     validate_executor_config,
 )
@@ -163,6 +164,11 @@ class BotCommandService:
                 raise BotCommandValidationError(str(exc)) from exc
         else:
             normalized_executor_config = {}
+        encoded_executor_config = json.dumps(
+            normalized_executor_config, ensure_ascii=False, separators=(",", ":")
+        )
+        if len(encoded_executor_config.encode("utf-8")) > _MAX_EXECUTOR_CONFIG_BYTES:
+            raise BotCommandValidationError("执行器配置不能超过 32KB")
         item = self.database.upsert_bot_command_config(
             command,
             description,
@@ -171,9 +177,7 @@ class BotCommandService:
             menu_visible=menu_visible,
             command_type="system" if command in default_names else None,
             executor_type=effective_executor_type,
-            executor_config_json=json.dumps(
-                normalized_executor_config, ensure_ascii=False, separators=(",", ":")
-            ),
+            executor_config_json=encoded_executor_config,
         )
         return self._command_item(item, roles=roles)
 
@@ -295,13 +299,14 @@ class BotCommandService:
         command_type = getattr(item, "command_type", "custom")
         executor_type = getattr(item, "executor_type", "none")
         if command_type == "custom":
-            try:
-                validate_executor_config(
-                    executor_type,
-                    cls._item_executor_config(item),
-                    enabled=True,
-                )
-            except CustomCommandConfigError:
+            if executor_type == "none":
+                return False
+            config = cls._item_executor_config(item)
+            if executor_type in {"python", "javascript"} and not config.get("allowExecution"):
+                return False
+            if executor_type == "builtin_function" and config.get("name") not in BUILTIN_FUNCTIONS:
+                return False
+            if executor_type == "http" and not config.get("url"):
                 return False
         return enabled
 

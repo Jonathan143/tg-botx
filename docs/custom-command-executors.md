@@ -51,7 +51,7 @@ HTTP URL、请求头、请求体字符串和 builtin 的 `template` 支持以下
 ### `http`
 
 - `url` 必填；仅支持 `https`，使用明文 `http` 时必须显式设置 `allowInsecureHttp: true`。
-- `allowedHosts` 可选；填写后目标主机必须精确匹配列表。
+- `allowedHosts` 可选；填写后目标主机必须精确匹配列表；当 url 主机名包含模板变量时必须显式配置以防范 SSRF。
 - 禁止 URL 用户名/密码、`Host` 请求头和重定向；目标 DNS 解析到内网、回环、链路本地、保留或非全球 IP 时会拒绝请求。
 - `method` 支持 `GET`、`POST`、`PUT`、`PATCH`、`DELETE`、`HEAD`。
 - `timeoutSeconds` 范围为 1–30，`retries` 范围为 0–3。网络错误和 408/429/5xx 响应才会重试。

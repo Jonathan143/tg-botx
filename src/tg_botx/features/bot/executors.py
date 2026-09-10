@@ -41,23 +41,31 @@ _HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}
 _SCRIPT_FORBIDDEN_NAMES = {
     "__import__",
     "breakpoint",
+    "builtins",
     "compile",
+    "delattr",
     "eval",
     "exec",
+    "getattr",
     "globals",
+    "hasattr",
     "input",
     "locals",
+    "object",
     "open",
     "os",
     "pathlib",
+    "setattr",
     "shutil",
     "socket",
     "subprocess",
     "sys",
+    "type",
 }
 _JAVASCRIPT_FORBIDDEN = re.compile(
-    r"(?:^|[^A-Za-z0-9_$])(?:require|process|globalThis|Function|eval|WebAssembly|"
-    r"import|fetch|XMLHttpRequest|Deno|Bun|child_process|fs|net|http)(?:$|[^A-Za-z0-9_$])"
+    r"(?:^|[^A-Za-z0-9_$])(?:require|process|globalThis|global|Function|eval|WebAssembly|"
+    r"import|fetch|XMLHttpRequest|Deno|Bun|child_process|fs|net|http|constructor|prototype|"
+    r"mainModule|binding)(?:$|[^A-Za-z0-9_$])"
 )
 
 
@@ -233,6 +241,9 @@ def _validate_http_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     ):
         raise CustomCommandConfigError("allowedHosts 必须是最多 50 个主机名的数组")
+    raw_parsed = urlsplit(url.strip())
+    if _COMMAND_VARIABLE.search(raw_parsed.netloc or "") and not allowed_hosts:
+        raise CustomCommandConfigError("url 主机名包含变量时必须显式配置 allowedHosts 白名单")
     follow_redirects = config.get("followRedirects", False)
     if follow_redirects is not False:
         raise CustomCommandConfigError("为避免绕过目标限制，followRedirects 必须为 false")
@@ -293,8 +304,11 @@ def _validate_python_code(code: str) -> None:
             raise CustomCommandConfigError("Python code 不允许 import")
         if isinstance(node, ast.Name) and node.id in _SCRIPT_FORBIDDEN_NAMES:
             raise CustomCommandConfigError(f"Python code 不允许使用 {node.id}")
-        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
-            raise CustomCommandConfigError("Python code 不允许访问下划线属性")
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                raise CustomCommandConfigError("Python code 不允许访问下划线属性")
+            if node.attr in _SCRIPT_FORBIDDEN_NAMES:
+                raise CustomCommandConfigError(f"Python code 不允许访问 {node.attr}")
 
 
 def _substitute(value: Any, variables: dict[str, str]) -> Any:
@@ -355,6 +369,7 @@ async def _execute_http(config: dict[str, Any], context: CustomCommandContext) -
     body = _substitute(config.get("body"), variables)
     timeout_seconds = float(config["timeoutSeconds"])
     retries = int(config["retries"])
+    max_response_bytes = int(config["maxResponseBytes"])
     last_error: Exception | None = None
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 5.0)),
@@ -369,20 +384,24 @@ async def _execute_http(config: dict[str, Any], context: CustomCommandContext) -
                         request_kwargs["json"] = body
                     else:
                         request_kwargs["content"] = str(body)
-                response = await client.request(config["method"], url, **request_kwargs)
-                content = response.content
-                if len(content) > config["maxResponseBytes"]:
-                    raise CustomCommandExecutorError("HTTP 响应超过配置的大小限制")
-                if (
-                    response.status_code in {408, 429} or response.status_code >= 500
-                ) and attempt < retries:
-                    await asyncio.sleep(min(2**attempt, 2))
-                    continue
-                if not 200 <= response.status_code < 300:
-                    raise CustomCommandExecutorError(
-                        f"HTTP 执行器返回状态码 {response.status_code}"
-                    )
-                return _format_http_response(response, config)
+                async with client.stream(config["method"], url, **request_kwargs) as response:
+                    if (
+                        response.status_code in {408, 429} or response.status_code >= 500
+                    ) and attempt < retries:
+                        await asyncio.sleep(min(2**attempt, 2))
+                        continue
+                    if not 200 <= response.status_code < 300:
+                        raise CustomCommandExecutorError(
+                            f"HTTP 执行器返回状态码 {response.status_code}"
+                        )
+                    chunks: list[bytes] = []
+                    total_bytes = 0
+                    async for chunk in response.aiter_bytes():
+                        total_bytes += len(chunk)
+                        if total_bytes > max_response_bytes:
+                            raise CustomCommandExecutorError("HTTP 响应超过配置的大小限制")
+                        chunks.append(chunk)
+                    return _format_http_response(b"".join(chunks), config)
             except CustomCommandExecutorError:
                 raise
             except (httpx.HTTPError, TimeoutError) as exc:
@@ -394,11 +413,11 @@ async def _execute_http(config: dict[str, Any], context: CustomCommandContext) -
     raise CustomCommandExecutorError("HTTP 执行器请求失败或超时") from last_error
 
 
-def _format_http_response(response: httpx.Response, config: dict[str, Any]) -> str:
+def _format_http_response(raw_bytes: bytes, config: dict[str, Any]) -> str:
     if config["responseFormat"] == "json":
         try:
-            value: Any = response.json()
-        except ValueError as exc:
+            value: Any = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
             raise CustomCommandExecutorError("HTTP 响应不是合法 JSON") from exc
         path = config.get("responsePath")
         if path:
@@ -411,11 +430,13 @@ def _format_http_response(response: httpx.Response, config: dict[str, Any]) -> s
             value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
         )
     else:
-        result = response.text
+        result = raw_bytes.decode("utf-8", errors="replace")
     return result[:MAX_HTTP_OUTPUT_CHARS]
 
 
 async def _assert_safe_target(parsed: Any, allowed_hosts: list[str]) -> None:
+    if parsed.username or parsed.password:
+        raise CustomCommandExecutorError("HTTP 目标地址不允许携带用户名或密码")
     host = parsed.hostname
     if not isinstance(host, str) or not host:
         raise CustomCommandExecutorError("HTTP 目标地址无效")
@@ -434,7 +455,8 @@ async def _assert_safe_target(parsed: Any, allowed_hosts: list[str]) -> None:
         return
     try:
         try:
-            port = parsed.port or 443
+            default_port = 80 if getattr(parsed, "scheme", "https") == "http" else 443
+            port = parsed.port or default_port
         except ValueError as exc:
             raise CustomCommandExecutorError("HTTP 目标端口无效") from exc
         infos = await asyncio.to_thread(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM)
@@ -494,7 +516,7 @@ async def _execute_script(
 
 def _python_runner(code: str) -> str:
     # The user program only sees the JSON context and a bounded print helper;
-    # imports and dangerous builtins are rejected before this runner starts.
+    # dangerous builtins and internal modules are strictly restricted.
     return (
         "import json, sys\n"
         "payload = json.load(sys.stdin)\n"
@@ -507,7 +529,11 @@ def _python_runner(code: str) -> str:
         "safe_builtins = {name: vars(builtins)[name] for name in "
         "('bool','dict','enumerate','float','int','len','list','max','min','range','round','sorted','str','sum','tuple')}\n"
         "safe_builtins['print'] = emit\n"
-        "safe_globals = {'__builtins__': safe_builtins, 'context': payload, 'json': json, 'print': emit}\n"
+        "class _SafeJson:\n"
+        "    __slots__ = ()\n"
+        "    dumps = staticmethod(json.dumps)\n"
+        "    loads = staticmethod(json.loads)\n"
+        "safe_globals = {'__builtins__': safe_builtins, 'context': payload, 'json': _SafeJson, 'print': emit}\n"
         f"exec({code!r}, safe_globals, safe_globals)\n"
         "sys.stdout.write(''.join(output))\n"
     )
@@ -516,11 +542,34 @@ def _python_runner(code: str) -> str:
 def _javascript_runner(code: str) -> str:
     return (
         "const fs = require('fs'); const vm = require('vm');\n"
-        "const context = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+        "const rawContext = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+        "const sanitize = (val) => {\n"
+        "  if (val && typeof val === 'object') {\n"
+        "    Object.setPrototypeOf(val, null);\n"
+        "    for (const k of Object.keys(val)) sanitize(val[k]);\n"
+        "  }\n"
+        "  return val;\n"
+        "};\n"
+        "sanitize(rawContext);\n"
         "let output = '';\n"
         "const emit = (...values) => { if (output.length < 12288) output += values.map(String).join(' ') + '\\n'; };\n"
-        "const sandbox = { context, JSON, Math, String, Number, Boolean, Array, Object, console: { log: emit, info: emit } };\n"
-        f"vm.runInNewContext({code!r}, sandbox, {{timeout: 4500}});\n"
+        "Object.setPrototypeOf(emit, null);\n"
+        "delete emit.constructor;\n"
+        "const sandbox = Object.create(null);\n"
+        "sandbox.context = rawContext;\n"
+        "sandbox.JSON = JSON;\n"
+        "sandbox.Math = Math;\n"
+        "sandbox.console = Object.create(null);\n"
+        "sandbox.console.log = emit;\n"
+        "sandbox.console.info = emit;\n"
+        "const ctx = vm.createContext(sandbox);\n"
+        "vm.runInContext(\n"
+        "  'for (const C of [Object, Function, Array, String, Number, Boolean, RegExp, Symbol, Map, Set, Promise]) { ' +\n"
+        "  '  if (C && C.prototype) { delete C.prototype.constructor; Object.freeze(C.prototype); Object.freeze(C); } ' +\n"
+        "  '}',\n"
+        "  ctx\n"
+        ");\n"
+        f"vm.runInContext({code!r}, ctx, {{timeout: 4500}});\n"
         "process.stdout.write(output.slice(0, 12288));\n"
     )
 

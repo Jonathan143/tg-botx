@@ -404,11 +404,31 @@ class BotMessageHandlers:
 
     async def _send(self, chat_id: int, text: str, markup: dict[str, object] | None = None) -> None:
         if self.client:
-            chunks = [text[index : index + 4000] for index in range(0, len(text), 4000)] or [""]
+            chunks = self._chunk_message(text)
             for index, chunk in enumerate(chunks):
                 await self.client.send_message(
                     chat_id, chunk, markup if index == len(chunks) - 1 else None
                 )
+
+    @staticmethod
+    def _chunk_message(text: str, max_chunk_size: int = 4000) -> list[str]:
+        if len(text) <= max_chunk_size:
+            return [text] if text else [""]
+        chunks: list[str] = []
+        start = 0
+        while start < len(text):
+            end = min(start + max_chunk_size, len(text))
+            if end < len(text):
+                amp = text.rfind("&", start, end)
+                if amp != -1 and text.find(";", amp, end) == -1:
+                    end = amp
+                else:
+                    nl = text.rfind("\n", start + max_chunk_size - 500, end)
+                    if nl != -1:
+                        end = nl + 1
+            chunks.append(text[start:end])
+            start = end
+        return chunks or [""]
 
     def _welcome(self, user_id: int, chat_id: int) -> str:
         if self.management.is_bound(user_id, chat_id):
