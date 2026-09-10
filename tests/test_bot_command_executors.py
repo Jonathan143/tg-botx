@@ -115,9 +115,15 @@ def test_custom_command_service_does_not_rename_on_invalid_update() -> None:
         allowed_roles_json='["admin"]', command_type="custom", executor_type="builtin_function",
         executor_config_json='{"name":"echo"}')
     class Database:
-        def list_bot_command_configs(self): return [row]
-        def rename_bot_command_config(self, old, new): row.command = new; return row
-        def upsert_bot_command_config(self, *args, **kwargs): raise AssertionError("must not persist")
+        def list_bot_command_configs(self):
+            return [row]
+
+        def rename_bot_command_config(self, old, new):
+            row.command = new
+            return row
+
+        def upsert_bot_command_config(self, *args, **kwargs):
+            raise AssertionError("must not persist")
     service = BotCommandService(Database())
     with pytest.raises(BotCommandValidationError):
         service.update_command_config("before", "demo", True, new_command="after",
