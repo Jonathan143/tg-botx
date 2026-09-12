@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -66,6 +67,9 @@ from tg_botx.infrastructure.persistence.models import (
 )
 from tg_botx.infrastructure.persistence.repositories.accounts import AccountsRepository
 from tg_botx.infrastructure.persistence.repositories.bot import BotRepository
+from tg_botx.infrastructure.persistence.repositories.command_executions import (
+    CommandExecutionRepository,
+)
 from tg_botx.infrastructure.persistence.repositories.dashboard import DashboardRepository
 from tg_botx.infrastructure.persistence.repositories.runs import RunsRepository
 from tg_botx.infrastructure.persistence.repositories.sessions import SessionsRepository
@@ -103,6 +107,7 @@ class Database:
         self.tasks = TasksRepository(self.session)
         self.runs = RunsRepository(self.session)
         self.bot = BotRepository(self.session)
+        self.command_executions = CommandExecutionRepository(self.session)
         self.sessions = SessionsRepository(self.session)
         self.dashboard = DashboardRepository(self.session)
 
@@ -394,3 +399,8 @@ class Database:
 
     def upcoming_tasks(self, limit: int = 10) -> list[Task]:
         return self.dashboard.upcoming_tasks(limit)
+
+    def mutate_bot_command_config(
+        self, command: str, transform: Callable[[BotCommandConfig | None], dict[str, Any]]
+    ) -> BotCommandConfig:
+        return self.bot.mutate_bot_command_config(command, transform)

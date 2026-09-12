@@ -67,12 +67,32 @@ def _command_configuration(connection: Connection) -> None:
     )
 
 
+def _secure_command_executors(connection: Connection) -> None:
+    _add_columns(
+        connection,
+        "bot_command_configs",
+        {
+            "revision": "INTEGER NOT NULL DEFAULT 1",
+            "confirmed_code_hash": "VARCHAR(64)",
+        },
+    )
+    # Existing custom configurations NEVER executed on the previous release.
+    # Do not activate their side effects merely by upgrading the application.
+    # Preserve raw type/configuration (especially retired JavaScript source).
+    connection.exec_driver_sql(
+        "UPDATE bot_command_configs SET enabled = FALSE, menu_visible = FALSE, "
+        "confirmed_code_hash = NULL WHERE command NOT IN "
+        "('start','help','bind','unbind','tasks','status','checkin')"
+    )
+
+
 MIGRATIONS: tuple[tuple[int, Callable[[Connection], None]], ...] = (
     (3, _binding_roles),
     (4, _run_snapshots),
     (5, _chat_avatars),
     (6, _published_schedule),
     (7, _command_configuration),
+    (8, _secure_command_executors),
 )
 
 

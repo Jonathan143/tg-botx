@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -417,3 +418,39 @@ class BotRepository:
                     .order_by(BotAuditLog.created_at.desc())
                 )
             )
+
+    def mutate_bot_command_config(
+        self,
+        command: str,
+        transform: Callable[[BotCommandConfig | None], dict[str, Any]],
+    ) -> BotCommandConfig:
+        """Read, validate, rename and persist in ONE transaction.
+
+        The transform is the service's side-effect-free validator. Errors roll
+        back before a rename or any other configuration mutation becomes visible.
+        """
+        with self.session() as session:
+            self._begin_sqlite_write(session)
+            current = session.scalar(
+                select(BotCommandConfig)
+                .where(BotCommandConfig.command == command)
+                .with_for_update()
+            )
+            values = transform(current)
+            item = current if current is not None else BotCommandConfig(command=command)
+            if current is None:
+                session.add(item)
+            item.command = values["command"]
+            item.description = values["description"]
+            item.enabled = values["enabled"]
+            item.menu_visible = values["menu_visible"]
+            item.allowed_roles_json = values["allowed_roles_json"]
+            item.command_type = values["command_type"]
+            item.executor_type = values["executor_type"]
+            item.executor_config_json = values["executor_config_json"]
+            item.confirmed_code_hash = values["confirmed_code_hash"]
+            item.revision = (item.revision or 0) + 1
+            item.updated_at = utc_now()
+            session.commit()
+            session.refresh(item)
+            return item

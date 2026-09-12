@@ -4,8 +4,11 @@ from typing import Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from tg_botx.features.bot.executors.policy import HttpCredential
+from tg_botx.features.bot.executors.schemas import origin, parsed_url
 
 
 class Settings(BaseSettings):
@@ -60,6 +63,46 @@ class Settings(BaseSettings):
     channel_notifications_enabled: bool = Field(default=False)
     group_monitor_enabled: bool = Field(default=False)
     group_monitor_history_limit: int = Field(default=500, ge=1, le=100_000)
+
+    command_http_allowed_origins: list[str] = Field(default_factory=list)
+    command_http_credentials: dict[str, HttpCredential] = Field(default_factory=dict, repr=False)
+    command_python_enabled: bool = False
+    command_python_runner_url: str | None = None
+    command_python_runner_token: SecretStr | None = None
+    command_max_workers: int = Field(default=8, ge=1, le=32)
+    command_python_workers: int = Field(default=2, ge=1, le=8)
+    command_queue_limit: int = Field(default=100, ge=1, le=1000)
+    command_queue_seconds: int = Field(default=60, ge=1, le=300)
+    command_rate_limit: int = Field(default=5, ge=1, le=100)
+    command_retention_days: int = Field(default=30, ge=1, le=365)
+
+    @field_validator("command_http_allowed_origins")
+    @classmethod
+    def validate_command_origins(cls, values: list[str]) -> list[str]:
+        normalized = []
+        for value in values:
+            url = parsed_url(value)
+            if url.path not in {"", "/"} or url.query:
+                raise ValueError("HTTP 白名单必须是完整 origin，不能包含路径或查询参数")
+            normalized.append(origin(value))
+        return list(dict.fromkeys(normalized))
+
+    @model_validator(mode="after")
+    def validate_command_runner(self) -> "Settings":
+        if self.command_python_runner_url:
+            from tg_botx.integrations.python_runner import validate_runner_url
+
+            validate_runner_url(self.command_python_runner_url)
+        if self.command_python_enabled and (
+            not self.command_python_runner_url or not self.command_python_runner_token
+        ):
+            raise ValueError("开启 Python 执行必须配置独立 Runner URL 和 token")
+        if (
+            self.command_python_runner_token
+            and len(self.command_python_runner_token.get_secret_value().encode()) < 32
+        ):
+            raise ValueError("Python Runner token 至少需要 32 字节")
+        return self
 
     @property
     def enabled_features(self) -> frozenset[str]:
