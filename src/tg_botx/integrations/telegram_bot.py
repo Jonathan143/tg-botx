@@ -76,14 +76,20 @@ class TelegramBotApiClient:
         )
 
     async def send_message(
-        self, chat_id: int, text: str, reply_markup: dict[str, object] | None = None
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: dict[str, object] | None = None,
+        *,
+        parse_mode: str | None = "HTML",
     ) -> object:
         payload: dict[str, object] = {
             "chat_id": chat_id,
             "text": text,
-            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         return await self.call("sendMessage", payload)

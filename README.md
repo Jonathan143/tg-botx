@@ -288,3 +288,11 @@ notify_bot_response: false
 ```
 
 回复超过单条 Telegram 消息长度时，通知会自动分段发送。
+
+## 自定义命令执行器
+
+管理 Bot 的自定义命令支持 `http`、`builtin_function` 和独立 Runner 中执行的 `python`；JavaScript 已移除，`none` 仅作为停用草稿。HTTP 默认空出站白名单、Python 默认关闭，不能只保存 `enabled=true` 就绕过部署策略。配置更新、能力查询、纯校验、真实试运行和运行记录接口已接入。
+
+**升级会停用所有历史自定义命令，保留原始配置，避免此前不可执行的配置突然产生副作用。升级前备份数据库，之后重新校验并启用。** 系统命令与签到工作流不受该停用迁移影响。
+
+完整架构、安全边界、环境变量、Python Runner 部署、错误码与前端对接见 [自定义命令执行器](docs/custom-command-executors.md)。本仓库只修改后端，独立前端应按文档移除 JS 选项并展示实际可执行状态。

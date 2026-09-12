@@ -58,6 +58,12 @@ class BotAdminBindingBody(BaseModel):
 
 class BotCommandBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    executor_type: ExecutorType | None = Field(default=None, alias="executorType")
+    executor_config: dict[str, Any] | None = Field(default=None, alias="executorConfig")
+    confirm_code_hash: str | None = Field(
+        default=None, alias="confirmCodeHash", pattern=r"^[0-9a-f]{64}$"
+    )
+    expected_revision: int | None = Field(default=None, alias="expectedRevision", ge=0)
     description: str | None = Field(default=None, max_length=256)
     command: str | None = Field(default=None, min_length=1, max_length=32)
     enabled: bool | None = None
@@ -75,6 +81,9 @@ class BotCommandCreateBody(BaseModel):
     menu_visible: bool = Field(default=False, alias="menuVisible")
     allowed_roles: list[CommandRole] = Field(
         default_factory=list, alias="allowedRoles", max_length=3
+    )
+    confirm_code_hash: str | None = Field(
+        default=None, alias="confirmCodeHash", pattern=r"^[0-9a-f]{64}$"
     )
     executor_type: ExecutorType = Field(default="none", alias="executorType")
     executor_config: dict[str, Any] = Field(default_factory=dict, alias="executorConfig")
@@ -101,3 +110,17 @@ class MessageProbeBody(BaseModel):
 class PublishBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     release_note: str | None = Field(default=None, alias="releaseNote", max_length=500)
+
+
+class CommandValidationBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    executor_type: ExecutorType = Field(alias="executorType")
+    executor_config: dict[str, Any] = Field(alias="executorConfig")
+    confirm_code_hash: str | None = Field(
+        default=None, alias="confirmCodeHash", pattern=r"^[0-9a-f]{64}$"
+    )
+
+
+class CommandTestBody(CommandValidationBody):
+    argument: str = Field(default="", max_length=4096)
+    confirm_execution: bool = Field(default=False, alias="confirmExecution")
