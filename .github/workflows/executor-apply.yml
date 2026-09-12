@@ -1,0 +1,108 @@
+name: Apply verified executor changes
+
+on:
+  push:
+    branches: [feat/secure-command-executors]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: executor-source-transfer
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.repository == 'Jonathan143/tg-botx' && github.ref == 'refs/heads/feat/secure-command-executors'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feat/secure-command-executors
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Apply hash-verified source and commit only approved paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import lzma
+          import os
+          from pathlib import Path, PurePosixPath
+          import subprocess
+          import urllib.request
+
+          REPO = "Jonathan143/tg-botx"
+          BRANCH = "feat/secure-command-executors"
+          BLOBS = [
+              "ea8d4ac355cadc15f48ab5b13386688778d45204",
+              "5586ffd456ada1806f61773d900e23f56410f02f",
+              "181022ece21a813179e2c6bf4479b4121953e4b1",
+              "1d8b5439b5fb7bba36f45ef5db90491d1bcded00",
+              "43464d1c53361ccc9170847b223959dcd0f3a705",
+              "538308f5472ddbb4351351090c36d3bd525d10d5",
+              "7b3a3597c0d0cdf77a8b5fcb1a0d754b9ff4fa2d",
+              "e0fa45765b1978bf45e4a639a933daea376f4d6e",
+              "c800cdb8a324b7ac99ea1a220786c9287a890c16",
+          ]
+          assert os.environ["GITHUB_REPOSITORY"] == REPO
+          assert os.environ["GITHUB_REF"] == "refs/heads/" + BRANCH
+          chunks = []
+          for sha in BLOBS:
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{REPO}/git/blobs/{sha}",
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json",
+                           "X-GitHub-Api-Version": "2022-11-28"},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  blob = json.loads(response.read(32_768))
+              raw = base64.b64decode(blob["content"])
+              assert hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest() == sha
+              chunks.append(raw)
+          compressed = base64.b64decode(b"".join(chunks), validate=True)
+          assert hashlib.sha256(compressed).hexdigest() == "2fbb9960b4b5c3ac59a26fd400b1177ea9a784de65dc50167d4c31c2cb7c8bac"
+          manifest = lzma.decompress(compressed, memlimit=128 * 1024 * 1024)
+          assert len(manifest) == 246929
+          records = json.loads(manifest)
+          assert len(records) == 46
+          root = Path.cwd().resolve()
+          paths = []
+          patches = []
+          for item in records:
+              path = item["path"]
+              relative = PurePosixPath(path)
+              assert not relative.is_absolute() and ".." not in relative.parts
+              assert path.startswith(("src/", "tests/executors/", "runner/", "docs/")) or path in {"README.md", ".env.example", "pyproject.toml"}
+              assert path not in paths
+              target = root / path
+              assert target.resolve().is_relative_to(root)
+              assert not any(p.is_symlink() for p in [target, *target.parents])
+              if item["base_blob"] is None:
+                  assert not target.exists() and set(item) == {"path", "base_blob", "content"}
+              else:
+                  assert set(item) == {"path", "base_blob", "patch"}
+                  actual = subprocess.check_output(["git", "hash-object", "--", path], text=True).strip()
+                  assert actual == item["base_blob"], f"Concurrent change: {path}"
+                  patches.append(item["patch"])
+              paths.append(path)
+          patch = "".join(patches).encode()
+          subprocess.run(["git", "apply", "--check", "--whitespace=error-all", "-"], input=patch, check=True)
+          subprocess.run(["git", "apply", "--whitespace=error-all", "-"], input=patch, check=True)
+          for item in records:
+              if item["base_blob"] is None:
+                  target = root / item["path"]
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_text(item["content"], encoding="utf-8")
+          subprocess.run(["git", "add", "--", *paths], check=True)
+          subprocess.run(["git", "diff", "--cached", "--check"], check=True)
+          subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+          subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
+          subprocess.run(["git", "commit", "-m", "feat(bot): 实现安全自定义命令执行器并移除 JavaScript"], check=True)
+          subprocess.run(["git", "push", "origin", "HEAD:refs/heads/" + BRANCH], check=True)
+          PY
