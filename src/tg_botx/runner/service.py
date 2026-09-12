@@ -167,7 +167,17 @@ class DockerSandbox:
                 status
                 or not isinstance(info, dict)
                 or info.get("OSType") != "linux"
-                or not all(info.get(key) for key in ("MemoryLimit", "PidsLimit", "CPUCfsQuota"))
+                # Docker's JSON API uses CpuCfsQuota, not the Go field CPUCfsQuota.
+                or not all(
+                    info.get(key) is True
+                    for key in (
+                        "MemoryLimit",
+                        "SwapLimit",
+                        "PidsLimit",
+                        "CpuCfsPeriod",
+                        "CpuCfsQuota",
+                    )
+                )
             ):
                 raise ExecutionError("EXECUTOR_UNAVAILABLE")
             if not any("seccomp" in item for item in info.get("SecurityOptions", [])):

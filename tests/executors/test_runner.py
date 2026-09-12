@@ -22,19 +22,21 @@ class FakeDocker(DockerSandbox):
         self.start_error = None
         self.create_wait = None
         self.cleanup_fails = False
+        # Mirror /info's JSON names, not the Go struct field names.
+        self.info = {
+            "OSType": "linux",
+            "MemoryLimit": True,
+            "SwapLimit": True,
+            "PidsLimit": True,
+            "CpuCfsPeriod": True,
+            "CpuCfsQuota": True,
+            "SecurityOptions": ["name=seccomp,profile=builtin"],
+        }
 
     async def command(self, *args, **kwargs):
         self.commands.append((args, kwargs))
         if args[0] == "info":
-            return 0, json.dumps(
-                {
-                    "OSType": "linux",
-                    "MemoryLimit": True,
-                    "PidsLimit": True,
-                    "CPUCfsQuota": True,
-                    "SecurityOptions": ["name=seccomp,profile=builtin"],
-                }
-            ).encode()
+            return 0, json.dumps(self.info).encode()
         if args[0] == "image":
             return 0, ("sha256:" + "a" * 64).encode()
         if args[0] == "ps":
@@ -203,3 +205,23 @@ async def test_runner_client_cancellation_requests_remote_cleanup(context):
         await pending
     assert deleted.is_set()
     await client.close()
+
+
+@pytest.mark.parametrize(
+    "key", ["MemoryLimit", "SwapLimit", "PidsLimit", "CpuCfsPeriod", "CpuCfsQuota"]
+)
+@pytest.mark.parametrize("value", [False, None, "true"])
+async def test_runner_rejects_missing_or_nonboolean_kernel_capabilities(manager, key, value):
+    manager.info[key] = value
+    assert not await manager.probe()
+    assert manager.image_id is None
+    assert not any(args[0] == "image" for args, kwargs in manager.commands)
+
+
+async def test_runner_uses_engine_json_cpu_quota_field_not_go_name(manager):
+    assert await manager.probe()
+    manager.info["CPUCfsQuota"] = manager.info.pop("CpuCfsQuota")
+    assert not await manager.probe()
+    with pytest.raises(ExecutionError) as error:
+        await manager.execute(request())
+    assert error.value.code == "EXECUTOR_UNAVAILABLE"
