@@ -53,13 +53,13 @@ class MessageGroupWrite(BaseModel):
 
 
 class MessageGroupUpdate(MessageGroupWrite):
-    revision: int = Field(ge=1, strict=True)
+    revision: int = Field(ge=1, le=2_147_483_646, strict=True)
 
 
 class MessageGroupDelete(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    revision: int = Field(ge=1, strict=True)
+    revision: int = Field(ge=1, le=2_147_483_646, strict=True)
 
 
 class MessageGroupSummary(BaseModel):

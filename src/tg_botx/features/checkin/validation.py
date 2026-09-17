@@ -410,9 +410,7 @@ def _validate_step_sequence(
                 _validate_template(step["text"], f"{step_path}.text", possible)
             elif step.get("random_source", "manual") == "manual":
                 for message_index, message in enumerate(step["messages"]):
-                    _validate_template(
-                        message, f"{step_path}.messages[{message_index}]", possible
-                    )
+                    _validate_template(message, f"{step_path}.messages[{message_index}]", possible)
         elif kind == "wait_message":
             timeout = step.get("timeout_seconds", 60)
             if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:

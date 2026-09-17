@@ -17,6 +17,7 @@ from tg_botx.features.checkin.errors import (
 )
 from tg_botx.features.checkin.executor import CheckinExecutor
 from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
+from tg_botx.features.message_library.service import validate_task_message_groups
 from tg_botx.infrastructure.persistence.db import (
     Account,
     Task,
@@ -190,8 +191,8 @@ class RunCoordinator:
                 # The run may finish before its planned wall-clock time (for
                 # example after a clock adjustment or a delayed scheduler
                 # callback).  Exclude the occurrence that was just consumed,
-                # not only the completion timestamp, so a daily task cannot
-                # be scheduled again later on the same day.
+                # not only the completion timestamp. Multi-run schedules may
+                # still have later occurrences on the same eligible day.
                 values["next_run_at"] = next_run_for(
                     schedule_from_task(current),
                     now=finished,
@@ -290,6 +291,7 @@ class RunCoordinator:
                         on_attempt=on_attempt,
                         on_step_status=on_step_status,
                         on_step_response=on_step_response,
+                        message_group_loader=self.database.messages.get_messages,
                     ),
                     task,
                 )
@@ -447,6 +449,7 @@ class RunCoordinator:
             raise TaskNotFound("任务不存在")
         if task.archived:
             raise TaskStateError("归档任务不能测试")
+        validate_task_message_groups(self.database, definition)
         execution_definition = definition.model_dump(mode="json")
         execution_task, account = self._execution_snapshot(
             task, execution_definition, task_name=definition.name

@@ -63,10 +63,12 @@ class CheckinExecutor:
         on_step_status: Callable[..., Awaitable[None]] | None = None,
         on_step_response: Callable[..., Awaitable[None]] | None = None,
         http_client: httpx.AsyncClient | None = None,
+        message_group_loader: Callable[[str], list[str]] | None = None,
     ):
         self._http_client = http_client
         self._owns_http_client = http_client is None
         self.client = client
+        self.message_group_loader = message_group_loader
         self.messages = TelegramMessageAdapter(client)
         self.is_cancelled = is_cancelled or (lambda: False)
         self.on_attempt = on_attempt

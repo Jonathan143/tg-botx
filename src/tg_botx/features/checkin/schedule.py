@@ -80,12 +80,14 @@ def _random_occurrences(
         or lower.astimezone(zone).utcoffset() != upper.astimezone(zone).utcoffset()
     ):
         # On DST transition dates only sample real seconds inside the wall-clock
-        # window. Never shift a nonexistent time outside the configured window.
+        # window; omit the repeated fold so local times are also strictly ordered.
+        # Never shift a nonexistent time outside the configured window.
         offsets = [
             offset
             for offset in offsets
             if (local := (lower + timedelta(seconds=offset)).astimezone(zone)).date() == day
             and start_clock <= local.time() <= end_clock
+            and local.fold == 0
         ]
     if len(offsets) < schedule.execution_count:
         return []

@@ -32,6 +32,7 @@ class SendMessageStep(StepBase):
         if self.message_mode == "fixed":
             if self.text is None:
                 raise ValueError("固定消息必须配置 text")
+            validate_message_text(self.text)
             if (
                 self.messages is not None
                 or self.message_group_id is not None
