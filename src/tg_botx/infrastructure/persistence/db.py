@@ -71,6 +71,7 @@ from tg_botx.infrastructure.persistence.repositories.command_executions import (
     CommandExecutionRepository,
 )
 from tg_botx.infrastructure.persistence.repositories.dashboard import DashboardRepository
+from tg_botx.infrastructure.persistence.repositories.messages import MessagesRepository
 from tg_botx.infrastructure.persistence.repositories.runs import RunsRepository
 from tg_botx.infrastructure.persistence.repositories.sessions import SessionsRepository
 from tg_botx.infrastructure.persistence.repositories.tasks import TasksRepository
@@ -108,6 +109,7 @@ class Database:
         self.runs = RunsRepository(self.session)
         self.bot = BotRepository(self.session)
         self.command_executions = CommandExecutionRepository(self.session)
+        self.messages = MessagesRepository(self.session)
         self.sessions = SessionsRepository(self.session)
         self.dashboard = DashboardRepository(self.session)
 

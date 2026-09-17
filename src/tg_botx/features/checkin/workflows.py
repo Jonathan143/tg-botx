@@ -7,6 +7,7 @@ from tg_botx.features.checkin.errors import (
     TaskStateError,
 )
 from tg_botx.features.checkin.schedule import next_run_for
+from tg_botx.features.message_library.service import validate_task_message_groups
 from tg_botx.infrastructure.persistence.db import (
     WorkflowVersion,
     utc_now,
@@ -45,6 +46,7 @@ class WorkflowService:
             definition = TaskDefinition.model_validate(task.config)
         except Exception as exc:
             raise TaskStateError("当前任务配置无效，无法发布") from exc
+        validate_task_message_groups(self.database, definition)
         schedule = definition.schedule
         if task.enabled:
             try:

@@ -11,6 +11,7 @@ from tg_botx.features.checkin.runtime import (
     CheckinService,
 )
 from tg_botx.features.checkin.schedule import next_runs
+from tg_botx.features.message_library.service import validate_task_message_groups
 from tg_botx.infrastructure.persistence.db import (
     Database,
     utc_now,
@@ -63,6 +64,7 @@ def build_router(database: Database, service: CheckinService) -> APIRouter:
                 422,
                 details=[{"path": "definition.account", "message": "Telegram 账号不存在"}],
             )
+        validate_task_message_groups(database, body.definition)
         return {
             "valid": True,
             "definition": body.definition.to_api_dict(),
