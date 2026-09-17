@@ -1,0 +1,28 @@
+name: 每日随机问候
+account: default
+target: "@example_bot"
+schedule:
+  type: random
+  timezone: Asia/Shanghai
+  frequency: daily
+  start: "06:00"
+  end: "12:00"
+  execution_count: 3
+retry:
+  max_attempts: 1
+  backoff_seconds: [30, 60, 120]
+notifications:
+  failure: true
+  success: false
+steps:
+  - type: send_message
+    message_mode: random
+    random_source: manual
+    messages:
+      - "早上好"
+      - "今天也要加油"
+      - |-
+        这是一条
+        多行消息
+# 实时分组：先在消息库中创建非空分组，然后用 API 返回的实际 UUID
+# 替换步骤的 random_source 为 group，移除 messages 并配置 message_group_id。
