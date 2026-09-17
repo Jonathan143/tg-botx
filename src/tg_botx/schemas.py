@@ -38,6 +38,7 @@ class ScheduleConfig(BaseModel):
     type: Literal["fixed", "random"]
     timezone: str = "Asia/Shanghai"
     frequency: Literal["daily", "every_n_days", "weekly", "monthly_dates"] = "daily"
+    execution_count: int = Field(default=1, ge=1, le=1000, strict=True)
     start_date: date | None = None
     end_date: date | None = None
     interval_days: int | None = Field(default=None, ge=1, le=365)
@@ -51,7 +52,9 @@ class ScheduleConfig(BaseModel):
     @classmethod
     def valid_time(cls, value: str | None) -> str | None:
         if value is not None:
-            time.fromisoformat(value)
+            parsed = time.fromisoformat(value)
+            if parsed.tzinfo is not None or parsed.microsecond:
+                raise ValueError("调度时间必须是不带时区的整秒时间")
         return value
 
     @field_validator("timezone")
@@ -67,12 +70,24 @@ class ScheduleConfig(BaseModel):
     def validate_shape(self) -> ScheduleConfig:
         if self.type == "fixed" and not self.time:
             raise ValueError("fixed 调度必须配置 time")
+        if self.type == "fixed" and self.execution_count != 1:
+            raise ValueError("固定时间的执行次数只能为 1")
         if self.type == "random" and (not self.start or not self.end):
             raise ValueError("random 调度必须配置 start 和 end")
         if self.type == "random":
             assert self.start is not None and self.end is not None
-            if time.fromisoformat(self.end) <= time.fromisoformat(self.start):
+            start = time.fromisoformat(self.start)
+            end = time.fromisoformat(self.end)
+            if end <= start:
                 raise ValueError("随机时间窗口暂不支持跨午夜，end 必须晚于 start")
+            seconds = (
+                (end.hour - start.hour) * 3600
+                + (end.minute - start.minute) * 60
+                + end.second
+                - start.second
+            )
+            if self.execution_count > seconds + 1:
+                raise ValueError("执行次数不能超过随机窗口内可用的整秒时间点数量")
         if self.start_date and self.end_date and self.end_date < self.start_date:
             raise ValueError("schedule.end_date 不能早于 start_date")
         if self.frequency == "every_n_days":
