@@ -53,9 +53,12 @@ jobs:
                       continue
                   if path.suffix in {'.session', '.pem', '.key'}:
                       continue
+                  source = root / path
+                  if source.is_symlink() or not source.is_file():
+                      continue
                   target = pathlib.Path('review') / name / path
                   target.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copyfile(root / path, target)
+                  shutil.copyfile(source, target)
           PY
           cp -a frontend/node_modules review/frontend/
           tar -czf review-snapshot.tar.gz review
