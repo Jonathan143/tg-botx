@@ -406,9 +406,13 @@ def _validate_step_sequence(
         _unsupported(step, _STEP_FIELDS[kind], step_path)
         _validate_node_id(step.get("node_id"), step_path, node_ids)
         if kind == "send_message":
-            if not isinstance(step.get("text"), str):
-                raise ValueError(f"{step_path}.text 必须是字符串")
-            _validate_template(step["text"], f"{step_path}.text", possible)
+            if step.get("message_mode", "fixed") == "fixed":
+                _validate_template(step["text"], f"{step_path}.text", possible)
+            elif step.get("random_source", "manual") == "manual":
+                for message_index, message in enumerate(step["messages"]):
+                    _validate_template(
+                        message, f"{step_path}.messages[{message_index}]", possible
+                    )
         elif kind == "wait_message":
             timeout = step.get("timeout_seconds", 60)
             if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
