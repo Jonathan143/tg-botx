@@ -7,6 +7,7 @@ from collections.abc import Callable
 from sqlalchemy import insert, inspect, select
 from sqlalchemy.engine import Connection, Engine
 
+from tg_botx.infrastructure.persistence.message_models import MessageGroup
 from tg_botx.infrastructure.persistence.models import Base, SchemaVersion
 
 
@@ -17,6 +18,10 @@ def _add_columns(connection: Connection, table: str, definitions: dict[str, str]
         if column in added:
             connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
     return added
+
+
+def _message_library(connection: Connection) -> None:
+    Base.metadata.tables[MessageGroup.__tablename__].create(connection, checkfirst=True)
 
 
 def _binding_roles(connection: Connection) -> None:
@@ -74,6 +79,9 @@ MIGRATIONS: tuple[tuple[int, Callable[[Connection], None]], ...] = (
     (6, _published_schedule),
     (7, _command_configuration),
 )
+# Version 8 is reserved by the separate secure-command-executors change.
+# Set-based tracking below also applies that migration if it is merged later.
+MIGRATIONS += ((9, _message_library),)
 
 
 def migrate(engine: Engine) -> None:

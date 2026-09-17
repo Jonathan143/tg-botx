@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -33,8 +34,11 @@ def _localize(naive: datetime, zone: ZoneInfo) -> datetime:
 def _seed_for(schedule: ScheduleConfig, seed: str | None) -> str:
     if seed:
         return seed
-    payload = json.dumps(schedule.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
-    return payload
+    values = schedule.model_dump(mode="json")
+    if schedule.execution_count == 1:
+        # Keep the stable occurrence of existing one-run schedules unchanged.
+        values.pop("execution_count", None)
+    return json.dumps(values, sort_keys=True, ensure_ascii=False)
 
 
 def random_local_datetime(
@@ -58,20 +62,70 @@ def random_local_datetime(
     return day.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(seconds=selected)
 
 
+def _random_occurrences(
+    day: date, schedule: ScheduleConfig, zone: ZoneInfo, *, seed: str | None
+) -> list[datetime]:
+    """Build one stable, distinct, ordered UTC plan for an eligible local day."""
+    assert schedule.start is not None and schedule.end is not None
+    start_clock = parse_clock(schedule.start)
+    end_clock = parse_clock(schedule.end)
+    start = datetime.combine(day, start_clock)
+    end = datetime.combine(day, end_clock)
+    lower = min(start.replace(tzinfo=zone, fold=fold).astimezone(UTC) for fold in (0, 1))
+    upper = max(end.replace(tzinfo=zone, fold=fold).astimezone(UTC) for fold in (0, 1))
+    offsets: range | list[int] = range(int((upper - lower).total_seconds()) + 1)
+    if (
+        lower.astimezone(zone).replace(tzinfo=None) != start
+        or upper.astimezone(zone).replace(tzinfo=None) != end
+        or lower.astimezone(zone).utcoffset() != upper.astimezone(zone).utcoffset()
+    ):
+        # On DST transition dates only sample real seconds inside the wall-clock
+        # window; omit the repeated fold so local times are also strictly ordered.
+        # Never shift a nonexistent time outside the configured window.
+        offsets = [
+            offset
+            for offset in offsets
+            if (local := (lower + timedelta(seconds=offset)).astimezone(zone)).date() == day
+            and start_clock <= local.time() <= end_clock
+            and local.fold == 0
+        ]
+    if len(offsets) < schedule.execution_count:
+        return []
+    key = f"{_seed_for(schedule, seed)}:{day.isoformat()}:{schedule.start}:{schedule.end}"
+    generator = random.Random(hashlib.sha256(key.encode()).digest())
+    selected = sorted(generator.sample(offsets, schedule.execution_count))
+    return [lower + timedelta(seconds=offset) for offset in selected]
+
+
+def _candidate_times(
+    day: date, schedule: ScheduleConfig, zone: ZoneInfo, *, seed: str | None
+) -> list[datetime]:
+    if schedule.type == "fixed":
+        assert schedule.time is not None
+        return [_localize(datetime.combine(day, parse_clock(schedule.time)), zone).astimezone(UTC)]
+    if schedule.execution_count > 1:
+        return _random_occurrences(day, schedule, zone, seed=seed)
+    assert schedule.start is not None and schedule.end is not None
+    naive = random_local_datetime(datetime.combine(day, time.min), schedule, seed=seed)
+    candidate = _localize(naive, zone)
+    if candidate.date() != day or not (
+        parse_clock(schedule.start) <= candidate.time() <= parse_clock(schedule.end)
+    ):
+        return []
+    return [candidate.astimezone(UTC)]
+
+
 def _candidate_time(
     day: date, schedule: ScheduleConfig, zone: ZoneInfo, *, seed: str | None, cutoff: datetime
 ) -> datetime | None:
-    if schedule.type == "fixed":
-        assert schedule.time is not None
-        return _localize(datetime.combine(day, parse_clock(schedule.time)), zone)
-    assert schedule.start is not None and schedule.end is not None
-    naive = random_local_datetime(datetime.combine(day, time.min), schedule, seed=seed)
-    # A random schedule has one stable occurrence per eligible day.  If that
-    # occurrence has already passed, skip the day instead of re-randomizing a
-    # second time within the same window.
-    if day == cutoff.date() and naive.time() <= cutoff.time().replace(microsecond=0):
-        return None
-    return _localize(naive, zone)
+    return next(
+        (
+            candidate.astimezone(zone)
+            for candidate in _candidate_times(day, schedule, zone, seed=seed)
+            if candidate > cutoff.astimezone(UTC)
+        ),
+        None,
+    )
 
 
 def _is_eligible(day: date, schedule: ScheduleConfig, anchor: date) -> bool:
@@ -95,23 +149,23 @@ def next_runs(
 ) -> list[datetime]:
     if count <= 0:
         return []
-    now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+    cutoff = (now or datetime.now(UTC)).astimezone(UTC)
     zone = ZoneInfo(schedule.timezone)
-    cutoff = now_utc.astimezone(zone)
     if start_after is not None:
-        cutoff = max(cutoff, start_after.astimezone(zone))
-    anchor = schedule.start_date or cutoff.date()
-    day = max(anchor, cutoff.date())
+        cutoff = max(cutoff, start_after.astimezone(UTC))
+    local_date = cutoff.astimezone(zone).date()
+    anchor = schedule.start_date or local_date
+    day = max(anchor, local_date)
     results: list[datetime] = []
     for _ in range(3660):
         if schedule.end_date is not None and day > schedule.end_date:
             break
         if _is_eligible(day, schedule, anchor):
-            candidate = _candidate_time(day, schedule, zone, seed=seed, cutoff=cutoff)
-            if candidate is not None and candidate > cutoff:
-                results.append(to_utc(candidate, zone))
-                if len(results) >= count:
-                    break
+            for candidate in _candidate_times(day, schedule, zone, seed=seed):
+                if candidate > cutoff:
+                    results.append(candidate)
+                    if len(results) >= count:
+                        return results
         day += timedelta(days=1)
     return results
 
@@ -129,9 +183,8 @@ def next_run_for(
 
 
 def schedule_from_task(task: Task) -> ScheduleConfig:
-    # ``config_json`` is the editable draft.  Once a workflow has been
-    # published, formal scheduling must continue to use the published
-    # schedule until the next publish operation.
+    # ``config_json`` is the editable draft. Once published, formal scheduling
+    # keeps using the published schedule until the next publish operation.
     payload: object = task.config.get("schedule")
     published_schedule_json = getattr(task, "published_schedule_json", None)
     if published_schedule_json:

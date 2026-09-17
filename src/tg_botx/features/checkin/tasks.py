@@ -11,6 +11,7 @@ from tg_botx.features.checkin.errors import (
     TaskStateError,
 )
 from tg_botx.features.checkin.schedule import next_run_for, schedule_from_task
+from tg_botx.features.message_library.service import validate_task_message_groups
 from tg_botx.infrastructure.persistence.db import (
     Account,
     Task,
@@ -62,6 +63,7 @@ class TaskService:
         account = self.database.get_account(definition.account)
         if account is None:
             raise AccountNotFoundError("任务绑定的账号不存在")
+        validate_task_message_groups(self.database, definition)
         task = self.database.save_task(self._task_from_definition(account, definition))
         self._publish_task_updated(task.id)
         return task
@@ -78,6 +80,7 @@ class TaskService:
         account = self.database.get_account(definition.account)
         if account is None:
             raise AccountNotFoundError("任务绑定的账号不存在")
+        validate_task_message_groups(self.database, definition)
 
         schedule = definition.schedule
         if schedule.start_date is None:

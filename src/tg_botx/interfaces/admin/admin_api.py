@@ -25,6 +25,7 @@ from tg_botx.interfaces.admin.routes import (
     bot_webhook,
     dashboard,
     logs,
+    messages,
     runs,
     task_events,
     task_imports,
@@ -83,6 +84,7 @@ def create_admin_app(
         dashboard.build_router(database=database, service=service, started_at=started_at)
     )
     app.include_router(tasks.build_router(database=database, service=service))
+    app.include_router(messages.build_router(database=database))
     app.include_router(
         task_events.build_router(database=database, service=service, shutdown_event=shutdown_event)
     )
