@@ -1,0 +1,67 @@
+name: Review snapshot
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/review-snapshot.yml
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: github.head_ref == 'feat/random-runs-message-library'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: backend
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: Jonathan143/tg-botx-web
+          ref: 2a79084ae62dda582df509c79b0be6adf941c600
+          path: frontend
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --target review/python './backend[dev]'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+      - run: pnpm --dir frontend install --frozen-lockfile
+      - name: Package reviewed source and isolated dependencies
+        shell: bash
+        run: |
+          mkdir -p review/backend review/frontend
+          python - <<'PY'
+          import pathlib
+          import shutil
+          import subprocess
+          for name in ('backend', 'frontend'):
+              root = pathlib.Path(name)
+              for entry in subprocess.check_output(['git', '-C', name, 'ls-files', '-z']).decode().split('\0'):
+                  if not entry:
+                      continue
+                  path = pathlib.PurePosixPath(entry)
+                  if any(part.startswith('.env') or part == '.git' for part in path.parts):
+                      continue
+                  if path.suffix in {'.session', '.pem', '.key'}:
+                      continue
+                  target = pathlib.Path('review') / name / path
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(root / path, target)
+          PY
+          cp -a frontend/node_modules review/frontend/
+          tar -czf review-snapshot.tar.gz review
+      - uses: actions/upload-artifact@v4
+        with:
+          name: review-snapshot
+          path: review-snapshot.tar.gz
+          retention-days: 1
+          if-no-files-found: error
