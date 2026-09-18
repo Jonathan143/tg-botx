@@ -9,6 +9,12 @@ from datetime import datetime
 from typing import Any
 
 from tg_botx.config import Settings
+from tg_botx.features.bot.execution import (
+    CommandAdmissionUnavailable,
+    CommandExecutionService,
+    execution_view,
+)
+from tg_botx.features.bot.executors.base import ExecutionError
 from tg_botx.features.bot.management import BotManagementService
 from tg_botx.features.bot.models import (
     _COMMAND_NAME_PATTERN,
@@ -30,13 +36,26 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramManagementBot:
-    def __init__(self, settings: Settings, database: Database, checkin: CheckinService):
+    def __init__(
+        self,
+        settings: Settings,
+        database: Database,
+        checkin: CheckinService,
+        *,
+        execution: CommandExecutionService | None = None,
+    ):
         token = (
             settings.admin_bot_token.get_secret_value().strip() if settings.admin_bot_token else ""
         )
         self.database = database
         self.checkin = checkin
+        from tg_botx.application.command_executors import build_command_execution
+
+        self.executions = (
+            execution if execution is not None else build_command_execution(settings, database)
+        )
         self.management = BotManagementService(database, checkin)
+        self.management.commands = self.executions.commands
         self.client = TelegramBotApiClient(token) if token else None
         # Keep the adapter tolerant of older injected settings objects.  The
         # concrete ``Settings`` model always exposes these fields, while
@@ -54,8 +73,9 @@ class TelegramManagementBot:
         configured = bool(token) and (self.transport != "webhook" or webhook_configured)
         self.status = BotRuntimeStatus(settings.bot_enabled, configured)
         self.handlers = BotMessageHandlers(
-            database, checkin, self.management, self.client, self.status
+            database, checkin, self.management, self.client, self.status, execution=self.executions
         )
+        self.executions.sender = self._send_command_result if self.client is not None else None
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._offset: int | None = None
@@ -64,6 +84,7 @@ class TelegramManagementBot:
         self._webhook_seen_update_order: deque[int] = deque()
 
     async def start(self) -> None:
+        await self.executions.start()
         if not self.status.enabled:
             logger.info("TG_BOT_BOT_ENABLED=false，Telegram 管理 Bot 未启动")
             return
@@ -98,7 +119,20 @@ class TelegramManagementBot:
             )
 
     def command_configs(self) -> list[dict[str, Any]]:
-        return self.management.command_configs()
+        configs = self.management.command_configs()
+        executions = getattr(self, "executions", None)
+        if executions is not None:
+            latest = executions.repository.latest(executions.bot_identity)
+            for config in configs:
+                row = latest.get(config["command"])
+                config["lastExecution"] = execution_view(row, include_result=False) if row else None
+        return configs
+
+    async def _send_command_result(self, chat_id: int, text: str) -> None:
+        if self.client is None:
+            raise ExecutionError("EXECUTOR_UNAVAILABLE")
+        # Plain text avoids both HTML injection and splitting an escaped entity.
+        await self.client.send_message(chat_id, text, parse_mode=None)
 
     async def pull_remote_commands(self) -> list[dict[str, Any]]:
         """Pull Telegram's default command menu into the local database."""
@@ -183,8 +217,11 @@ class TelegramManagementBot:
             with suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
-        if self.client is not None:
-            await self.client.close()
+        try:
+            await self.executions.close()
+        finally:
+            if self.client is not None:
+                await self.client.close()
 
     def public_status(self) -> dict[str, Any]:
         return {
@@ -292,6 +329,13 @@ class TelegramManagementBot:
             try:
                 await self._handle_update(update)
                 self.status.last_error = None
+            except CommandAdmissionUnavailable:
+                update_id = update.get("update_id")
+                if type(update_id) is int:
+                    self._webhook_seen_update_ids.discard(update_id)
+                    with suppress(ValueError):
+                        self._webhook_seen_update_order.remove(update_id)
+                raise
             except Exception as exc:
                 self.status.last_error = type(exc).__name__
                 logger.exception("管理 Bot 处理 Webhook update 失败 type=%s", type(exc).__name__)
@@ -305,6 +349,7 @@ class TelegramManagementBot:
                     await self.client.set_webhook(self.webhook_url, self._webhook_secret)
                     if self._stop.is_set():
                         break
+                    await self.refresh_commands()
                     self.status.running = True
                     self.status.last_error = None
                     logger.info("Telegram 管理 Bot 已使用 Webhook 模式启动")
@@ -334,6 +379,7 @@ class TelegramManagementBot:
             while not self._stop.is_set():
                 try:
                     await self.client.delete_webhook(drop_pending_updates=True)
+                    await self.refresh_commands()
                     break
                 except asyncio.CancelledError:
                     raise
@@ -355,6 +401,10 @@ class TelegramManagementBot:
                             self._offset = update_id + 1
                         try:
                             await self._handle_update(update)
+                        except CommandAdmissionUnavailable:
+                            if type(update_id) is int:
+                                self._offset = update_id
+                            raise
                         except Exception as exc:
                             self.status.last_error = type(exc).__name__
                             logger.exception(

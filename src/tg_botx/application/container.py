@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from tg_botx.application.command_executors import build_command_execution
 from tg_botx.config import Settings
 from tg_botx.features.accounts.service import LoginFlowManager
 from tg_botx.features.checkin.notifications import NotificationService
@@ -121,7 +122,9 @@ def build_admin_context(application: ApplicationContext) -> AdminContext:
         SessionManager(admin_key, session_days=settings.admin_session_days, session_store=database),
         FailureRateLimiter(max_failures=5, window_seconds=600),
         LoginFlowManager(settings, database, client_pool=checkin.pool),
-        TelegramManagementBot(settings, database, checkin),
+        TelegramManagementBot(
+            settings, database, checkin, execution=build_command_execution(settings, database)
+        ),
         proxies,
         LogStream(settings),
         asyncio.Event(),

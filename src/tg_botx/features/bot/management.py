@@ -180,6 +180,8 @@ class BotManagementService:
         menu_visible: bool = False,
         executor_type: str = "none",
         executor_config: dict[str, Any] | None = None,
+        *,
+        confirm_code_hash: str | None = None,
     ) -> dict[str, Any]:
         return self.commands.create_command_config(
             command,
@@ -189,6 +191,7 @@ class BotManagementService:
             menu_visible,
             executor_type,
             executor_config,
+            confirm_code_hash=confirm_code_hash,
         )
 
     def reorder_command_configs(self, commands: list[str]) -> list[dict[str, Any]]:

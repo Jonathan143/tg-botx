@@ -16,7 +16,7 @@ from tg_botx.infrastructure.persistence.db import (
 logger = logging.getLogger(__name__)
 
 CommandRole = Literal["anonymous", "user", "admin"]
-ExecutorType = Literal["none", "http", "builtin_function", "python", "javascript"]
+ExecutorType = Literal["none", "http", "builtin_function", "python"]
 
 
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"

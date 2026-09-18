@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.13"]
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -22,7 +22,47 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
-      - run: python -m ruff check src
-      - run: python -m ruff format --check src
+      - run: python -m ruff check src tests/executors runner
+      - run: python -m ruff format --check src tests/executors runner
       - run: python -m mypy src
-      - run: python -m compileall -q src
+      - run: python -m compileall -q src runner
+      - run: python -m pytest -q tests/executors
+
+  executor-postgresql:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: executor_test
+          POSTGRES_PASSWORD: test-only-local-password
+          POSTGRES_DB: executor_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U executor_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest -q tests/executors/test_configuration.py tests/executors/test_execution.py
+        env:
+          EXECUTOR_TEST_DATABASE_URL: postgresql://executor_test:test-only-local-password@127.0.0.1:5432/executor_test
+
+  executor-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e '.[dev]'
+      - run: docker build -f runner/Dockerfile -t tg-botx-python-sandbox:1 .
+      - run: python -m pytest -q tests/executors/test_runner_docker.py
+        env:
+          RUN_EXECUTOR_DOCKER_TESTS: "1"

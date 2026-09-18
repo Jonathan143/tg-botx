@@ -108,3 +108,9 @@ HTTP 步骤在同一次执行中复用客户端，执行结束后关闭自有客
 旧的 `features.admin_bot`、`features.accounts.auth`、`interfaces.admin.admin_accounts`、`interfaces.admin.admin_security`、`features.checkin.condition` 和数据库门面继续保留兼容导出。新代码使用实际职责模块。
 
 `EventBus`、`CommandRegistry`、`ChannelNotifier`、`GroupMonitor` 保留为独立扩展能力，没有自动接入当前管理机器人。它们的语义与任务进度的合并订阅不同，不能直接替换。配置中的扩展开关不代表已经完成运行链路接入；新增接入需同时提供实际 transport、生命周期与配置说明。
+
+## 管理 Bot 自定义执行器的隔离例外
+
+新增 `features/bot/execution.py` / `executors/`，配置保存与启用校验、原子入队、固定 Worker、持久化结果和回复交付分离。`application/command_executors.py` 统一装配并纳入现有容器生命周期。`integrations/safe_http.py` 负责受控出站；`integrations/python_runner.py` 只调用独立 Runner 固定协议。
+
+前文“不得增加任意代码/Shell”继续适用于签到工作流和 Bot 主进程。管理命令的 Python 能力是明确例外：默认禁用、部署授权、源码确认，并仅在 `tg_botx.runner` 管理的一次性 OS 隔离容器中执行；普通子进程、AST 限制、禁止 import 都不是替代沙箱。执行器不得接收应用容器/密钥，Runner 工作负载不挂载 Docker socket 或宿主数据。具体能力边界和迁移见 [custom-command-executors.md](custom-command-executors.md)。

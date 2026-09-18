@@ -11,6 +11,7 @@ from sqlalchemy.exc import OperationalError
 
 from tg_botx.config import Settings
 from tg_botx.features.accounts.service import AdminAccountError
+from tg_botx.features.bot.execution import CommandAdmissionUnavailable
 from tg_botx.features.checkin.errors import ManualRunConflict, TaskNotFound, TaskStateError
 from tg_botx.interfaces.admin.admin_security import (
     SecurityError,
@@ -73,12 +74,18 @@ def install_middleware(
             APIError("VALIDATION_FAILED", "请求参数无效", 422, details=_validation_details(exc)),
         )
 
+    @app.exception_handler(CommandAdmissionUnavailable)
+    async def handle_admission_unavailable(
+        request: Request, exc: CommandAdmissionUnavailable
+    ) -> JSONResponse:
+        return error_response(request, APIError("DATABASE_UNAVAILABLE", "命令队列暂时不可用", 503))
+
     @app.exception_handler(OperationalError)
     async def handle_database_unavailable(request: Request, exc: OperationalError) -> JSONResponse:
         logger.error(
             "管理 API 数据库不可用 request_id=%s",
             getattr(request.state, "request_id", "-"),
-            exc_info=exc,
+            # SQL exceptions can include bound command code/arguments; do not log parameters.
         )
         return error_response(
             request,
@@ -132,6 +139,13 @@ def install_middleware(
                         raise APIError("AUTH_REQUIRED", "需要管理员身份验证", 401) from exc
                     raise
                 request.state.session = credentials
+            if mutating and path.startswith("/api/bot/command"):
+                raw = bytearray()
+                async for chunk in request.stream():
+                    raw.extend(chunk)
+                    if len(raw) > 64 * 1024:
+                        raise APIError("REQUEST_TOO_LARGE", "命令请求体不能超过 64KB", 413)
+                request._body = bytes(raw)
             response = await call_next(request)
             if (
                 not is_key

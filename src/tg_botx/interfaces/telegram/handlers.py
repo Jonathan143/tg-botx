@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from tg_botx.core.time import format_local_time
+from tg_botx.features.bot.execution import CommandExecutionService
+from tg_botx.features.bot.executors.base import ExecutionError
 from tg_botx.features.bot.management import BotManagementService
 from tg_botx.features.bot.models import (
     _CONFIRM_TTL_SECONDS,
@@ -28,12 +30,22 @@ logger = logging.getLogger(__name__)
 
 
 class BotMessageHandlers:
-    def __init__(self, database, checkin, management, client, status):
+    def __init__(
+        self,
+        database,
+        checkin,
+        management,
+        client,
+        status,
+        *,
+        execution: CommandExecutionService | None = None,
+    ):
         self.database = database
         self.checkin = checkin
         self.management = management
         self.client = client
         self.status = status
+        self.execution = execution
 
     def command_configs(self) -> list[dict[str, Any]]:
         return self.management.command_configs()
@@ -81,7 +93,28 @@ class BotMessageHandlers:
             await self._send(chat_id, "你没有权限调用该命令。")
             return
         if config.get("type") == "custom":
-            await self._send(chat_id, "该自定义指令的执行器尚未实现，请联系管理员。")
+            try:
+                if self.execution is None:
+                    raise ExecutionError("EXECUTOR_UNAVAILABLE")
+                if type(update_number) is not int:
+                    raise ExecutionError("INVALID_EXECUTOR_CONFIG")
+                self.execution.submit(
+                    canonical_command,
+                    argument,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    update_id=update_number,
+                )
+            except ExecutionError as exc:
+                self.management.audit(
+                    user_id,
+                    chat_id,
+                    canonical_command,
+                    "denied",
+                    update_id=update_number,
+                    details=exc.code,
+                )
+                await self._send(chat_id, html.escape(str(exc)))
             return
         if command == "start":
             await self._send(chat_id, self._welcome(user_id, chat_id))
@@ -195,7 +228,11 @@ class BotMessageHandlers:
     ) -> bool:
         role = self.management.binding_role(user_id, chat_id) or "anonymous"
         config = next((item for item in self.command_configs() if item["command"] == command), None)
-        allowed = bool(config and config.get("enabled") and role in config.get("allowedRoles", []))
+        allowed = bool(
+            config
+            and config.get("enabled")
+            and role in config.get("effectiveAllowedRoles", config.get("allowedRoles", []))
+        )
         if not allowed:
             self.management.audit(user_id, chat_id, command, "denied", update_id=update_id)
         return allowed
@@ -356,7 +393,8 @@ class BotMessageHandlers:
             available = {
                 item["command"]
                 for item in self.command_configs()
-                if BotManagementService._menu_visible(item) and role in item.get("allowedRoles", [])
+                if BotManagementService._menu_visible(item)
+                and role in item.get("effectiveAllowedRoles", item.get("allowedRoles", []))
             }
             actions = []
             if "tasks" in available:
@@ -379,7 +417,8 @@ class BotMessageHandlers:
         )
         for item in self.command_configs():
             if BotManagementService._menu_visible(item) and (
-                role is None or role in item.get("allowedRoles", [])
+                role is None
+                or role in item.get("effectiveAllowedRoles", item.get("allowedRoles", []))
             ):
                 lines.append(f"/{item['command']} {html.escape(item['description'])}")
         return "\n\n".join(lines)
